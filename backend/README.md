@@ -52,8 +52,8 @@ notification text, sound, and vibration.
 
 ## API
 
-`GET /healthz` is unauthenticated. Every `/v1` route requires
-`X-Yo-Key: $YO_SERVER_KEY`.
+`GET /healthz` is unauthenticated. The app-facing `/v1/register`,
+`/v1/friends`, and `/v1/send` routes require `X-Yo-Key: $YO_SERVER_KEY`.
 
 Register or rotate a device token:
 
@@ -80,11 +80,32 @@ curl -X POST http://127.0.0.1:8790/v1/send \
   -d '{"sender":"me","recipient":"friend"}'
 ```
 
+## Broadcast API (third-party clients)
+
+Provision a client and optionally pre-seed subscriptions for registered
+usernames:
+
+```sh
+python3 register_client.py --client-id fedex --subscribe alice --subscribe bob
+```
+
+The command prints the raw client key once. Store it securely and send it with
+the client ID in the `X-Yo-Client-Key` and `X-Yo-Client-Id` headers:
+
+```sh
+export YO_CLIENT_KEY='the-key-printed-by-register-client'
+curl -X POST http://127.0.0.1:8790/v1/broadcast \
+  -H 'X-Yo-Client-Id: fedex' \
+  -H "X-Yo-Client-Key: $YO_CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Package update"}'
+```
+
 ## Tests
 
 The suite uses a temporary SQLite file and a fake FCM client, so it performs no
 network calls and does not require Firebase credentials:
 
 ```sh
-python3 -m unittest test_yo_server -v
+python3 -m unittest discover -v
 ```

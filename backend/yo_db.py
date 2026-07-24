@@ -22,6 +22,25 @@ class YoDatabase:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_clients(
+                    client_id TEXT PRIMARY KEY,
+                    api_key_hash TEXT NOT NULL,
+                    created_at INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscriptions(
+                    client_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at INTEGER,
+                    PRIMARY KEY (client_id, username)
+                )
+                """
+            )
 
     def upsert_device(
         self,
@@ -62,6 +81,67 @@ class YoDatabase:
                 (username,),
             ).fetchone()
         return None if row is None else row[0]
+
+    def upsert_api_client(
+        self,
+        client_id: str,
+        api_key_hash: str,
+        created_at: Optional[int] = None,
+    ) -> None:
+        timestamp = int(time.time()) if created_at is None else created_at
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO api_clients(client_id, api_key_hash, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    api_key_hash = excluded.api_key_hash
+                """,
+                (client_id, api_key_hash, timestamp),
+            )
+
+    def get_api_key_hash(self, client_id: str) -> Optional[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT api_key_hash FROM api_clients WHERE client_id = ?",
+                (client_id,),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def add_subscription(
+        self,
+        client_id: str,
+        username: str,
+        created_at: Optional[int] = None,
+    ) -> None:
+        timestamp = int(time.time()) if created_at is None else created_at
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO subscriptions(
+                    client_id,
+                    username,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (client_id, username, timestamp),
+            )
+
+    def list_subscriber_tokens(self, client_id: str) -> List[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT devices.fcm_token
+                FROM subscriptions
+                JOIN devices
+                    ON devices.username = subscriptions.username
+                WHERE subscriptions.client_id = ?
+                ORDER BY devices.username
+                """,
+                (client_id,),
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=5)

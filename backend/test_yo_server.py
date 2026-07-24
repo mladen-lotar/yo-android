@@ -6,9 +6,9 @@ import unittest
 from email.message import Message
 from types import SimpleNamespace
 
-from fcm_client import FCMNotConfiguredError
+from fcm_client import FCMDeliveryError, FCMNotConfiguredError
 from yo_db import YoDatabase
-from yo_server import YoRequestHandler
+from yo_server import YoRequestHandler, _hash_client_key
 
 
 class RecordingFCMClient:
@@ -16,11 +16,14 @@ class RecordingFCMClient:
         self.calls = []
         self.result = True
         self.error = None
+        self.fail_tokens = set()
 
     def send_yo(self, fcm_token, sender):
         self.calls.append((fcm_token, sender))
         if self.error is not None:
             raise self.error
+        if fcm_token in self.fail_tokens:
+            raise FCMDeliveryError("delivery failed")
         return self.result
 
 
@@ -145,6 +148,188 @@ class YoServerTest(unittest.TestCase):
         )
         self.assertEqual([], self.fcm_client.calls)
 
+    def test_broadcast_delivers_to_all_subscribers(self):
+        client_key = "fedex-client-key"
+        self.server.database.upsert_device("alice", "alice-token")
+        self.server.database.upsert_device("bob", "bob-token")
+        self.server.database.upsert_api_client(
+            "fedex",
+            _hash_client_key(client_key),
+        )
+        self.server.database.add_subscription("fedex", "alice")
+        self.server.database.add_subscription("fedex", "bob")
+
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {"message": "Package update"},
+            key=None,
+            extra_headers={
+                "X-Yo-Client-Id": "fedex",
+                "X-Yo-Client-Key": client_key,
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"delivered": 2, "failed": 0, "subscriber_count": 2},
+            body,
+        )
+        self.assertEqual(
+            [
+                ("alice-token", "fedex"),
+                ("bob-token", "fedex"),
+            ],
+            self.fcm_client.calls,
+        )
+
+    def test_broadcast_rejects_wrong_client_key(self):
+        client_key = "fedex-client-key"
+        self.server.database.upsert_api_client(
+            "fedex",
+            _hash_client_key(client_key),
+        )
+        credentials = (
+            (None, None),
+            (self.server_key, None),
+            (
+                None,
+                {
+                    "X-Yo-Client-Id": "fedex",
+                    "X-Yo-Client-Key": "wrong-key",
+                },
+            ),
+        )
+
+        for key, extra_headers in credentials:
+            with self.subTest(key=key, extra_headers=extra_headers):
+                status, body = self.request(
+                    "POST",
+                    "/v1/broadcast",
+                    {},
+                    key=key,
+                    extra_headers=extra_headers,
+                )
+
+                self.assertEqual(401, status)
+                self.assertEqual({"error": "unauthorized"}, body)
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_broadcast_rejects_unknown_client_id(self):
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {},
+            key=None,
+            extra_headers={
+                "X-Yo-Client-Id": "unknown",
+                "X-Yo-Client-Key": "unknown-key",
+            },
+        )
+
+        self.assertEqual(401, status)
+        self.assertEqual({"error": "unauthorized"}, body)
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_broadcast_with_no_subscribers_returns_zero_counts(self):
+        client_key = "fedex-client-key"
+        self.server.database.upsert_api_client(
+            "fedex",
+            _hash_client_key(client_key),
+        )
+
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {},
+            key=None,
+            extra_headers={
+                "X-Yo-Client-Id": "fedex",
+                "X-Yo-Client-Key": client_key,
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"delivered": 0, "failed": 0, "subscriber_count": 0},
+            body,
+        )
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_broadcast_continues_past_single_delivery_failure(self):
+        client_key = "fedex-client-key"
+        self.server.database.upsert_device("alice", "alice-token")
+        self.server.database.upsert_device("bob", "bob-token")
+        self.server.database.upsert_api_client(
+            "fedex",
+            _hash_client_key(client_key),
+        )
+        self.server.database.add_subscription("fedex", "alice")
+        self.server.database.add_subscription("fedex", "bob")
+        self.fcm_client.fail_tokens.add("alice-token")
+
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {},
+            key=None,
+            extra_headers={
+                "X-Yo-Client-Id": "fedex",
+                "X-Yo-Client-Key": client_key,
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"delivered": 1, "failed": 1, "subscriber_count": 2},
+            body,
+        )
+        self.assertEqual(
+            [
+                ("alice-token", "fedex"),
+                ("bob-token", "fedex"),
+            ],
+            self.fcm_client.calls,
+        )
+
+    def test_broadcast_with_unconfigured_fcm_short_circuits(self):
+        client_key = "fedex-client-key"
+        self.server.database.upsert_device("alice", "alice-token")
+        self.server.database.upsert_device("bob", "bob-token")
+        self.server.database.upsert_api_client(
+            "fedex",
+            _hash_client_key(client_key),
+        )
+        self.server.database.add_subscription("fedex", "alice")
+        self.server.database.add_subscription("fedex", "bob")
+        self.fcm_client.error = FCMNotConfiguredError("not configured")
+
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {},
+            key=None,
+            extra_headers={
+                "X-Yo-Client-Id": "fedex",
+                "X-Yo-Client-Key": client_key,
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {
+                "delivered": 0,
+                "failed": 0,
+                "subscriber_count": 2,
+                "reason": "fcm_not_configured",
+            },
+            body,
+        )
+        self.assertEqual(
+            [("alice-token", "fedex")],
+            self.fcm_client.calls,
+        )
+
     def test_missing_or_wrong_key_is_unauthorized_for_every_v1_route(self):
         routes = (
             (
@@ -177,7 +362,14 @@ class YoServerTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual({"ok": True}, body)
 
-    def request(self, method, path, body=None, key=server_key):
+    def request(
+        self,
+        method,
+        path,
+        body=None,
+        key=server_key,
+        extra_headers=None,
+    ):
         data = b""
         headers = Message()
         if body is not None:
@@ -186,6 +378,9 @@ class YoServerTest(unittest.TestCase):
             headers["Content-Length"] = str(len(data))
         if key is not None:
             headers["X-Yo-Key"] = key
+        if extra_headers is not None:
+            for name, value in extra_headers.items():
+                headers[name] = value
 
         handler = YoRequestHandler.__new__(YoRequestHandler)
         handler.command = method
