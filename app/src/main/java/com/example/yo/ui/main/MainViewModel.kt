@@ -2,6 +2,7 @@ package com.example.yo.ui.main
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.YoIdentity
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.domain.repository.YoRepository
@@ -23,6 +24,7 @@ class MainViewModel @Inject constructor(
     private val fetchFriendsUseCase: FetchFriendsUseCase,
     private val registerDeviceUseCase: RegisterDeviceUseCase,
     repository: YoRepository,
+    private val locationProvider: OneShotLocationProvider,
 ) : ViewModel() {
     private val _friends = MutableStateFlow<List<String>>(emptyList())
     val friends: StateFlow<List<String>> = _friends.asStateFlow()
@@ -52,9 +54,22 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    fun sendYo(recipient: String) {
+    fun sendYo(
+        recipient: String,
+        link: String? = null,
+        hashtag: String? = null,
+        attachLocation: Boolean = false,
+    ) {
         viewModelScope.launch {
-            sendYoUseCase(sender = YoIdentity.CURRENT_USERNAME, recipient = recipient)
+            val coords = if (attachLocation) locationProvider.getCurrentLocation() else null
+            sendYoUseCase(sender = YoIdentity.CURRENT_USERNAME, recipient = recipient) {
+                copy(
+                    link = link?.takeIf { it.isNotBlank() },
+                    hashtag = hashtag?.takeIf { it.isNotBlank() },
+                    latitude = coords?.latitude,
+                    longitude = coords?.longitude,
+                )
+            }
         }
     }
 }

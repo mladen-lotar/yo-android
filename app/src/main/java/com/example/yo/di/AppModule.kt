@@ -3,6 +3,7 @@ package com.example.yo.di
 import android.content.Context
 import androidx.room.Room
 import com.example.yo.BuildConfig
+import com.example.yo.data.location.FusedOneShotLocationProvider
 import com.example.yo.data.local.YoDao
 import com.example.yo.data.local.YoDatabase
 import com.example.yo.data.remote.FirebaseFcmTokenProvider
@@ -11,6 +12,7 @@ import com.example.yo.data.remote.SharedPreferencesDeviceRegistrationStore
 import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.data.remote.YoRemoteDeliveryPortImpl
 import com.example.yo.data.repository.YoRepositoryImpl
+import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
 import com.example.yo.domain.repository.YoRemoteDeliveryPort
@@ -69,4 +71,14 @@ abstract class RepositoryModule {
     abstract fun bindDeviceRegistrationStore(
         impl: SharedPreferencesDeviceRegistrationStore,
     ): DeviceRegistrationStore
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class LocationModule {
+    @Binds
+    @Singleton
+    abstract fun bindOneShotLocationProvider(
+        impl: FusedOneShotLocationProvider,
+    ): OneShotLocationProvider
 }

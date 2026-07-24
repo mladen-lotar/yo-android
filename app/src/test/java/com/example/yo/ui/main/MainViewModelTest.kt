@@ -1,7 +1,10 @@
 package com.example.yo.ui.main
 
 import com.example.yo.data.remote.YoBackendApi
+import com.example.yo.domain.location.LocationCoordinates
+import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.DeviceRegistration
+import com.example.yo.domain.model.YoIdentity
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
@@ -21,6 +24,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -59,13 +63,75 @@ class MainViewModelTest {
         val collectorJob = launch { viewModel.history.collect {} }
         dispatcher.scheduler.advanceUntilIdle()
 
-        viewModel.sendYo("Alice")
+        viewModel.sendYo("Alice", link = null, hashtag = null, attachLocation = false)
         dispatcher.scheduler.advanceUntilIdle()
 
         val history = viewModel.history.value
         assertEquals(1, history.size)
         assertEquals("Alice", history.single().recipient)
-        assertEquals("me", history.single().sender)
+        assertEquals(YoIdentity.CURRENT_USERNAME, history.single().sender)
+
+        collectorJob.cancel()
+    }
+
+    @Test
+    fun `sendYo with link and hashtag saves them on the message`() = runTest {
+        val repository = FakeYoRepository()
+        val viewModel = createViewModel(repository = repository)
+
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo("Alice", link = "https://example.com", hashtag = "worldcup", attachLocation = false)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val history = viewModel.history.value
+        assertEquals("https://example.com", history.single().link)
+        assertEquals("worldcup", history.single().hashtag)
+
+        collectorJob.cancel()
+    }
+
+    @Test
+    fun `sendYo with attachLocation true calls the location provider and saves returned coordinates`() = runTest {
+        val repository = FakeYoRepository()
+        val locationProvider = FakeOneShotLocationProvider(
+            coordinates = LocationCoordinates(latitude = 45.815, longitude = 15.982),
+        )
+        val viewModel = createViewModel(repository = repository, locationProvider = locationProvider)
+
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo("Alice", link = null, hashtag = null, attachLocation = true)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val history = viewModel.history.value
+        assertEquals(1, locationProvider.callCount)
+        assertEquals(45.815, history.single().latitude)
+        assertEquals(15.982, history.single().longitude)
+
+        collectorJob.cancel()
+    }
+
+    @Test
+    fun `sendYo with attachLocation false never calls the location provider`() = runTest {
+        val repository = FakeYoRepository()
+        val locationProvider = FakeOneShotLocationProvider(
+            coordinates = LocationCoordinates(latitude = 45.815, longitude = 15.982),
+        )
+        val viewModel = createViewModel(repository = repository, locationProvider = locationProvider)
+
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo("Alice", link = null, hashtag = null, attachLocation = false)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val history = viewModel.history.value
+        assertEquals(0, locationProvider.callCount)
+        assertNull(history.single().latitude)
+        assertNull(history.single().longitude)
 
         collectorJob.cancel()
     }
@@ -97,6 +163,7 @@ class MainViewModelTest {
         repository: FakeYoRepository = FakeYoRepository(),
         friends: List<String> = emptyList(),
         friendsFailure: Throwable? = null,
+        locationProvider: OneShotLocationProvider = FakeOneShotLocationProvider(),
     ): MainViewModel {
         val backendApi = FakeYoBackendApi(friends, friendsFailure)
         return MainViewModel(
@@ -109,6 +176,7 @@ class MainViewModelTest {
                     registrationStore = FakeDeviceRegistrationStore(),
                 ),
             repository = repository,
+            locationProvider = locationProvider,
         )
     }
 
@@ -120,6 +188,18 @@ class MainViewModelTest {
         }
 
         override fun observeHistory(): Flow<List<YoMessage>> = state
+    }
+
+    private class FakeOneShotLocationProvider(
+        private val coordinates: LocationCoordinates? = null,
+    ) : OneShotLocationProvider {
+        var callCount = 0
+            private set
+
+        override suspend fun getCurrentLocation(): LocationCoordinates? {
+            callCount++
+            return coordinates
+        }
     }
 
     private class FakeYoBackendApi(
