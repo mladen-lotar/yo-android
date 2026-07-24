@@ -16,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -27,15 +28,20 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 
-// Local friend picker stub; no contacts backend is wired yet.
-private val friends = listOf("Alice", "Bob", "Charlie")
-
 @Composable
 fun MainScreen(
     viewModel: MainViewModel = hiltViewModel(),
 ) {
     val history by viewModel.history.collectAsState()
-    var selectedFriend by remember { mutableStateOf(friends.first()) }
+    val friends by viewModel.friends.collectAsState()
+    val friendsLoadFailed by viewModel.friendsLoadFailed.collectAsState()
+    var selectedFriend by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(friends) {
+        if (selectedFriend !in friends) {
+            selectedFriend = friends.firstOrNull()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -47,6 +53,9 @@ fun MainScreen(
             style = MaterialTheme.typography.titleMedium,
         )
         Spacer(modifier = Modifier.height(8.dp))
+        if (friendsLoadFailed) {
+            Text("Couldn't load friends")
+        }
         friends.forEach { friend ->
             Row(
                 modifier = Modifier
@@ -71,7 +80,8 @@ fun MainScreen(
         }
         Spacer(modifier = Modifier.height(16.dp))
         Button(
-            onClick = { viewModel.sendYo(selectedFriend) },
+            onClick = { selectedFriend?.let(viewModel::sendYo) },
+            enabled = selectedFriend != null,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Yo")
