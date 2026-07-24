@@ -1,9 +1,29 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("com.google.dagger.hilt.android")
     id("org.jetbrains.kotlin.kapt")
 }
+
+val localProperties =
+    Properties().apply {
+        val localPropertiesFile = rootProject.file("local.properties")
+        if (localPropertiesFile.exists()) {
+            localPropertiesFile.inputStream().use(::load)
+        }
+    }
+val yoBackendUrl =
+    providers.gradleProperty("yoBackendUrl").orNull
+        ?: localProperties.getProperty("yoBackendUrl")
+        ?: "http://10.0.2.2:8790"
+val yoBackendKey =
+    providers.gradleProperty("yoBackendKey").orNull
+        ?: localProperties.getProperty("yoBackendKey")
+        ?: ""
+val escapedYoBackendUrl = yoBackendUrl.replace("\\", "\\\\").replace("\"", "\\\"")
+val escapedYoBackendKey = yoBackendKey.replace("\\", "\\\\").replace("\"", "\\\"")
 
 android {
     namespace = "com.example.yo"
@@ -17,9 +37,12 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "YO_BACKEND_URL", "\"$escapedYoBackendUrl\"")
+        buildConfigField("String", "YO_BACKEND_KEY", "\"$escapedYoBackendKey\"")
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 
@@ -80,6 +103,9 @@ dependencies {
     implementation("androidx.room:room-ktx:2.6.1")
     kapt("androidx.room:room-compiler:2.6.1")
 
+    implementation(platform("com.google.firebase:firebase-bom:32.7.0"))
+    implementation("com.google.firebase:firebase-messaging-ktx")
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
@@ -97,4 +123,9 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+}
+
+val servicesJson = file("google-services.json")
+if (servicesJson.exists() && servicesJson.readText().isNotBlank()) {
+    apply(plugin = "com.google.gms.google-services")
 }

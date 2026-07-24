@@ -3,6 +3,7 @@ package com.example.yo.data.repository
 import com.example.yo.data.local.YoDao
 import com.example.yo.data.local.YoEntity
 import com.example.yo.domain.model.YoMessage
+import com.example.yo.domain.repository.YoRemoteDeliveryPort
 import com.example.yo.domain.repository.YoRepository
 import javax.inject.Inject
 import kotlinx.coroutines.flow.Flow
@@ -10,9 +11,11 @@ import kotlinx.coroutines.flow.map
 
 class YoRepositoryImpl @Inject constructor(
     private val yoDao: YoDao,
+    private val remoteDeliveryPort: YoRemoteDeliveryPort,
 ) : YoRepository {
     override suspend fun saveSent(message: YoMessage) {
         yoDao.insert(message.toEntity())
+        runCatching { remoteDeliveryPort.deliver(message) }
     }
 
     override fun observeHistory(): Flow<List<YoMessage>> =
