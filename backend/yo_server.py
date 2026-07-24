@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -15,6 +16,10 @@ from yo_db import YoDatabase
 DEFAULT_PORT = 8790
 DEFAULT_DATABASE = Path(__file__).with_name("yo.db")
 MAX_BODY_BYTES = 1_000_000
+
+
+def _hash_client_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
 class BadRequestError(ValueError):
@@ -55,10 +60,18 @@ class YoRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
-        if not self._authorize():
+        client_id: Optional[str] = None
+        if parsed.path == "/v1/broadcast":
+            client_id = self._authorize_client()
+            if client_id is None:
+                return
+        elif not self._authorize():
             return
         try:
             body = self._read_json_body()
+            if client_id is not None:
+                self._handle_broadcast(client_id, body)
+                return
             if parsed.path == "/v1/register":
                 self._handle_register(body)
                 return
@@ -81,6 +94,26 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             {"error": "unauthorized"},
         )
         return False
+
+    def _authorize_client(self) -> Optional[str]:
+        client_id = self.headers.get("X-Yo-Client-Id", "")
+        supplied_key = self.headers.get("X-Yo-Client-Key", "")
+        stored_hash = self.server.database.get_api_key_hash(client_id)
+        if (
+            client_id
+            and supplied_key
+            and stored_hash is not None
+            and hmac.compare_digest(
+                _hash_client_key(supplied_key),
+                stored_hash,
+            )
+        ):
+            return client_id
+        self._write_json(
+            HTTPStatus.UNAUTHORIZED,
+            {"error": "unauthorized"},
+        )
+        return None
 
     def _handle_register(self, body: Dict[str, Any]) -> None:
         username = self._required_string(body, "username")
@@ -141,6 +174,45 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
+
+    def _handle_broadcast(
+        self,
+        client_id: str,
+        body: Dict[str, Any],
+    ) -> None:
+        message = body.get("message")
+        if message is not None and not isinstance(message, str):
+            raise BadRequestError("message must be a string")
+        tokens = self.server.database.list_subscriber_tokens(client_id)
+        delivered_count = 0
+        failed_count = 0
+        for token in tokens:
+            try:
+                if self.server.fcm_client.send_yo(token, client_id):
+                    delivered_count += 1
+                else:
+                    failed_count += 1
+            except FCMNotConfiguredError:
+                self._write_json(
+                    HTTPStatus.OK,
+                    {
+                        "delivered": 0,
+                        "failed": 0,
+                        "subscriber_count": len(tokens),
+                        "reason": "fcm_not_configured",
+                    },
+                )
+                return
+            except FCMDeliveryError:
+                failed_count += 1
+        self._write_json(
+            HTTPStatus.OK,
+            {
+                "delivered": delivered_count,
+                "failed": failed_count,
+                "subscriber_count": len(tokens),
+            },
+        )
 
     def _read_json_body(self) -> Dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
