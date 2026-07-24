@@ -2,6 +2,7 @@ package com.example.yo.ui.main
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.domain.repository.YoRepository
 import com.example.yo.domain.usecase.SendYoUseCase
@@ -16,6 +17,7 @@ import kotlinx.coroutines.launch
 class MainViewModel @Inject constructor(
     private val sendYoUseCase: SendYoUseCase,
     repository: YoRepository,
+    private val locationProvider: OneShotLocationProvider,
 ) : ViewModel() {
     val history: StateFlow<List<YoMessage>> = repository.observeHistory()
         .stateIn(
@@ -24,9 +26,22 @@ class MainViewModel @Inject constructor(
             initialValue = emptyList(),
         )
 
-    fun sendYo(recipient: String) {
+    fun sendYo(
+        recipient: String,
+        link: String? = null,
+        hashtag: String? = null,
+        attachLocation: Boolean = false,
+    ) {
         viewModelScope.launch {
-            sendYoUseCase(sender = "me", recipient = recipient)
+            val coords = if (attachLocation) locationProvider.getCurrentLocation() else null
+            sendYoUseCase(sender = "me", recipient = recipient) {
+                copy(
+                    link = link?.takeIf { it.isNotBlank() },
+                    hashtag = hashtag?.takeIf { it.isNotBlank() },
+                    latitude = coords?.latitude,
+                    longitude = coords?.longitude,
+                )
+            }
         }
     }
 }
