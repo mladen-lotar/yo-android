@@ -11,9 +11,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
@@ -24,6 +24,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -32,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.example.yo.domain.model.Group
 
 @Composable
 fun MainScreen(
@@ -40,6 +42,7 @@ fun MainScreen(
     val history by viewModel.history.collectAsState()
     val friends by viewModel.friends.collectAsState()
     val friendsLoadFailed by viewModel.friendsLoadFailed.collectAsState()
+    val groups by viewModel.groups.collectAsState()
     var selectedFriend by remember { mutableStateOf<String?>(null) }
     var linkText by remember { mutableStateOf("") }
     var hashtagText by remember { mutableStateOf("") }
@@ -60,7 +63,8 @@ fun MainScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
     ) {
         Text(
             text = "Choose a friend",
@@ -161,26 +165,142 @@ fun MainScreen(
             style = MaterialTheme.typography.titleMedium,
         )
         Spacer(modifier = Modifier.height(8.dp))
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(
-                items = history,
-                key = { message -> message.id },
-            ) { message ->
-                val extras = buildString {
-                    append("${message.sender} sent Yo to ${message.recipient}")
-                    message.link?.let { append(" · $it") }
-                    message.hashtag?.let { append(" · #$it") }
-                    if (message.latitude != null && message.longitude != null) {
-                        append(" · (${message.latitude}, ${message.longitude})")
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            history.forEach { message ->
+                key(message.id) {
+                    val extras = buildString {
+                        append("${message.sender} sent Yo to ${message.recipient}")
+                        message.link?.let { append(" · $it") }
+                        message.hashtag?.let { append(" · #$it") }
+                        if (message.latitude != null && message.longitude != null) {
+                            append(" · (${message.latitude}, ${message.longitude})")
+                        }
+                    }
+                    Text(extras)
+                }
+            }
+        }
+        GroupsSection(
+            groups = groups,
+            friends = friends,
+            onSendYoToGroup = viewModel::sendYoToGroup,
+            onCreateGroup = viewModel::createGroup,
+        )
+    }
+}
+
+@Composable
+private fun GroupsSection(
+    groups: List<Group>,
+    friends: List<String>,
+    onSendYoToGroup: (String) -> Unit,
+    onCreateGroup: (String, List<String>) -> Unit,
+) {
+    var selectedGroupId by remember { mutableStateOf<String?>(null) }
+    var groupName by remember { mutableStateOf("") }
+    var selectedMemberUsernames by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    LaunchedEffect(groups) {
+        if (groups.none { it.id == selectedGroupId }) {
+            selectedGroupId = groups.firstOrNull()?.id
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "Groups",
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        groups.forEach { group ->
+            key(group.id) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(
+                            selected = group.id == selectedGroupId,
+                            onClick = { selectedGroupId = group.id },
+                            role = Role.RadioButton,
+                        )
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = group.id == selectedGroupId,
+                        onClick = null,
+                    )
+                    Column(modifier = Modifier.padding(start = 12.dp)) {
+                        Text(group.name)
+                        Text(
+                            text = "${group.memberUsernames.size} members",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                 }
-                Text(extras)
             }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(
+            onClick = { selectedGroupId?.let(onSendYoToGroup) },
+            enabled = selectedGroupId != null,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Yo Group")
+        }
+        Spacer(modifier = Modifier.height(24.dp))
+        Text(
+            text = "Create group",
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedTextField(
+            value = groupName,
+            onValueChange = { groupName = it },
+            label = { Text("Group name") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        friends.forEach { friend ->
+            val isSelected = friend in selectedMemberUsernames
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = { checked ->
+                        selectedMemberUsernames =
+                            if (checked) {
+                                selectedMemberUsernames + friend
+                            } else {
+                                selectedMemberUsernames - friend
+                            }
+                    },
+                )
+                Text(
+                    text = friend,
+                    modifier = Modifier.padding(start = 12.dp),
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = {
+                onCreateGroup(
+                    groupName.trim(),
+                    friends.filter { it in selectedMemberUsernames },
+                )
+                groupName = ""
+                selectedMemberUsernames = emptySet()
+            },
+            enabled = groupName.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Create Group")
         }
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Room
 import com.example.yo.BuildConfig
 import com.example.yo.data.location.FusedOneShotLocationProvider
+import com.example.yo.data.local.GroupDao
 import com.example.yo.data.local.YoDao
 import com.example.yo.data.local.YoDatabase
 import com.example.yo.data.remote.FirebaseFcmTokenProvider
@@ -11,10 +12,12 @@ import com.example.yo.data.remote.HttpYoBackendApi
 import com.example.yo.data.remote.SharedPreferencesDeviceRegistrationStore
 import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.data.remote.YoRemoteDeliveryPortImpl
+import com.example.yo.data.repository.GroupRepositoryImpl
 import com.example.yo.data.repository.YoRepositoryImpl
 import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
+import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.YoRemoteDeliveryPort
 import com.example.yo.domain.repository.YoRepository
 import dagger.Binds
@@ -43,6 +46,9 @@ object AppModule {
     fun provideYoDao(database: YoDatabase): YoDao = database.yoDao()
 
     @Provides
+    fun provideGroupDao(database: YoDatabase): GroupDao = database.groupDao()
+
+    @Provides
     @Singleton
     fun provideYoBackendApi(): YoBackendApi =
         HttpYoBackendApi(
@@ -57,6 +63,10 @@ abstract class RepositoryModule {
     @Binds
     @Singleton
     abstract fun bindYoRepository(impl: YoRepositoryImpl): YoRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindGroupRepository(impl: GroupRepositoryImpl): GroupRepository
 
     @Binds
     @Singleton

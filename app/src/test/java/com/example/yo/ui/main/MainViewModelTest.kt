@@ -4,13 +4,16 @@ import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.domain.location.LocationCoordinates
 import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.DeviceRegistration
+import com.example.yo.domain.model.Group
 import com.example.yo.domain.model.YoIdentity
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
+import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.YoRepository
 import com.example.yo.domain.usecase.FetchFriendsUseCase
 import com.example.yo.domain.usecase.RegisterDeviceUseCase
+import com.example.yo.domain.usecase.SendYoToGroupUseCase
 import com.example.yo.domain.usecase.SendYoUseCase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -159,15 +162,71 @@ class MainViewModelTest {
         assertTrue(viewModel.friendsLoadFailed.value)
     }
 
+    @Test
+    fun `sendYoToGroup fans out to history for every member`() = runTest {
+        val group =
+            Group(
+                id = "group-1",
+                name = "Friends",
+                memberUsernames = listOf("Ada", "Lin", "Sam"),
+            )
+        val repository = FakeYoRepository()
+        val groupRepository = FakeGroupRepository(listOf(group))
+        val viewModel =
+            createViewModel(
+                repository = repository,
+                groupRepository = groupRepository,
+            )
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYoToGroup(group.id)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val history = viewModel.history.value
+        assertEquals(3, history.size)
+        assertEquals(
+            group.memberUsernames.toSet(),
+            history.map { message -> message.recipient }.toSet(),
+        )
+        assertTrue(history.all { message -> message.sender == "me" })
+
+        collectorJob.cancel()
+    }
+
+    @Test
+    fun `createGroup adds a group to groups StateFlow`() = runTest {
+        val groupRepository = FakeGroupRepository()
+        val viewModel = createViewModel(groupRepository = groupRepository)
+        val collectorJob = launch { viewModel.groups.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.createGroup("Friends", listOf("Ada", "Lin"))
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val group = viewModel.groups.value.single()
+        assertEquals("Friends", group.name)
+        assertEquals(setOf("Ada", "Lin"), group.memberUsernames.toSet())
+
+        collectorJob.cancel()
+    }
+
     private fun createViewModel(
         repository: FakeYoRepository = FakeYoRepository(),
+        groupRepository: FakeGroupRepository = FakeGroupRepository(),
         friends: List<String> = emptyList(),
         friendsFailure: Throwable? = null,
         locationProvider: OneShotLocationProvider = FakeOneShotLocationProvider(),
     ): MainViewModel {
         val backendApi = FakeYoBackendApi(friends, friendsFailure)
+        val sendYoUseCase = SendYoUseCase(repository)
         return MainViewModel(
-            sendYoUseCase = SendYoUseCase(repository),
+            sendYoUseCase = sendYoUseCase,
+            sendYoToGroupUseCase =
+                SendYoToGroupUseCase(
+                    groupRepository = groupRepository,
+                    sendYoUseCase = sendYoUseCase,
+                ),
             fetchFriendsUseCase = FetchFriendsUseCase(backendApi),
             registerDeviceUseCase =
                 RegisterDeviceUseCase(
@@ -176,6 +235,7 @@ class MainViewModelTest {
                     registrationStore = FakeDeviceRegistrationStore(),
                 ),
             repository = repository,
+            groupRepository = groupRepository,
             locationProvider = locationProvider,
         )
     }
@@ -200,6 +260,26 @@ class MainViewModelTest {
             callCount++
             return coordinates
         }
+    }
+
+    private class FakeGroupRepository(
+        initialGroups: List<Group> = emptyList(),
+    ) : GroupRepository {
+        private val state = MutableStateFlow(initialGroups)
+
+        override suspend fun createGroup(
+            name: String,
+            memberUsernames: List<String>,
+        ): Group {
+            val group = Group(name = name, memberUsernames = memberUsernames)
+            state.value = state.value + group
+            return group
+        }
+
+        override fun observeGroups(): Flow<List<Group>> = state
+
+        override suspend fun getGroup(groupId: String): Group? =
+            state.value.firstOrNull { group -> group.id == groupId }
     }
 
     private class FakeYoBackendApi(
