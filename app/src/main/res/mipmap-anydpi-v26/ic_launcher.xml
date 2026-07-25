@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Yo's app icon was literally one colour. The archived 300x300 Google Play icon contains exactly
+  one unique value across all 90,000 pixels: #9B59B6. No wordmark, no glyph, no gradient, no bevel.
+  (The purple square carrying a white "Yo" is the press-kit logo — conflating the two is the most
+  common mistake in recreations, so this deliberately has no foreground mark.)
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/yo_brand" />
+    <foreground android:drawable="@color/yo_brand" />
+    <!--
+      Themed icons (Android 13+) need a monochrome layer; without one the launcher renders an empty
+      tile. The wordmark is used here only because a blank themed icon would look broken.
+    -->
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

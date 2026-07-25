@@ -155,6 +155,91 @@ broadcast client. See gap G6 on flakiness and G7 on absent CI.
 
 ---
 
+### 4.1 Visual design system
+
+Every value below is quoted from a primary source, not eyeballed from a screenshot. The sources, in
+descending order of authority:
+
+1. **Yo's own "Yo Branding Guidelines"**, embedded as an HTML block in their archived developer docs
+   (`docs.justyo.co/docs/ui-design-guidelines`). It names and hex-specifies all ten colours and
+   states the typeface, the text colour and the row height outright.
+2. **Yo's press kit** (`yoapp.s3.amazonaws.com/yo/yomediakit.zip`, Last-Modified 2014-10-10) — the
+   vector logo whose embedded font descriptor reads `Montserrat-Bold.ttf`, `FontWeight 700`.
+3. **Archived store listings** — the real Google Play, App Store and Windows Phone screenshots, plus
+   an unretouched real-device Android screenshot, measured with PIL.
+4. **Archived `justyo.co` inline CSS**, which dogfooded the same system on the web.
+
+**Palette** — ten colours, a curated subset of Flat UI Colors (2013) with the names abbreviated.
+Roles are Yo's, not ours:
+
+| Yo's name | Hex | Role |
+|---|---|---|
+| TURQUOISE | `#1ABC9C` | row 1 of the cycle |
+| EMERALD | `#2ECC71` | row 2 |
+| PETER | `#3498DB` | row 3 |
+| ASPHALT | `#34495E` | row 4 |
+| GREEN | `#16A085` | row 5 |
+| SUNFLOWER | `#F1C40F` | row 6 |
+| BELIZE | `#2980B9` | row 7 |
+| WISTERIA | `#8E44AD` | row 8 |
+| ALIZARIN | `#E74C3C` | **menu button only** — the one entry Yo annotated with a usage |
+| AMETHYST | `#9B59B6` | "the main purple": background, app icon, sheets — never a row |
+
+Row colour is a function of **position, not identity**. Yo's own menu screen — whose rows are not
+contacts at all — uses the identical sequence, and the same five names appear in completely
+different colours on iOS versus Android. So `colorForIndex(i) = Rows[i % 8]`, with friends, groups
+and the trailing `+` row sharing one continuous cycle. Hashing a username to pick a colour would be
+wrong.
+
+**Typography** — Montserrat Bold (700), white `#FFFFFF`, uppercase, centred on both axes. Bundled as
+a static 700 instance under the SIL OFL. Row labels are **42sp**, derived rather than guessed: the
+measured cap height on Yo's press render is 29.66pt and Montserrat's capHeight is 0.700em, so
+29.66 / 0.700 = 42.4sp — which puts the cap height at almost exactly one third of the row, matching
+the original's proportions. A `letterSpacing` of `-0.03em` is a **correction, not a style choice**:
+today's Montserrat is a 2017 redraw averaging ~3.7% wider than the 2014 cut (`Y` is +8.6%), and Yo
+sized its type so the longest label cleared the screen by ~6.5pt, so without the correction long
+labels overflow where they originally did not.
+
+**Layout** — bands are a fixed **89dp** ("Row Height: 89px", verbatim; measured at 89/87/87/86px on
+the real screenshot), full-bleed, butted directly together with single-pixel transitions: no
+dividers, no gutters, no insets, no rounding, no shadows. Rows do not stretch; leftover space below
+the last band stays Amethyst, which is why the original screen reads deliberately "unfinished".
+There is **no chrome at all** — no app bar, title, search, tabs or section headers; the list starts
+at the first pixel of the content area. The single floating control is a 48dp Alizarin circle inset
+12dp from the bottom-right corner, carrying a white overflow glyph.
+
+**Casing** — usernames are ALL CAPS (Yo's API documented the field as "UPPERCASE username"), but the
+app's own name is mixed-case "Yo". The guidelines are emphatic: «Please note to casing of the name:
+"Yo". Not YO, yo, Yo!, YO!.» Hence uppercase bands but a mixed-case "Yo" send button.
+
+**App icon** — a flat, solid `#9B59B6` square with no wordmark, no glyph, no gradient. This is
+measured, not inferred: the archived 300×300 Play icon contains exactly one unique colour across all
+90,000 pixels. The purple square bearing a white "Yo" is the *press-kit logo*; mistaking it for the
+app icon is the most common error in recreations.
+
+**Notification** — title "Yo" over body "From LEO", read directly off the iOS lockscreen and Android
+shade in Yo's own store screenshots.
+
+#### Conflicts and deliberate deviations
+
+Recorded rather than smoothed over:
+
+- **Typeface conflict.** Yo's guidelines state "Font: Montserrat Bold" and their logo file embeds it,
+  but pixel measurement of the shipped 2014 rows suggests those rendered in the *platform* font
+  (Roboto/Helvetica Bold), with Montserrat only on the website. We follow Yo's stated spec, since it
+  is first-party and is provably the wordmark's face. Reasonable people could ship Roboto Bold here.
+- **Status bar.** The real v1 sat under an untinted black KitKat bar. We tint it Amethyst, because
+  that was a platform-era limitation rather than a design decision — Yo's website was purple to the
+  edges — and an untinted bar reads as a bug on a modern edge-to-edge phone.
+- **Long labels.** Yo used one fixed size with no shrink-to-fit, tuned for short usernames. Group
+  names are user-supplied and can be far longer, so labels over 9 characters step down one size and
+  ellipsize rather than overflow.
+- **Sheets.** Attachments, history and group creation use modern bottom sheets. The original reached
+  its equivalents through swipes and a menu screen; the sheets are styled as colour bands to stay in
+  the idiom, but they are a modern construct.
+- **Cycle offset.** The 2014 build started the cycle at Turquoise and the 2016 build at Emerald. We
+  start at Turquoise, matching v1.
+
 ## 5. Non-goals (deliberate omissions)
 
 | Omitted | Historical counterpart | Why |

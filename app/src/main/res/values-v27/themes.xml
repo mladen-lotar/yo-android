@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Yo" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:windowLightNavigationBar">true</item>
+    <!-- Purple nav bar carries white icons, so the light-icon flag stays off (API 27+ only). -->
+    <style name="Theme.Yo" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/yo_brand</item>
+        <item name="android:navigationBarColor">@color/yo_brand</item>
+        <item name="android:statusBarColor">@color/yo_brand</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>
