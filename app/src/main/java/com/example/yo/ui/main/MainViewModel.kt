@@ -77,7 +77,7 @@ class MainViewModel @Inject constructor(
             sendYoUseCase(sender = YoIdentity.CURRENT_USERNAME, recipient = recipient) {
                 copy(
                     link = link?.takeIf { it.isNotBlank() },
-                    hashtag = hashtag?.takeIf { it.isNotBlank() },
+                    hashtag = hashtag?.takeIf { it.isNotBlank() }?.trimStart('#')?.takeIf { it.isNotBlank() },
                     latitude = coords?.latitude,
                     longitude = coords?.longitude,
                 )

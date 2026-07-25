@@ -96,6 +96,40 @@ class MainViewModelTest {
     }
 
     @Test
+    fun `sendYo strips a leading hashtag character from user-entered hashtag text`() = runTest {
+        val repository = FakeYoRepository()
+        val viewModel = createViewModel(repository = repository)
+
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo("Alice", link = null, hashtag = "#worldcup", attachLocation = false)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val history = viewModel.history.value
+        assertEquals("worldcup", history.single().hashtag)
+
+        collectorJob.cancel()
+    }
+
+    @Test
+    fun `sendYo with hashtag of only hash characters stores null`() = runTest {
+        val repository = FakeYoRepository()
+        val viewModel = createViewModel(repository = repository)
+
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo("Alice", link = null, hashtag = "##", attachLocation = false)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val history = viewModel.history.value
+        assertNull(history.single().hashtag)
+
+        collectorJob.cancel()
+    }
+
+    @Test
     fun `sendYo with attachLocation true calls the location provider and saves returned coordinates`() = runTest {
         val repository = FakeYoRepository()
         val locationProvider = FakeOneShotLocationProvider(
