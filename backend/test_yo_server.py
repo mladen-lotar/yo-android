@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from fcm_client import FCMDeliveryError, FCMNotConfiguredError
 from yo_db import YoDatabase
-from yo_server import YoRequestHandler, _hash_client_key
+from yo_server import MAX_PHOTO_BYTES, YoRequestHandler, _hash_client_key
 
 
 class RecordingFCMClient:
@@ -147,6 +147,72 @@ class YoServerTest(unittest.TestCase):
             body,
         )
         self.assertEqual([], self.fcm_client.calls)
+
+    def test_photo_upload_then_fetch_round_trips(self):
+        status, body = self.request(
+            "POST",
+            "/v1/photo",
+            {
+                "message_id": "message-1",
+                "mime_type": "image/jpeg",
+                "data": "base64-data",
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual({"stored": True}, body)
+
+        status, body = self.request(
+            "GET",
+            "/v1/photo?message_id=message-1",
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            {"mime_type": "image/jpeg", "data": "base64-data"},
+            body,
+        )
+
+    def test_photo_upload_rejects_oversized_payload(self):
+        status, body = self.request(
+            "POST",
+            "/v1/photo",
+            {
+                "message_id": "message-1",
+                "mime_type": "image/jpeg",
+                "data": "A" * (MAX_PHOTO_BYTES + 1),
+            },
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual({"error": "photo_too_large"}, body)
+        self.assertIsNone(self.server.database.get_photo("message-1"))
+
+    def test_photo_fetch_missing_message_id_returns_404(self):
+        for path in ("/v1/photo", "/v1/photo?message_id=missing"):
+            with self.subTest(path=path):
+                status, body = self.request("GET", path)
+
+                self.assertEqual(404, status)
+                self.assertEqual({"error": "not_found"}, body)
+
+    def test_photo_upload_requires_authorization(self):
+        for key in (None, "wrong-key"):
+            with self.subTest(key=key):
+                status, body = self.request(
+                    "POST",
+                    "/v1/photo",
+                    {
+                        "message_id": "message-1",
+                        "mime_type": "image/jpeg",
+                        "data": "base64-data",
+                    },
+                    key=key,
+                )
+
+                self.assertEqual(401, status)
+                self.assertEqual({"error": "unauthorized"}, body)
+        self.assertIsNone(self.server.database.get_photo("message-1"))
 
     def test_broadcast_delivers_to_all_subscribers(self):
         client_key = "fedex-client-key"

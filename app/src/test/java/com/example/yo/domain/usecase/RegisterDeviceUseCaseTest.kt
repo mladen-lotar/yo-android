@@ -112,6 +112,12 @@ class RegisterDeviceUseCaseTest {
             sender: String,
             recipient: String,
         ): Boolean = true
+
+        override suspend fun uploadPhoto(
+            messageId: String,
+            base64Data: String,
+            mimeType: String,
+        ): Boolean = true
     }
 
     private class FakeFcmTokenProvider(

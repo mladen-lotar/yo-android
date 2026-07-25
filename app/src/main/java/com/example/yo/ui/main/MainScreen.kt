@@ -1,8 +1,12 @@
 package com.example.yo.ui.main
 
 import android.Manifest
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,19 +30,35 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.example.yo.data.photo.decodeSampledBitmap
 import com.example.yo.domain.model.Group
+import java.io.File
+import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+private const val THUMBNAIL_MAX_EDGE_PX = 512
+private const val CAPTURED_PHOTOS_DIRECTORY = "captured-photos"
 
 @Composable
 fun MainScreen(
     viewModel: MainViewModel = hiltViewModel(),
 ) {
+    val context = LocalContext.current
     val history by viewModel.history.collectAsState()
     val friends by viewModel.friends.collectAsState()
     val friendsLoadFailed by viewModel.friendsLoadFailed.collectAsState()
@@ -47,11 +67,41 @@ fun MainScreen(
     var linkText by remember { mutableStateOf("") }
     var hashtagText by remember { mutableStateOf("") }
     var attachLocation by remember { mutableStateOf(false) }
+    var capturedPhotoUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var pendingCaptureUri by rememberSaveable { mutableStateOf<Uri?>(null) }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
     ) { granted ->
         attachLocation = granted
+    }
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture(),
+    ) { captured ->
+        if (captured) {
+            capturedPhotoUri = pendingCaptureUri
+        }
+        pendingCaptureUri = null
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            createCapturedPhotoUri(context)?.let { uri ->
+                pendingCaptureUri = uri
+                runCatching { takePictureLauncher.launch(uri) }
+                    .onFailure { pendingCaptureUri = null }
+            }
+        }
+    }
+    val choosePhotoLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri ->
+        uri?.let { sourceUri ->
+            copyPhotoToCache(context, sourceUri)?.let { cachedUri ->
+                capturedPhotoUri = cachedUri
+            }
+        }
     }
 
     LaunchedEffect(friends) {
@@ -142,6 +192,30 @@ fun MainScreen(
                 modifier = Modifier.padding(start = 12.dp),
             )
         }
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Take Photo")
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = { choosePhotoLauncher.launch("image/*") },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Choose Photo")
+        }
+        capturedPhotoUri?.let { uri ->
+            Spacer(modifier = Modifier.height(8.dp))
+            PhotoThumbnail(
+                photoUri = uri,
+                contentDescription = "Attached photo",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+            )
+        }
         Spacer(modifier = Modifier.height(16.dp))
         Button(
             onClick = {
@@ -151,6 +225,7 @@ fun MainScreen(
                         link = linkText,
                         hashtag = hashtagText,
                         attachLocation = attachLocation,
+                        photoUri = capturedPhotoUri?.toString(),
                     )
                 }
             },
@@ -176,7 +251,18 @@ fun MainScreen(
                             append(" · (${message.latitude}, ${message.longitude})")
                         }
                     }
-                    Text(extras)
+                    Column {
+                        Text(extras)
+                        message.photoUri?.let { photoUri ->
+                            PhotoThumbnail(
+                                photoUri = Uri.parse(photoUri),
+                                contentDescription = "Photo sent to ${message.recipient}",
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(120.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -188,6 +274,78 @@ fun MainScreen(
         )
     }
 }
+
+@Composable
+private fun PhotoThumbnail(
+    photoUri: Uri,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val bitmap by produceState<Bitmap?>(
+        initialValue = null,
+        key1 = photoUri,
+    ) {
+        value = null
+        value =
+            try {
+                withContext(Dispatchers.IO) {
+                    decodeSampledBitmap(context, photoUri, THUMBNAIL_MAX_EDGE_PX)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
+            }
+    }
+
+    bitmap?.let {
+        Image(
+            bitmap = it.asImageBitmap(),
+            contentDescription = contentDescription,
+            modifier = modifier,
+            contentScale = ContentScale.Crop,
+        )
+    }
+}
+
+private fun createCapturedPhotoUri(context: Context): Uri? =
+    runCatching {
+        val directory = capturedPhotosDirectory(context)
+        val file = File(directory, "${UUID.randomUUID()}.jpg")
+        if (!file.createNewFile()) {
+            return@runCatching null
+        }
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file,
+        )
+    }.getOrNull()
+
+private fun copyPhotoToCache(
+    context: Context,
+    sourceUri: Uri,
+): Uri? =
+    runCatching {
+        val directory = capturedPhotosDirectory(context)
+        val file = File(directory, "${UUID.randomUUID()}.jpg")
+        context.contentResolver.openInputStream(sourceUri)?.use { input ->
+            file.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        } ?: return@runCatching null
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file,
+        )
+    }.getOrNull()
+
+private fun capturedPhotosDirectory(context: Context): File =
+    File(context.cacheDir, CAPTURED_PHOTOS_DIRECTORY).apply {
+        check(exists() || mkdirs())
+    }
 
 @Composable
 private fun GroupsSection(

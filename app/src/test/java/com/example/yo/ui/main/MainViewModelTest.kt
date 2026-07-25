@@ -130,6 +130,23 @@ class MainViewModelTest {
     }
 
     @Test
+    fun `sendYo with photoUri saves it on the message`() = runTest {
+        val repository = FakeYoRepository()
+        val viewModel = createViewModel(repository = repository)
+        val photoUri = "content://com.example.yo.fileprovider/captured_photos/photo.jpg"
+
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo("Alice", photoUri = photoUri)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(photoUri, viewModel.history.value.single().photoUri)
+
+        collectorJob.cancel()
+    }
+
+    @Test
     fun `sendYo with attachLocation true calls the location provider and saves returned coordinates`() = runTest {
         val repository = FakeYoRepository()
         val locationProvider = FakeOneShotLocationProvider(
@@ -333,6 +350,12 @@ class MainViewModelTest {
         override suspend fun sendYo(
             sender: String,
             recipient: String,
+        ): Boolean = true
+
+        override suspend fun uploadPhoto(
+            messageId: String,
+            base64Data: String,
+            mimeType: String,
         ): Boolean = true
     }
 

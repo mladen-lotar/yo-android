@@ -1,15 +1,43 @@
 package com.example.yo.data.remote
 
 import com.example.yo.domain.model.YoMessage
+import com.example.yo.domain.photo.PhotoEncoder
 import com.example.yo.domain.repository.YoRemoteDeliveryPort
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 
 class YoRemoteDeliveryPortImpl @Inject constructor(
     private val backendApi: YoBackendApi,
+    private val photoEncoder: PhotoEncoder,
 ) : YoRemoteDeliveryPort {
-    override suspend fun deliver(message: YoMessage): Boolean =
-        backendApi.sendYo(
-            sender = message.sender,
-            recipient = message.recipient,
-        )
+    override suspend fun deliver(message: YoMessage): Boolean {
+        val sent =
+            backendApi.sendYo(
+                sender = message.sender,
+                recipient = message.recipient,
+            )
+        message.photoUri?.let { uri ->
+            runCatchingIgnoringCancellation { photoEncoder.encodeForUpload(uri) }
+                .getOrNull()
+                ?.let { payload ->
+                    runCatchingIgnoringCancellation {
+                        backendApi.uploadPhoto(
+                            messageId = message.id,
+                            base64Data = payload.base64Data,
+                            mimeType = payload.mimeType,
+                        )
+                    }
+                }
+        }
+        return sent
+    }
 }
+
+private inline fun <T> runCatchingIgnoringCancellation(block: () -> T): Result<T> =
+    try {
+        Result.success(block())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        Result.failure(e)
+    }
