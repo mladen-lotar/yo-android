@@ -83,9 +83,18 @@ Single "Yo" button sends to the selected friend. Persisted to Room as local hist
 ### FR2 — Push delivery (historical: core "text and audio notification")
 Backend registers device tokens and fans a Yo out over FCM.
 `YoFirebaseMessagingService` receives it; `YoNotifier` posts a high-importance notification titled
-"Yo" with body `"<sender> says Yo!"`, a notification sound, and vibration pattern
-`[0, 150, 100, 150]`. Push-only — no polling (P2).
-*Source: issue #3. See gap G1 (audio) and G2 (FCM credentials).*
+"Yo" with body `"<sender> says Yo!"`, the bundled spoken-"Yo" clip as its sound, and vibration
+pattern `[0, 150, 100, 150]`. Push-only — no polling (P2).
+
+The sound is `res/raw/yo.mp3`: a ~0.47s mono clip of a synthesized voice saying "Yo!", normalized to
+−14 LUFS with the tail tapered. It is **our own** synthesis, not the original app's asset, and
+`tools/generate-yo-sound.sh` regenerates it byte-for-byte so the binary is reproducible rather than
+opaque. Because a notification channel's sound is immutable after creation, the channel id is
+`yo_push_v2`; bumping it is what makes the new sound take effect on installs that already had the
+old default-tone channel. On API 24–25 there are no channels, so the sound rides on the
+notification itself — both paths are covered by `YoNotifierTest`.
+
+*Source: issue #3. See gap G2 (FCM credentials).*
 
 ### FR3 — Links and hashtags (historical: 2014-08)
 Optional link and hashtag fields on the send screen, carried as nullable fields on `YoMessage`
@@ -162,12 +171,12 @@ broadcast client. See gap G6 on flakiness and G7 on absent CI.
 
 ## 6. Known gaps and risks
 
-These are the honest deltas between this document and the code as of `b8d6d07`.
+These are the honest deltas between this document and the code. Gap numbers are stable — a closed
+gap keeps its number rather than being deleted, so earlier references stay valid.
 
-**G1 — No signature "Yo" audio.** The original played a distinctive audio clip of a voice saying
-"Yo"; `YoNotifier` uses `RingtoneManager.getDefaultUri(TYPE_NOTIFICATION)`, the device's generic
-tone. FR2 is therefore *functionally* but not *characterfully* aligned. Closing this needs a bundled
-audio asset set as the channel sound.
+**G1 — No signature "Yo" audio. — RESOLVED 2026-07-25.** The original played a distinctive clip of a
+voice saying "Yo"; `YoNotifier` used the device's generic tone. Now bundles its own synthesized
+spoken-"Yo" clip as the channel sound — see FR2.
 
 **G2 — Real FCM push is unconfigured.** Without `google-services.json` and a backend
 service-account key, no device obtains an FCM token, so no `/v1/register` occurs and `/v1/send`
