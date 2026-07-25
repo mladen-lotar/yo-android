@@ -22,6 +22,12 @@ interface YoBackendApi {
         sender: String,
         recipient: String,
     ): Boolean
+
+    suspend fun uploadPhoto(
+        messageId: String,
+        base64Data: String,
+        mimeType: String,
+    ): Boolean
 }
 
 class HttpYoBackendApi(
@@ -65,6 +71,21 @@ class HttpYoBackendApi(
                 .toString()
         val response = execute(method = "POST", path = "/v1/send", body = body)
         return response.isSuccessful && JSONObject(response.body).optBoolean("delivered", false)
+    }
+
+    override suspend fun uploadPhoto(
+        messageId: String,
+        base64Data: String,
+        mimeType: String,
+    ): Boolean {
+        val body =
+            JSONObject()
+                .put("message_id", messageId)
+                .put("mime_type", mimeType)
+                .put("data", base64Data)
+                .toString()
+        val response = execute(method = "POST", path = "/v1/photo", body = body)
+        return response.isSuccessful && JSONObject(response.body).optBoolean("stored", false)
     }
 
     private suspend fun execute(

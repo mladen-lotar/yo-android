@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 
 PathValue = Union[str, os.PathLike]
@@ -38,6 +38,16 @@ class YoDatabase:
                     username TEXT NOT NULL,
                     created_at INTEGER,
                     PRIMARY KEY (client_id, username)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS photos(
+                    message_id TEXT PRIMARY KEY,
+                    mime_type TEXT NOT NULL,
+                    data_base64 TEXT NOT NULL,
+                    created_at INTEGER
                 )
                 """
             )
@@ -81,6 +91,44 @@ class YoDatabase:
                 (username,),
             ).fetchone()
         return None if row is None else row[0]
+
+    def store_photo(
+        self,
+        message_id: str,
+        mime_type: str,
+        data_base64: str,
+        created_at: Optional[int] = None,
+    ) -> None:
+        timestamp = int(time.time()) if created_at is None else created_at
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO photos(
+                    message_id,
+                    mime_type,
+                    data_base64,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    mime_type = excluded.mime_type,
+                    data_base64 = excluded.data_base64,
+                    created_at = excluded.created_at
+                """,
+                (message_id, mime_type, data_base64, timestamp),
+            )
+
+    def get_photo(self, message_id: str) -> Optional[Tuple[str, str]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT mime_type, data_base64
+                FROM photos
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+        return None if row is None else (row[0], row[1])
 
     def upsert_api_client(
         self,
