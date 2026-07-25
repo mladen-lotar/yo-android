@@ -22,6 +22,20 @@ object YoNotifier {
     fun yoSoundUri(context: Context): Uri =
         Uri.parse("android.resource://${context.packageName}/${R.raw.yo}")
 
+    /**
+     * The original's notification was title "Yo" over body "From LEO" — read directly off the iOS
+     * lockscreen and Android shade in Yo's own store screenshots. Senders are uppercase because
+     * uppercase was the canonical username form (Yo's API documented the field as "UPPERCASE
+     * username"), while the app's own name keeps its mixed case: the branding guidelines forbid
+     * "YO".
+     */
+    const val NOTIFICATION_TITLE = "Yo"
+
+    /** AMETHYST #9B59B6 — "the main purple" in Yo's own guidelines. Tints the notification accent. */
+    const val ACCENT_COLOR = 0xFF9B59B6.toInt()
+
+    fun yoNotificationBody(sender: String): String = "From ${sender.uppercase()}"
+
     fun postYoNotification(context: Context, sender: String) {
         val sound = yoSoundUri(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -57,9 +71,10 @@ object YoNotifier {
 
         val notification =
             NotificationCompat.Builder(context, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle("Yo")
-                .setContentText("$sender says Yo!")
+                .setSmallIcon(R.drawable.ic_yo_notification)
+                .setColor(ACCENT_COLOR)
+                .setContentTitle(NOTIFICATION_TITLE)
+                .setContentText(yoNotificationBody(sender))
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)
                 .setSound(sound)

@@ -34,7 +34,21 @@ class YoNotifierTest {
         )
         val notification = shadowOf(notificationManager).allNotifications.single()
         val text = notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString()
-        assertTrue(text.contains("Ada"))
+        assertTrue(text.contains("ADA"))
+    }
+
+    @Test
+    fun `notification reads "Yo" over "From USERNAME" with the sender uppercased`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val notificationManager = context.getSystemService(NotificationManager::class.java)
+
+        YoNotifier.postYoNotification(context, "Ada")
+
+        val extras = shadowOf(notificationManager).allNotifications.single().extras
+        // Mixed-case "Yo" is mandatory: Yo's branding guidelines forbid "YO", "yo" and "Yo!".
+        assertEquals("Yo", extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+        assertEquals("From ADA", extras.getCharSequence(Notification.EXTRA_TEXT).toString())
+        assertEquals("From PRODUCTHUNT", YoNotifier.yoNotificationBody("producthunt"))
     }
 
     @Test

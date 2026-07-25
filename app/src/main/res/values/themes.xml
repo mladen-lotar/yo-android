@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Yo" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:navigationBarColor">@android:color/white</item>
-        <item name="android:statusBarColor">@android:color/white</item>
-        <item name="android:windowLightStatusBar">true</item>
+    <!--
+      Yo had no chrome. The system bars carry the brand purple #9B59B6 so the colour runs edge to
+      edge, and the status-bar icons stay light because that purple always holds white content.
+      windowBackground is purple too, so the launch window does not flash white before Compose
+      draws its first frame.
+    -->
+    <style name="Theme.Yo" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/yo_brand</item>
+        <item name="android:navigationBarColor">@color/yo_brand</item>
+        <item name="android:statusBarColor">@color/yo_brand</item>
+        <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

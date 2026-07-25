@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Verbatim from the archived justyo.co stylesheet: `body { background: repeat #9B59B6 }`.
+      Kept here as well as in YoPalette.kt because the launch window and system bars are styled
+      by the platform before any Compose code runs.
+    -->
+    <color name="yo_brand">#9B59B6</color>
+</resources>
