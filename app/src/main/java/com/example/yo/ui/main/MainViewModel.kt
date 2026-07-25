@@ -71,6 +71,7 @@ class MainViewModel @Inject constructor(
         link: String? = null,
         hashtag: String? = null,
         attachLocation: Boolean = false,
+        photoUri: String? = null,
     ) {
         viewModelScope.launch {
             val coords = if (attachLocation) locationProvider.getCurrentLocation() else null
@@ -80,6 +81,7 @@ class MainViewModel @Inject constructor(
                     hashtag = hashtag?.takeIf { it.isNotBlank() }?.trimStart('#')?.takeIf { it.isNotBlank() },
                     latitude = coords?.latitude,
                     longitude = coords?.longitude,
+                    photoUri = photoUri,
                 )
             }
         }

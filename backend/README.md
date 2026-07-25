@@ -53,7 +53,8 @@ notification text, sound, and vibration.
 ## API
 
 `GET /healthz` is unauthenticated. The app-facing `/v1/register`,
-`/v1/friends`, and `/v1/send` routes require `X-Yo-Key: $YO_SERVER_KEY`.
+`/v1/friends`, `/v1/send`, and `/v1/photo` routes require
+`X-Yo-Key: $YO_SERVER_KEY`.
 
 Register or rotate a device token:
 
@@ -78,6 +79,29 @@ curl -X POST http://127.0.0.1:8790/v1/send \
   -H "X-Yo-Key: $YO_SERVER_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"sender":"me","recipient":"friend"}'
+```
+
+## Photo attachment
+
+Upload a base64-encoded photo for a message:
+
+```sh
+curl -X POST http://127.0.0.1:8790/v1/photo \
+  -H "X-Yo-Key: $YO_SERVER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id":"message-id","mime_type":"image/jpeg","data":"base64-data"}'
+```
+
+Photo upload request bodies are capped at 2 MB, and the base64 `data` payload
+is capped at approximately 1.4 MB.
+The approximately 1.4 MB cap is measured in actual UTF-8-encoded bytes of the
+`data` field, not Python string length.
+
+Fetch the stored photo by message ID:
+
+```sh
+curl 'http://127.0.0.1:8790/v1/photo?message_id=message-id' \
+  -H "X-Yo-Key: $YO_SERVER_KEY"
 ```
 
 ## Broadcast API (third-party clients)

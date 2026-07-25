@@ -15,7 +15,8 @@ from yo_db import YoDatabase
 
 DEFAULT_PORT = 8790
 DEFAULT_DATABASE = Path(__file__).with_name("yo.db")
-MAX_BODY_BYTES = 1_000_000
+MAX_BODY_BYTES = 2_000_000
+MAX_PHOTO_BYTES = 1_400_000
 
 
 def _hash_client_key(raw_key: str) -> str:
@@ -56,6 +57,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/friends":
             self._handle_friends(parsed.query)
             return
+        if parsed.path == "/v1/photo":
+            self._handle_photo_fetch(parsed.query)
+            return
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -77,6 +81,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/v1/send":
                 self._handle_send(body)
+                return
+            if parsed.path == "/v1/photo":
+                self._handle_photo_upload(body)
                 return
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except BadRequestError as error:
@@ -174,6 +181,33 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
+
+    def _handle_photo_upload(self, body: Dict[str, Any]) -> None:
+        message_id = self._required_string(body, "message_id")
+        mime_type = self._required_string(body, "mime_type")
+        data = self._required_string(body, "data")
+        if len(data.encode("utf-8")) > MAX_PHOTO_BYTES:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "photo_too_large"},
+            )
+            return
+        self.server.database.store_photo(message_id, mime_type, data)
+        self._write_json(HTTPStatus.OK, {"stored": True})
+
+    def _handle_photo_fetch(self, query: str) -> None:
+        parameters = parse_qs(query, keep_blank_values=True)
+        values = parameters.get("message_id")
+        message_id = values[0].strip() if values else ""
+        photo = self.server.database.get_photo(message_id)
+        if photo is None:
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        mime_type, data = photo
+        self._write_json(
+            HTTPStatus.OK,
+            {"mime_type": mime_type, "data": data},
+        )
 
     def _handle_broadcast(
         self,
