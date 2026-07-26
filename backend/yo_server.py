@@ -546,11 +546,20 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         fcm_token = self.server.database.get_fcm_token(recipient)
         if fcm_token is None:
+            # A real account with no device is not a missing account. Reporting both as
+            # "recipient_not_found" told senders their friend did not exist whenever that friend's
+            # registration had quietly failed. This discloses nothing new: /v1/friends and /v1/block
+            # already answer "no_such_user" for names that do not exist.
+            reason = (
+                "recipient_unregistered"
+                if self.server.database.account_exists(recipient)
+                else "recipient_not_found"
+            )
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {
                     "delivered": False,
-                    "reason": "recipient_not_found",
+                    "reason": reason,
                 },
             )
             return

@@ -23,6 +23,7 @@ import com.example.yo.domain.usecase.FilterContactsUseCase
 import com.example.yo.domain.usecase.RegisterDeviceUseCase
 import com.example.yo.domain.usecase.SendYoToGroupUseCase
 import com.example.yo.domain.usecase.SendYoUseCase
+import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -360,6 +361,49 @@ class MainViewModelTest {
     }
 
     @Test
+    fun `a device that cannot register for push says so`() = runTest {
+        // Gap G17: this used to be swallowed entirely, so an unreachable phone looked healthy and
+        // the only symptom was that Yos sent to it silently vanished.
+        val viewModel = createViewModel(tokenProvider = FakeFcmTokenProvider(failuresBeforeSuccess = 99))
+
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.pushUnavailable.value)
+    }
+
+    @Test
+    fun `a working registration never warns`() = runTest {
+        val viewModel = createViewModel()
+
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.pushUnavailable.value)
+    }
+
+    @Test
+    fun `signed out is not reported as a push failure`() = runTest {
+        // There is nothing to register before sign-in, so warning would be a lie.
+        val viewModel = createViewModel(sessionStore = FakeSessionStore(initial = null))
+
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.pushUnavailable.value)
+    }
+
+    @Test
+    fun `retrying clears the warning once the cause passes`() = runTest {
+        // The use case burns 3 attempts on init; the 4th, from the user's tap, succeeds.
+        val viewModel = createViewModel(tokenProvider = FakeFcmTokenProvider(failuresBeforeSuccess = 3))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(viewModel.pushUnavailable.value)
+
+        viewModel.retryDeviceRegistration()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.pushUnavailable.value)
+    }
+
+    @Test
     fun `friends fetch failure yields empty list and failure flag`() = runTest {
         val viewModel =
             createViewModel(
@@ -564,6 +608,7 @@ class MainViewModelTest {
         contactsRepository: ContactsRepository = FakeContactsRepository(),
         backendApi: FakeYoBackendApi = FakeYoBackendApi(friends, friendsFailure),
         sessionStore: FakeSessionStore = FakeSessionStore(),
+        tokenProvider: FcmTokenProvider = FakeFcmTokenProvider(),
     ): MainViewModel {
         val sendYoUseCase = SendYoUseCase(repository)
         return MainViewModel(
@@ -577,7 +622,7 @@ class MainViewModelTest {
             registerDeviceUseCase =
                 RegisterDeviceUseCase(
                     backendApi = backendApi,
-                    tokenProvider = FakeFcmTokenProvider(),
+                    tokenProvider = tokenProvider,
                     registrationStore = FakeDeviceRegistrationStore(),
                     sessionStore = sessionStore,
                 ),
@@ -705,8 +750,18 @@ class MainViewModelTest {
         }
     }
 
-    private class FakeFcmTokenProvider : FcmTokenProvider {
-        override suspend fun getToken(): String = "test-token"
+    private class FakeFcmTokenProvider(
+        private val failuresBeforeSuccess: Int = 0,
+    ) : FcmTokenProvider {
+        private var calls = 0
+
+        override suspend fun getToken(): String {
+            calls += 1
+            if (calls <= failuresBeforeSuccess) {
+                throw IOException("SERVICE_NOT_AVAILABLE")
+            }
+            return "test-token"
+        }
     }
 
     private class FakeDeviceRegistrationStore : DeviceRegistrationStore {

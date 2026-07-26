@@ -931,6 +931,54 @@ class SendTest(YoServerTestCase):
         )
         self.assertEqual([], self.fcm_client.calls)
 
+    def test_a_real_account_with_no_device_is_not_reported_as_missing(self):
+        """Otherwise a friend whose registration failed is announced as a nonexistent user."""
+        alice_token = self.signup("ALICE")
+        self.signup("BOB")  # signs up, never registers a device
+
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB"},
+            token=alice_token,
+        )
+
+        self.assertEqual(404, status)
+        self.assertEqual(
+            {"delivered": False, "reason": "recipient_unregistered"},
+            body,
+        )
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_the_two_unreachable_reasons_are_distinguishable(self):
+        alice_token = self.signup("ALICE")
+        self.signup("BOB")
+
+        _, unregistered = self.request(
+            "POST", "/v1/send", {"recipient": "BOB"}, token=alice_token
+        )
+        _, absent = self.request(
+            "POST", "/v1/send", {"recipient": "NOBODY"}, token=alice_token
+        )
+
+        self.assertNotEqual(unregistered["reason"], absent["reason"])
+
+    def test_a_registering_recipient_becomes_reachable(self):
+        alice_token = self.signup("ALICE")
+        bob_token = self.signup("BOB")
+
+        _, before = self.request(
+            "POST", "/v1/send", {"recipient": "BOB"}, token=alice_token
+        )
+        self.request("POST", "/v1/register", {"fcm_token": "bob-token"}, token=bob_token)
+        status, after = self.request(
+            "POST", "/v1/send", {"recipient": "BOB"}, token=alice_token
+        )
+
+        self.assertEqual("recipient_unregistered", before["reason"])
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, after)
+
     def test_a_blocked_sender_is_silently_dropped(self):
         """The response has to look delivered, or the block becomes a notification."""
         alice_token = self.signup("ALICE")

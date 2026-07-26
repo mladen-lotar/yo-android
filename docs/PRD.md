@@ -456,11 +456,12 @@ disproportionate for a prototype, and it is worth noting that it would not have 
 threat G3 was actually about, since a token only exists after a real login.
 
 **G9 — `/v1/send` is a device-registration oracle.** Login was hardened so an unknown user and a
-wrong password are indistinguishable, but `send` still answers 404 `recipient_not_found` for an
+wrong password are indistinguishable, but `send` still answers 404 `recipient_unregistered` for an
 account with no registered device and 200 for one with a device. An authenticated caller can
 therefore learn which accounts have a live install. Bounded — account *existence* is already
-discoverable by design, since you must be able to add someone by name — but the blocked-sender path
-shows the fix: return an indistinguishable success.
+discoverable by design, since you must be able to add someone by name, and `/v1/friends` and
+`/v1/block` say `no_such_user` outright — but the blocked-sender path shows the fix: return an
+indistinguishable success. G18 changed which string is returned, not this property.
 
 **G10 — Tokens never expire.** The `tokens` table has a `created_at` that nothing reads. There is
 no TTL, no "sign out everywhere", and no per-device labelling, so an exfiltrated token is valid
@@ -520,19 +521,34 @@ access to the Google account therefore means losing the Yo username, with no rec
 same trade already accepted for forgotten passwords in §5, but worth naming separately because
 here the credential is held by a third party.
 
-**G17 — A device whose FCM registration fails is indistinguishable from one that worked.**
-`RegisterDeviceUseCase` wraps every step in `runCatching` and returns `false` on failure: no retry,
-no log, nothing on screen. This is not hypothetical — the S23's first attempt failed with
-`SERVICE_NOT_AVAILABLE` while dozing (§7.2) and only succeeded on the next launch. The app looked
-perfectly healthy the whole time; the only symptom was that Yos sent to it vanished. A device that
-never recovers stays silently unreachable forever, because the only other registration trigger is
-`onNewToken`, which fires on token *rotation*, not on launch.
+**G17 — A device whose FCM registration fails was indistinguishable from one that worked. —
+RESOLVED 2026-07-26.** `RegisterDeviceUseCase` wrapped every step in `runCatching` and returned
+`false`: no retry, no log, nothing on screen. Not hypothetical — the S23's first attempt failed with
+`SERVICE_NOT_AVAILABLE` while dozing (§7.2) and only succeeded on the next launch, looking perfectly
+healthy throughout, the only symptom being that Yos sent to it vanished. Three things changed:
 
-**G18 — `recipient_not_found` conflates "no such user" with "user has no device".** `_handle_send`
-resolves the recipient account first, then looks up their FCM token; a missing token returns
-`404 {"reason":"recipient_not_found"}`. So a real, existing friend whose registration silently
-failed under G17 is reported to the sender as a nonexistent user. Same class of mistake as the
-`NoCredentialException` copy fixed in G13: an error asserting a fact it has not established.
+- **It retries.** Token retrieval now makes 3 attempts backing off 1s then 2s. Firebase logs "Won't
+  retry the operation" and means it, and `onNewToken` fires on token *rotation* rather than on
+  launch, so nothing else in the app would ever ask again.
+- **It says which failure.** `DeviceRegistrationOutcome` replaces the `Boolean`, so `NotSignedIn`
+  (nothing to register yet, not an error) is no longer conflated with `Failed`.
+- **The user is told, and can act.** The home screen shows `NOT RECEIVING YOS - TAP TO RETRY` when
+  registration failed. It names the consequence rather than the mechanism, and tapping asks again,
+  which is the one thing that helps when the cause is transient.
+
+A blank token now counts as a failure worth retrying too: registering `""` would have bound the
+account to a token that can never receive anything, which reads as success everywhere downstream.
+
+**G18 — `recipient_not_found` conflated "no such user" with "user has no device". — RESOLVED
+2026-07-26.** `_handle_send` resolves the recipient account first, then looks up their FCM token; a
+missing token returned `404 {"reason":"recipient_not_found"}`, so a real friend whose registration
+had silently failed under G17 was reported to the sender as a nonexistent user — the same class of
+mistake as the `NoCredentialException` copy fixed in G13, an error asserting a fact it had not
+established. A registered-but-deviceless account now answers `recipient_unregistered`.
+
+This discloses nothing new, which is why it does not worsen G9: `_handle_add_friend` and
+`_handle_block` already answer `no_such_user` for names that do not exist, so any authenticated
+caller could already enumerate accounts. The conflation bought no privacy, only a wrong message.
 
 ---
 
@@ -673,11 +689,24 @@ maintenance window — for an app whose entire product is immediacy, the wrong d
 now sets `android.priority = high`. It would not have shown up in this test: a screen-on, plugged-in
 handset is never in Doze, so the defect would have shipped behind a green run.
 
-A second, unrelated observation: the first token attempt failed with
+A second observation, since fixed: the first token attempt failed with
 `FirebaseMessaging: … java.io.IOException: SERVICE_NOT_AVAILABLE` while the handset was dozing, and
-succeeded on the next launch with the screen awake. `RegisterDeviceUseCase` swallows that failure
-and returns `false` with nothing surfaced to the user, so an install whose registration never
-succeeds looks identical to one that worked until somebody tries to Yo it. See gap G17.
+succeeded on the next launch with the screen awake. At the time `RegisterDeviceUseCase` swallowed
+that and returned `false` with nothing surfaced, so an install whose registration never succeeded
+looked identical to one that worked until somebody tried to Yo it. See G17, now resolved.
+
+**Re-verified 2026-07-26 after the G17/G18 fixes**, same handset and production backend:
+
+| Check | Result |
+|---|---|
+| `POST /v1/send` to `MLADEN` (registered) | `200 {"delivered":true}`, notification on the device |
+| `POST /v1/send` to `LOTAR` (real account, no device) | `404 {"reason":"recipient_unregistered"}` |
+| `POST /v1/send` to `NOBODY` (no such account) | `404 {"reason":"recipient_not_found"}` |
+
+The `NOT RECEIVING YOS` row itself has **not** been seen on a screen: the S23 is pattern-locked, so
+screencaps come back black, and provoking it would mean breaking registration on purpose. Its logic
+is covered by unit tests on `MainViewModel` (fails → warns, succeeds → silent, signed out → silent,
+retry clears it); the row's rendering is not.
 
 ---
 
