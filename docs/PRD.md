@@ -408,8 +408,10 @@ spoken-"Yo" clip as the channel sound — see FR2.
 **G2 — Real FCM push is unconfigured.** Without `google-services.json` and a backend
 service-account key, no device obtains an FCM token, so no `/v1/register` occurs and `/v1/send`
 returns `{"delivered":false,"reason":"fcm_not_configured"}`. Sending, history, friends, groups, and
-photos all work; the actual push notification does not arrive. Blocked on interactive
-`firebase login` + `gcloud auth login`.
+photos all work; the actual push notification does not arrive. **No longer blocked on credentials** —
+project `yo-theshop` now exists and the Android app is registered (§7.1), so `google-services.json`
+is one CLI call away. What remains is fetching it, adding the FCM service-account key to the
+backend, and rebuilding.
 
 **G3 — The shared key ships inside the APK. — RESOLVED 2026-07-26.** `BuildConfig.YO_BACKEND_KEY`
 was embedded in the binary, so extracting an installed APK granted full API access: registering or
@@ -475,14 +477,32 @@ so it slows credential stuffing rather than preventing account creation at scale
 (which would need an emulator). The G6 class of bug is now caught; static-analysis and on-device
 regressions are not.
 
-**G13 — Google sign-in is built but dark.** FR10 ships complete and tested on both sides, and is
-switched off in every build and on the live host, because no Google Cloud project exists for this
-app — the same missing project that keeps G2 open. Three things are needed and none can be created
-without an interactive console login: an OAuth **web** client id (type 3), the app's signing SHA-1
-registered against an Android client in the same project, and `pip install google-auth` on the
-backend host, where it is declared in `requirements.txt` but has never actually been installed.
-Until then the band is absent from the UI and the route answers 503. Verified in that state: both
-503 paths, and a well-formed token rejected 401 once the library is present.
+**G13 — Google sign-in is configured; the on-device picker is the one leg still unproven.**
+Was "built but dark". The Google Cloud project now exists (`yo-theshop`, project number
+747034506241) and the backend half is verified against production with genuinely Google-signed
+tokens — see §7.1. What has *not* been exercised is the Credential Manager account picker on a
+real handset, because the S25 was locked for the duration and the picker cannot be driven past a
+keyguard. Two consequences follow, and neither is visible from the backend:
+
+- Firebase registered the Android app and its SHA-1, but `google-services.json` came back with
+  **zero `oauth_client` entries** — Firebase only mints those when Google is enabled as a sign-in
+  provider in Firebase Authentication, which this design does not use. The web client was created
+  through the IAP API instead. Whether Play services will issue an ID token to
+  `com.example.yo` without a matching *Android* OAuth client in the project is therefore untested;
+  if it refuses, the symptom is a `GetCredentialException` surfacing as
+  `GOOGLE SIGN-IN UNAVAILABLE`, and the fix is one Android OAuth client for package
+  `com.example.yo` + the SHA-1 in §7.1, which has no public API and must be made in the console.
+- The consent screen is an IAP-created brand with **`orgInternalOnly: true`**, so only
+  `the-shop.hr` Workspace accounts can complete sign-in. A personal `@gmail.com` account on the
+  device will be offered by the picker and then refused. Publishing the brand externally is a
+  console action.
+
+**G15 — Firebase Auth cannot be initialized on this project without billing.** Not a defect in
+Yo, but it explains the shape of the above: `identityPlatform:initializeAuth` answers
+`BILLING_NOT_ENABLED`, and `defaultSupportedIdpConfigs` refuses to auto-create a client
+(`client_id cannot be empty`). Everything here was therefore built without Firebase Auth, which is
+the right architecture anyway — the backend verifies Google's token itself and owns its own
+accounts, so a second account system would be redundant.
 
 **G14 — A Google account has no second way in and cannot be unlinked.** The link is one Google
 account to one Yo account, fixed at first sign-in. There is no route to attach a password to a
@@ -521,27 +541,58 @@ history rendering the sent Yo. Gap G2 still applies to the push itself.
 
 ### 7.1 Switching on Google sign-in (FR10)
 
-FR10 is deployed but dark (G13). Nothing about it is a secret — a client id is public by design —
-so the only barrier is that the Google Cloud project does not exist yet. To enable it:
+FR10 is live. Nothing here is a secret — an OAuth client id is public by design.
 
-1. In the Google Cloud console, create (or reuse) a project and configure the OAuth consent screen.
-2. Create an **Android** OAuth client: package `com.example.yo`, SHA-1
-   `BC:E5:5B:00:AA:7E:68:4D:72:EF:B7:2F:53:AF:B3:97:20:F7:F8:88` (the debug keystore this app is
-   currently signed with; a release keystore needs its own client).
-3. Create a **Web application** OAuth client in the *same* project. Its id — not the Android one —
-   is what both halves use, because Android sends it as the `serverClientId` and the backend pins
-   the token's audience to it.
-4. Backend: `pip install google-auth` for the interpreter in the plist, add
-   `YO_GOOGLE_CLIENT_ID=<web client id>` to the agent's `EnvironmentVariables`, and
-   `launchctl kickstart -k gui/$UID/com.yo.backend`.
-5. App: build with `-PyoGoogleClientId=<same web client id>` (or set `yoGoogleClientId` in
-   `local.properties`) and reinstall.
+**As provisioned (2026-07-26).** Google Cloud / Firebase project `yo-theshop`, number
+`747034506241`, on the free Spark tier with no billing account attached.
 
-Steps 4 and 5 take the same value. Getting them out of step fails closed — a mismatched audience is
-rejected as an invalid token, not accepted.
+| Piece | Value |
+|---|---|
+| Web (server) client id | `747034506241-c56bjfe0hihuarel9rucuo7b4oogvbkg.apps.googleusercontent.com` |
+| Firebase Android app | `1:747034506241:android:2643dabcb1f28ae548bc00`, package `com.example.yo` |
+| Registered SHA-1 | `BC:E5:5B:00:AA:7E:68:4D:72:EF:B7:2F:53:AF:B3:97:20:F7:F8:88` (debug keystore; a release keystore needs its own) |
+| Consent screen | IAP brand `projects/747034506241/brands/747034506241`, `orgInternalOnly: true` |
+| Backend interpreter | `~/.local/share/yo-backend-venv/bin/python` (holds `google-auth` 2.56.2) |
+| Backend env | `YO_GOOGLE_CLIENT_ID` in the launchd plist |
+| App config | `yoGoogleClientId` in the gitignored `local.properties` |
 
-Doing this also unblocks G2: the same project supplies `google-services.json` and the FCM service
-account.
+The web client was created through the **IAP API** (`iap.googleapis.com/v1/projects/{n}/brands`
+then `.../identityAwareProxyClients`) rather than the console, because Google exposes no public API
+for ordinary OAuth clients and Firebase would only auto-create them via Firebase Auth, which needs
+billing on this project (G15). Android OAuth clients have no API at all — see G13.
+
+**Two launchd gotchas, both of which cost time here.** `launchctl kickstart -k` restarts the job
+but re-uses the *loaded* configuration, so plist edits are silently ignored; use
+`launchctl bootout gui/$UID/com.yo.backend` followed by
+`launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.yo.backend.plist`. And the interpreter
+must be the venv's, since Homebrew's Python is externally managed and will not accept
+`pip install`.
+
+App and backend must carry the identical client id. Out of step fails closed — a mismatched
+audience is rejected as an invalid token, never accepted. That is not a claim from reading the
+code: a real Google-signed token minted for a different audience was posted to production and came
+back `401 invalid_google_token`.
+
+**Verified against production** on 2026-07-26 with genuinely Google-signed ID tokens (minted by
+impersonating service account `yo-e2e@yo-theshop.iam.gserviceaccount.com` with `--audiences` set to
+the web client id, since a human account cannot mint a token for an arbitrary audience):
+
+| Check | Result |
+|---|---|
+| First sign-in, no username | `404 username_required` |
+| Same token + username | `201`, account `GTEST` created and linked |
+| Issued bearer token | `GET /v1/friends` → `200 {"friends":[]}` |
+| Returning sign-in, no username | `200 GTEST` |
+| Junk username once linked | `200 GTEST` — ignored, owner not locked out |
+| `POST /v1/login` as that account | never succeeds (401/400 for every password tried) |
+| Token for another audience | `401 invalid_google_token` |
+
+`GTEST` and its identity and tokens were deleted from the production database afterwards.
+
+The same project is what G2 has been waiting on: `google-services.json` is now obtainable with
+`firebase apps:sdkconfig ANDROID 1:747034506241:android:2643dabcb1f28ae548bc00 --project
+yo-theshop`. Closing G2 additionally needs the FCM service-account key and the app rebuilt with
+that file present, which is separate work.
 
 ---
 
