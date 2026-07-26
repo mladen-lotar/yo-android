@@ -502,5 +502,106 @@ class YoServerTest(unittest.TestCase):
         return status, json.loads(response_body)
 
 
+class InstallPageTest(unittest.TestCase):
+    """
+    The install page is the landing target of shared invite links.
+
+    Deliberately NOT a subclass of YoServerTest: inheriting would re-run every API test a second
+    time under a new name. These routes never touch the database, so the harness here is a stub.
+    """
+
+    server_key = "test-server-key"
+
+    def setUp(self):
+        self.server = SimpleNamespace(
+            database=None,
+            shared_key=self.server_key,
+            fcm_client=None,
+        )
+
+    def raw_request(self, method, path, key=None):
+        """Returns the head and undecoded body, since these responses are HTML and binary."""
+        headers = Message()
+        if key is not None:
+            headers["X-Yo-Key"] = key
+
+        handler = YoRequestHandler.__new__(YoRequestHandler)
+        handler.command = method
+        handler.path = path
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = f"{method} {path} HTTP/1.1"
+        handler.headers = headers
+        handler.rfile = io.BytesIO(b"")
+        handler.wfile = io.BytesIO()
+        handler.server = self.server
+        handler.client_address = ("127.0.0.1", 0)
+        handler.log_message = lambda *_: None
+        handler.do_GET()
+
+        response_head, response_body = handler.wfile.getvalue().split(b"\r\n\r\n", 1)
+        status = int(response_head.splitlines()[0].decode("ascii").split(" ", 2)[1])
+        return status, response_head.decode("latin-1"), response_body
+
+    def test_install_page_is_public_because_invitees_have_no_key(self):
+        status, head, body = self.raw_request("GET", "/install", key=None)
+
+        self.assertEqual(200, status)
+        self.assertIn("text/html", head)
+        self.assertIn(b"<h1>Yo</h1>", body)
+        self.assertIn(b"It's that simple.", body)
+        self.assertIn(b"#9B59B6", body)
+
+    def test_install_page_never_leaks_the_shared_key(self):
+        _, head, body = self.raw_request("GET", "/install", key=None)
+
+        self.assertNotIn(self.server_key.encode("utf-8"), body)
+        self.assertNotIn(self.server_key, head)
+
+    def test_trailing_slash_serves_the_same_page(self):
+        status, _, body = self.raw_request("GET", "/install/", key=None)
+
+        self.assertEqual(200, status)
+        self.assertIn(b"<h1>Yo</h1>", body)
+
+    def test_without_a_configured_apk_the_page_says_so_and_the_download_404s(self):
+        os.environ.pop("YO_APK_PATH", None)
+
+        _, _, page = self.raw_request("GET", "/install", key=None)
+        self.assertIn(b"not published yet", page)
+        self.assertNotIn(b"/install/yo.apk", page)
+
+        status, _, _ = self.raw_request("GET", "/install/yo.apk", key=None)
+        self.assertEqual(404, status)
+
+    def test_with_a_configured_apk_the_page_links_it_and_the_download_serves_bytes(self):
+        apk = tempfile.NamedTemporaryFile(suffix=".apk", delete=False)
+        apk.write(b"PK\x03\x04 pretend-apk")
+        apk.close()
+        self.addCleanup(os.unlink, apk.name)
+        os.environ["YO_APK_PATH"] = apk.name
+        self.addCleanup(os.environ.pop, "YO_APK_PATH", None)
+
+        _, _, page = self.raw_request("GET", "/install", key=None)
+        self.assertIn(b"/install/yo.apk", page)
+
+        status, head, body = self.raw_request("GET", "/install/yo.apk", key=None)
+        self.assertEqual(200, status)
+        self.assertIn("application/vnd.android.package-archive", head)
+        self.assertEqual(b"PK\x03\x04 pretend-apk", body)
+
+    def test_a_configured_but_missing_apk_falls_back_to_404_rather_than_crashing(self):
+        os.environ["YO_APK_PATH"] = "/nonexistent/path/to/yo.apk"
+        self.addCleanup(os.environ.pop, "YO_APK_PATH", None)
+
+        status, _, _ = self.raw_request("GET", "/install/yo.apk", key=None)
+        self.assertEqual(404, status)
+
+    def test_adding_the_public_route_did_not_open_up_the_api(self):
+        status, _, body = self.raw_request("GET", "/v1/friends?username=alice", key=None)
+
+        self.assertEqual(401, status)
+        self.assertIn(b"unauthorized", body)
+
+
 if __name__ == "__main__":
     unittest.main()

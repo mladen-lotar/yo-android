@@ -2,6 +2,8 @@ package com.example.yo.ui.main
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
@@ -52,10 +55,12 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.yo.data.photo.decodeSampledBitmap
 import com.example.yo.domain.model.Group
+import com.example.yo.domain.model.PhoneContact
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.ui.theme.YoBody
 import com.example.yo.ui.theme.YoLabel
@@ -105,6 +110,7 @@ fun MainScreen(
     val friends by viewModel.friends.collectAsState()
     val friendsLoadFailed by viewModel.friendsLoadFailed.collectAsState()
     val groups by viewModel.groups.collectAsState()
+    val contacts by viewModel.contacts.collectAsState()
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
@@ -207,6 +213,13 @@ fun MainScreen(
             onDismiss = { sheet = null },
             onHistory = { sheet = Sheet.History },
             onCreateGroup = { sheet = Sheet.CreateGroup },
+            onInvite = { sheet = Sheet.Invite },
+        )
+        Sheet.Invite -> InviteSheet(
+            contacts = contacts,
+            onDismiss = { sheet = null },
+            onRefreshContacts = viewModel::refreshContacts,
+            inviteMessageFor = viewModel::inviteMessageFor,
         )
         Sheet.History -> HistorySheet(history = history, onDismiss = { sheet = null })
         Sheet.CreateGroup -> CreateGroupSheet(
@@ -221,7 +234,7 @@ fun MainScreen(
     }
 }
 
-private enum class Sheet { Menu, History, CreateGroup }
+private enum class Sheet { Menu, History, CreateGroup, Invite }
 
 /** A send target — a person or a group. Both render as an identical colour band. */
 private sealed interface SendTarget {
@@ -353,17 +366,26 @@ private fun MenuSheet(
     onDismiss: () -> Unit,
     onHistory: () -> Unit,
     onCreateGroup: () -> Unit,
+    onInvite: () -> Unit,
 ) {
     YoSheet(onDismiss = onDismiss) {
         Column(modifier = Modifier.fillMaxWidth()) {
+            // INVITE is not an invention: Yo's own menu render carried INVITE and FIND FRIENDS
+            // rows, and the Windows Phone build had a dedicated INVITE band in the contact list.
             Band(
                 color = YoPalette.colorForIndex(0),
+                label = "INVITE",
+                onClick = onInvite,
+                onLongClick = onInvite,
+            )
+            Band(
+                color = YoPalette.colorForIndex(1),
                 label = "HISTORY",
                 onClick = onHistory,
                 onLongClick = onHistory,
             )
             Band(
-                color = YoPalette.colorForIndex(1),
+                color = YoPalette.colorForIndex(2),
                 label = "NEW GROUP",
                 onClick = onCreateGroup,
                 onLongClick = onCreateGroup,
@@ -371,6 +393,115 @@ private fun MenuSheet(
             Spacer(modifier = Modifier.height(24.dp))
         }
     }
+}
+
+/**
+ * Pick a contact, hand the invite to the system share sheet. Yo never sees who you sent it to and
+ * never reads a phone number — [PhoneContact] carries only an id and a display name, and the
+ * recipient is chosen inside WhatsApp/Viber/Messenger/SMS after the chooser opens.
+ */
+@Composable
+private fun InviteSheet(
+    contacts: List<PhoneContact>,
+    onDismiss: () -> Unit,
+    onRefreshContacts: () -> Unit,
+    inviteMessageFor: (PhoneContact?) -> String,
+) {
+    val context = LocalContext.current
+    var permissionDenied by remember { mutableStateOf(false) }
+
+    val contactsPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        permissionDenied = !granted
+        if (granted) onRefreshContacts()
+    }
+
+    // Read on open, not at startup: the grant may have happened seconds ago, or the address book
+    // may have changed since the app launched.
+    LaunchedEffect(Unit) {
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_CONTACTS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            onRefreshContacts()
+        } else {
+            contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+        }
+    }
+
+    YoSheet(onDismiss = onDismiss) {
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            item(key = "invite-title") {
+                Text(
+                    text = "INVITE TO YO",
+                    style = YoLabel,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp, bottom = 14.dp),
+                )
+            }
+
+            // Always available, permission or not — sharing the link never needed the address book.
+            item(key = "invite-share-anyone") {
+                Band(
+                    color = YoPalette.colorForIndex(0),
+                    label = "SHARE LINK",
+                    onClick = { context.shareInvite(inviteMessageFor(null)) },
+                    onLongClick = { context.shareInvite(inviteMessageFor(null)) },
+                )
+            }
+
+            if (contacts.isEmpty()) {
+                item(key = "invite-empty") {
+                    Text(
+                        text = if (permissionDenied) {
+                            "NO CONTACTS ACCESS — SHARE LINK STILL WORKS"
+                        } else {
+                            "NO CONTACTS FOUND"
+                        },
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 18.dp),
+                    )
+                }
+            }
+
+            itemsIndexed(contacts, key = { _, contact -> contact.id }) { index, contact ->
+                Band(
+                    // +1 so the first contact does not repeat the SHARE LINK band's colour.
+                    color = YoPalette.colorForIndex(index + 1),
+                    label = contact.displayName,
+                    onClick = { context.shareInvite(inviteMessageFor(contact)) },
+                    onLongClick = { context.shareInvite(inviteMessageFor(contact)) },
+                )
+            }
+
+            item(key = "invite-bottom") {
+                Spacer(modifier = Modifier.height(28.dp))
+            }
+        }
+    }
+}
+
+/**
+ * Fires the system chooser. ACTION_SEND with text/plain is what every messenger registers for, so
+ * Viber, Messenger, WhatsApp, Signal, Telegram, SMS and email all appear without Yo integrating
+ * with any of them.
+ */
+private fun Context.shareInvite(message: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "Yo")
+        putExtra(Intent.EXTRA_TEXT, message)
+    }
+    val chooser = Intent.createChooser(send, "Invite to Yo").apply {
+        // The sheet is launched from a Composable, whose context may not be an Activity.
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { startActivity(chooser) }
 }
 
 @Composable

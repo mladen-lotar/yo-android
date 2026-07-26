@@ -5,12 +5,15 @@ import com.example.yo.domain.location.LocationCoordinates
 import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.DeviceRegistration
 import com.example.yo.domain.model.Group
+import com.example.yo.domain.model.PhoneContact
 import com.example.yo.domain.model.YoIdentity
 import com.example.yo.domain.model.YoMessage
+import com.example.yo.domain.repository.ContactsRepository
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
 import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.YoRepository
+import com.example.yo.domain.usecase.BuildInviteMessageUseCase
 import com.example.yo.domain.usecase.FetchFriendsUseCase
 import com.example.yo.domain.usecase.RegisterDeviceUseCase
 import com.example.yo.domain.usecase.SendYoToGroupUseCase
@@ -45,6 +48,66 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModelTest {
     private val dispatcher = StandardTestDispatcher()
+
+    private companion object {
+        const val INVITE_URL = "https://yo.example/install"
+    }
+
+    @Test
+    fun `refreshContacts publishes the address book for the invite sheet`() = runTest {
+        val contacts = listOf(
+            PhoneContact(id = "1", displayName = "Alice Smith"),
+            PhoneContact(id = "2", displayName = "Bob"),
+        )
+        val viewModel = createViewModel(contactsRepository = FakeContactsRepository(contacts))
+
+        viewModel.refreshContacts()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf("Alice Smith", "Bob"), viewModel.contacts.value.map { it.displayName })
+    }
+
+    @Test
+    fun `contacts start empty so nothing is read before the sheet is opened`() = runTest {
+        val repository = FakeContactsRepository(listOf(PhoneContact("1", "Alice")))
+        val viewModel = createViewModel(contactsRepository = repository)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.contacts.value.isEmpty())
+        assertEquals(0, repository.loadCount)
+    }
+
+    @Test
+    fun `a failing contacts read leaves the list empty instead of crashing the screen`() = runTest {
+        val viewModel = createViewModel(
+            contactsRepository = FakeContactsRepository(failure = SecurityException("denied")),
+        )
+
+        viewModel.refreshContacts()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.contacts.value.isEmpty())
+    }
+
+    @Test
+    fun `invite message carries the configured url and greets the chosen contact`() {
+        val viewModel = createViewModel()
+
+        val message = viewModel.inviteMessageFor(PhoneContact("1", "Alice Smith"))
+
+        assertTrue(message.startsWith("Hey Alice, "))
+        assertTrue(message.contains(INVITE_URL))
+    }
+
+    @Test
+    fun `invite message without a contact still carries the url`() {
+        val viewModel = createViewModel()
+
+        val message = viewModel.inviteMessageFor(null)
+
+        assertFalse(message.contains("Hey"))
+        assertTrue(message.contains(INVITE_URL))
+    }
 
     @Before
     fun setUp() {
@@ -268,6 +331,7 @@ class MainViewModelTest {
         friends: List<String> = emptyList(),
         friendsFailure: Throwable? = null,
         locationProvider: OneShotLocationProvider = FakeOneShotLocationProvider(),
+        contactsRepository: ContactsRepository = FakeContactsRepository(),
     ): MainViewModel {
         val backendApi = FakeYoBackendApi(friends, friendsFailure)
         val sendYoUseCase = SendYoUseCase(repository)
@@ -288,7 +352,24 @@ class MainViewModelTest {
             repository = repository,
             groupRepository = groupRepository,
             locationProvider = locationProvider,
+            contactsRepository = contactsRepository,
+            buildInviteMessage = BuildInviteMessageUseCase(),
+            inviteUrl = INVITE_URL,
         )
+    }
+
+    private class FakeContactsRepository(
+        private val contacts: List<PhoneContact> = emptyList(),
+        private val failure: Throwable? = null,
+    ) : ContactsRepository {
+        var loadCount = 0
+            private set
+
+        override suspend fun loadContacts(): List<PhoneContact> {
+            loadCount++
+            failure?.let { throw it }
+            return contacts
+        }
     }
 
     private class FakeYoRepository : YoRepository {

@@ -3,6 +3,7 @@ package com.example.yo.di
 import android.content.Context
 import androidx.room.Room
 import com.example.yo.BuildConfig
+import com.example.yo.data.contacts.ContentResolverContactsRepository
 import com.example.yo.data.location.FusedOneShotLocationProvider
 import com.example.yo.data.local.GroupDao
 import com.example.yo.data.local.YoDao
@@ -17,6 +18,7 @@ import com.example.yo.data.repository.GroupRepositoryImpl
 import com.example.yo.data.repository.YoRepositoryImpl
 import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.photo.PhotoEncoder
+import com.example.yo.domain.repository.ContactsRepository
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
 import com.example.yo.domain.repository.GroupRepository
@@ -49,6 +51,10 @@ object AppModule {
 
     @Provides
     fun provideGroupDao(database: YoDatabase): GroupDao = database.groupDao()
+
+    @Provides
+    @InviteUrl
+    fun provideInviteUrl(): String = BuildConfig.YO_INVITE_URL
 
     @Provides
     @Singleton
@@ -101,4 +107,14 @@ abstract class PhotoModule {
     @Binds
     @Singleton
     abstract fun bindPhotoEncoder(impl: BitmapPhotoEncoder): PhotoEncoder
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class ContactsModule {
+    @Binds
+    @Singleton
+    abstract fun bindContactsRepository(
+        impl: ContentResolverContactsRepository,
+    ): ContactsRepository
 }
