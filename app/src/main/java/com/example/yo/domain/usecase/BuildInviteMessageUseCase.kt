@@ -18,9 +18,8 @@ class BuildInviteMessageUseCase @Inject constructor() {
         senderUsername: String,
     ): String {
         val greeting = contact?.displayName
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { "Hey ${firstName(it)}, " }
+            ?.let(::greetableFirstName)
+            ?.let { "Hey $it, " }
             ?: ""
         return buildString {
             append(greeting)
@@ -34,9 +33,20 @@ class BuildInviteMessageUseCase @Inject constructor() {
     }
 
     /**
-     * Only the first name goes in the greeting: address books are full of entries like
-     * "Alice Smith (Work)" and "Mum ❤" that read badly in full.
+     * The first name, but only when greeting by it actually reads like a greeting — otherwise null,
+     * and the message simply opens with "get Yo".
+     *
+     * Real address books are not lists of people's names. They contain businesses
+     * ("AS;Pizza/1"), nameless entries stored as raw numbers ("031 210 904"), and tagged entries
+     * ("Mum ❤"). Naively taking the first space-delimited token produced "Hey AS;Pizza/1," and
+     * "Hey 031," on a live device, so a token now has to look like a name to be used: at least two
+     * characters and letters only.
      */
-    private fun firstName(displayName: String): String =
-        displayName.trim().substringBefore(' ').ifEmpty { displayName.trim() }
+    private fun greetableFirstName(displayName: String): String? {
+        val first = displayName.trim().substringBefore(' ').trim()
+        if (first.length < 2) return null
+        // Letters only — no digits, no punctuation. Accented letters are fine; emoji are not.
+        if (!first.all { it.isLetter() }) return null
+        return first
+    }
 }

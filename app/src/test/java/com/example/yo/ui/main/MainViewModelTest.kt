@@ -15,6 +15,7 @@ import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.YoRepository
 import com.example.yo.domain.usecase.BuildInviteMessageUseCase
 import com.example.yo.domain.usecase.FetchFriendsUseCase
+import com.example.yo.domain.usecase.FilterContactsUseCase
 import com.example.yo.domain.usecase.RegisterDeviceUseCase
 import com.example.yo.domain.usecase.SendYoToGroupUseCase
 import com.example.yo.domain.usecase.SendYoUseCase
@@ -61,20 +62,30 @@ class MainViewModelTest {
         )
         val viewModel = createViewModel(contactsRepository = FakeContactsRepository(contacts))
 
+        // contacts is a WhileSubscribed flow derived from the address book and the search query,
+        // so it only emits while something collects it — mirroring collectAsState() in the sheet.
+        val collector = launch { viewModel.contacts.collect {} }
         viewModel.refreshContacts()
         dispatcher.scheduler.advanceUntilIdle()
 
         assertEquals(listOf("Alice Smith", "Bob"), viewModel.contacts.value.map { it.displayName })
+
+        collector.cancel()
     }
 
     @Test
     fun `contacts start empty so nothing is read before the sheet is opened`() = runTest {
         val repository = FakeContactsRepository(listOf(PhoneContact("1", "Alice")))
         val viewModel = createViewModel(contactsRepository = repository)
+        // Subscribe, so "empty" means the address book genuinely was not read rather than merely
+        // that nothing is collecting the flow.
+        val collector = launch { viewModel.contacts.collect {} }
         dispatcher.scheduler.advanceUntilIdle()
 
         assertTrue(viewModel.contacts.value.isEmpty())
         assertEquals(0, repository.loadCount)
+
+        collector.cancel()
     }
 
     @Test
@@ -83,10 +94,90 @@ class MainViewModelTest {
             contactsRepository = FakeContactsRepository(failure = SecurityException("denied")),
         )
 
+        val collector = launch { viewModel.contacts.collect {} }
         viewModel.refreshContacts()
         dispatcher.scheduler.advanceUntilIdle()
 
         assertTrue(viewModel.contacts.value.isEmpty())
+
+        collector.cancel()
+    }
+
+    @Test
+    fun `typing in the search field narrows the invite list`() = runTest {
+        val viewModel = createViewModel(
+            contactsRepository = FakeContactsRepository(
+                listOf(
+                    PhoneContact("1", "Adam Marjanović"),
+                    PhoneContact("2", "Petra Vego"),
+                    PhoneContact("3", "Ada Lovelace"),
+                ),
+            ),
+        )
+        val collector = launch { viewModel.contacts.collect {} }
+        viewModel.refreshContacts()
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(3, viewModel.contacts.value.size)
+
+        // ASCII query against an accented name — the case that matters on a Croatian address book.
+        viewModel.onContactQueryChange("marjanovic")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf("Adam Marjanović"), viewModel.contacts.value.map { it.displayName })
+
+        collector.cancel()
+    }
+
+    @Test
+    fun `clearing the query restores the whole address book`() = runTest {
+        val viewModel = createViewModel(
+            contactsRepository = FakeContactsRepository(
+                listOf(PhoneContact("1", "Alice"), PhoneContact("2", "Bob")),
+            ),
+        )
+        val collector = launch { viewModel.contacts.collect {} }
+        viewModel.refreshContacts()
+        viewModel.onContactQueryChange("alice")
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, viewModel.contacts.value.size)
+
+        viewModel.onContactQueryChange("")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(2, viewModel.contacts.value.size)
+
+        collector.cancel()
+    }
+
+    @Test
+    fun `a query matching nothing is distinguishable from having no contacts at all`() = runTest {
+        val viewModel = createViewModel(
+            contactsRepository = FakeContactsRepository(listOf(PhoneContact("1", "Alice"))),
+        )
+        val collector = launch { viewModel.contacts.collect {} }
+        val flagCollector = launch { viewModel.contactsFilteredToNothing.collect {} }
+        viewModel.refreshContacts()
+        viewModel.onContactQueryChange("zzzz")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.contacts.value.isEmpty())
+        assertTrue(viewModel.contactsFilteredToNothing.value)
+
+        collector.cancel()
+        flagCollector.cancel()
+    }
+
+    @Test
+    fun `an empty address book is not reported as filtered to nothing`() = runTest {
+        val viewModel = createViewModel(contactsRepository = FakeContactsRepository(emptyList()))
+        val flagCollector = launch { viewModel.contactsFilteredToNothing.collect {} }
+        viewModel.refreshContacts()
+        viewModel.onContactQueryChange("anything")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertFalse(viewModel.contactsFilteredToNothing.value)
+
+        flagCollector.cancel()
     }
 
     @Test
@@ -354,6 +445,7 @@ class MainViewModelTest {
             locationProvider = locationProvider,
             contactsRepository = contactsRepository,
             buildInviteMessage = BuildInviteMessageUseCase(),
+            filterContacts = FilterContactsUseCase(),
             inviteUrl = INVITE_URL,
         )
     }

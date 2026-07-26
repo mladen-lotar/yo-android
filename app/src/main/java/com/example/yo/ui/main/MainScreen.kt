@@ -111,6 +111,8 @@ fun MainScreen(
     val friendsLoadFailed by viewModel.friendsLoadFailed.collectAsState()
     val groups by viewModel.groups.collectAsState()
     val contacts by viewModel.contacts.collectAsState()
+    val contactQuery by viewModel.contactQuery.collectAsState()
+    val contactsFilteredToNothing by viewModel.contactsFilteredToNothing.collectAsState()
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
@@ -217,7 +219,14 @@ fun MainScreen(
         )
         Sheet.Invite -> InviteSheet(
             contacts = contacts,
-            onDismiss = { sheet = null },
+            query = contactQuery,
+            filteredToNothing = contactsFilteredToNothing,
+            onQueryChange = viewModel::onContactQueryChange,
+            onDismiss = {
+                // Clear the query on close so the next open starts from the whole address book.
+                viewModel.onContactQueryChange("")
+                sheet = null
+            },
             onRefreshContacts = viewModel::refreshContacts,
             inviteMessageFor = viewModel::inviteMessageFor,
         )
@@ -400,9 +409,13 @@ private fun MenuSheet(
  * never reads a phone number — [PhoneContact] carries only an id and a display name, and the
  * recipient is chosen inside WhatsApp/Viber/Messenger/SMS after the chooser opens.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun InviteSheet(
     contacts: List<PhoneContact>,
+    query: String,
+    filteredToNothing: Boolean,
+    onQueryChange: (String) -> Unit,
     onDismiss: () -> Unit,
     onRefreshContacts: () -> Unit,
     inviteMessageFor: (PhoneContact?) -> String,
@@ -433,14 +446,32 @@ private fun InviteSheet(
 
     YoSheet(onDismiss = onDismiss) {
         LazyColumn(modifier = Modifier.fillMaxWidth()) {
-            item(key = "invite-title") {
-                Text(
-                    text = "INVITE TO YO",
-                    style = YoLabel,
+            // The header stays pinned outside the scrolling list further down; here it is the
+            // title plus the search field, which has to remain reachable with a long address book.
+            stickyHeader(key = "invite-header") {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 4.dp, bottom = 14.dp),
-                )
+                        .background(YoPalette.Amethyst),
+                ) {
+                    Text(
+                        text = "INVITE TO YO",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp, bottom = 12.dp),
+                    )
+                    Box(modifier = Modifier.padding(horizontal = 20.dp)) {
+                        ChromelessField(
+                            value = query,
+                            onValueChange = onQueryChange,
+                            placeholder = "SEARCH CONTACTS",
+                            // Names are mixed case, so the search field must not force caps the way
+                            // the link/hashtag fields do.
+                            capitalize = false,
+                        )
+                    }
+                }
             }
 
             // Always available, permission or not — sharing the link never needed the address book.
@@ -456,10 +487,10 @@ private fun InviteSheet(
             if (contacts.isEmpty()) {
                 item(key = "invite-empty") {
                     Text(
-                        text = if (permissionDenied) {
-                            "NO CONTACTS ACCESS — SHARE LINK STILL WORKS"
-                        } else {
-                            "NO CONTACTS FOUND"
+                        text = when {
+                            filteredToNothing -> "NO CONTACT MATCHES \"${query.trim().uppercase()}\""
+                            permissionDenied -> "NO CONTACTS ACCESS — SHARE LINK STILL WORKS"
+                            else -> "NO CONTACTS FOUND"
                         },
                         style = YoLabel,
                         modifier = Modifier
@@ -758,6 +789,7 @@ private fun ChromelessField(
     value: String,
     onValueChange: (String) -> Unit,
     placeholder: String,
+    capitalize: Boolean = true,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Box(contentAlignment = Alignment.Center) {
@@ -775,8 +807,12 @@ private fun ChromelessField(
                 cursorBrush = SolidColor(YoPalette.OnColor),
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(
-                    capitalization = KeyboardCapitalization.Characters,
-                    imeAction = ImeAction.Done,
+                    capitalization = if (capitalize) {
+                        KeyboardCapitalization.Characters
+                    } else {
+                        KeyboardCapitalization.None
+                    },
+                    imeAction = if (capitalize) ImeAction.Done else ImeAction.Search,
                 ),
                 modifier = Modifier
                     .fillMaxWidth()

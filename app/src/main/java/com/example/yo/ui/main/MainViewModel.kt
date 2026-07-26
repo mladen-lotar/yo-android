@@ -13,12 +13,14 @@ import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.YoRepository
 import com.example.yo.domain.usecase.BuildInviteMessageUseCase
 import com.example.yo.domain.usecase.FetchFriendsUseCase
+import com.example.yo.domain.usecase.FilterContactsUseCase
 import com.example.yo.domain.usecase.RegisterDeviceUseCase
 import com.example.yo.domain.usecase.SendYoToGroupUseCase
 import com.example.yo.domain.usecase.SendYoUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,6 +38,7 @@ class MainViewModel @Inject constructor(
     private val locationProvider: OneShotLocationProvider,
     private val contactsRepository: ContactsRepository,
     private val buildInviteMessage: BuildInviteMessageUseCase,
+    private val filterContacts: FilterContactsUseCase,
     @InviteUrl private val inviteUrl: String,
 ) : ViewModel() {
     private val _friends = MutableStateFlow<List<String>>(emptyList())
@@ -45,7 +48,36 @@ class MainViewModel @Inject constructor(
     val friendsLoadFailed: StateFlow<Boolean> = _friendsLoadFailed.asStateFlow()
 
     private val _contacts = MutableStateFlow<List<PhoneContact>>(emptyList())
-    val contacts: StateFlow<List<PhoneContact>> = _contacts.asStateFlow()
+
+    private val _contactQuery = MutableStateFlow("")
+    val contactQuery: StateFlow<String> = _contactQuery.asStateFlow()
+
+    /**
+     * The invite list, already narrowed by whatever is typed in the search field. Derived rather
+     * than stored, so the raw address book is filtered once per keystroke and the UI never has to
+     * hold two copies in sync.
+     */
+    val contacts: StateFlow<List<PhoneContact>> =
+        combine(_contacts, _contactQuery) { all, query -> filterContacts(all, query) }
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = emptyList(),
+            )
+
+    /** True when a query is hiding everything, so the sheet can say so instead of looking broken. */
+    val contactsFilteredToNothing: StateFlow<Boolean> =
+        combine(_contacts, contacts, _contactQuery) { all, shown, query ->
+            query.isNotBlank() && all.isNotEmpty() && shown.isEmpty()
+        }.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = false,
+        )
+
+    fun onContactQueryChange(query: String) {
+        _contactQuery.value = query
+    }
 
     /** The share text is built here so the wording stays testable and out of the Composable. */
     fun inviteMessageFor(contact: PhoneContact?): String =

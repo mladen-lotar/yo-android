@@ -137,6 +137,18 @@ appear without Yo integrating with any of them.
 This is not an invented screen: Yo's own menu render carried **INVITE** and **FIND FRIENDS** rows,
 and the Windows Phone build had a dedicated uppercase INVITE band in the contact list itself.
 
+A **search field** pins to the top of the sheet, because a real address book is hundreds of entries
+and scrolling 89dp bands through it is unusable. Matching is deliberately forgiving: case-insensitive,
+**diacritic-insensitive** (typing `marjanovic` finds `Marjanović`, `zeljko` finds `Željko` — without
+this the filter is useless on a Croatian address book), matching any word rather than only the start
+of a name, and requiring all terms of a multi-word query in any order. Digits are preserved, so a
+contact stored as a bare number stays findable by typing part of it. A query that matches nothing
+says so explicitly rather than looking like an empty address book.
+
+The greeting is only used when the contact's first token actually reads like a name — at least two
+characters, letters only. Live devices produced `Hey AS;Pizza/1,` for a business and `Hey 031,` for a
+nameless contact stored as its phone number; those now open with plain "get Yo" instead.
+
 Privacy is deliberate. `PhoneContact` carries **only an id and a display name** — no phone number,
 no email. The recipient is chosen inside the messaging app after the chooser opens, so Yo never
 reads, stores or transmits anyone's contact details, and nothing about the address book reaches the
