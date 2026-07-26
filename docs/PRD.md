@@ -1,8 +1,9 @@
 # Yo (Android) — Product Requirements Document
 
 Status: consolidated 2026-07-25 from GitHub issues #1–#7 and #11, then reconciled against the
-historical record of the original app. Last revised 2026-07-26, when gaps G3–G7 were closed.
-Repo: `mladen-lotar/yo-android` · Package: `com.example.yo` · Baseline commit: `a7843b8`
+historical record of the original app. Last revised 2026-07-26, when Google sign-in (FR10) was
+added on top of the accounts work that closed gaps G3–G7.
+Repo: `mladen-lotar/yo-android` · Package: `com.example.yo` · Baseline commit: `e401a0c`
 
 This document is the single source of truth for *what this app is meant to be*. It exists because
 the specification previously lived only in closed GitHub issues, so a reader of the checkout saw a
@@ -209,6 +210,47 @@ otherwise anyone could clobber anyone's photo by reusing their id).
 *Source: this task. Historical claims about uppercase usernames and unilateral adds follow Yo's own
 API documentation and the well-documented spammability of the original.*
 
+### FR10 — Sign in with Google (2026-07-26)
+An addition to FR9, never a replacement: username-and-password sign-up and log-in are untouched and
+remain the default path.
+
+**What it is.** A third band, `CONTINUE WITH GOOGLE`, which opens the device's Google account picker
+and signs in as whichever account is chosen. One Yo account is signed in at a time, exactly as
+before; to use a different one, sign out and pick another. Choosing is the point — Credential
+Manager is asked with `setFilterByAuthorizedAccounts(false)` and `setAutoSelectEnabled(false)`, so
+every account on the device is offered every time rather than the app silently latching onto one.
+Credential Manager, not the deprecated `GoogleSignInClient`.
+
+**Why it is two steps the first time.** Google supplies a subject and an email; neither is a Yo
+username, and the username is how friends address each other. So a Google account the backend has
+never seen is answered `404 username_required`, the screen asks for a username, and the app posts
+the *same* token back with the answer — Google is not consulted twice. Every later sign-in is one
+tap and one round trip.
+
+**Identity is keyed on Google's `sub`, not the email address.** An address is neither stable nor
+permanently unique — a Workspace address can be reassigned to a different person — so keying on it
+would eventually hand somebody another user's account. The email is not stored at all; the app has
+no use for it, which is the same restraint applied to `PhoneContact` in FR8.
+
+**An account created this way has no password.** It stores `"!"`, a value `hash_password` cannot
+produce and `verify_password` rejects structurally rather than by a check — it does not split into
+the four fields an encoded hash has. So `/v1/login` stays shut for these accounts by construction,
+and remains indistinguishable from an unknown username.
+
+**Verification is local.** `POST /v1/google` checks the token's signature, audience and expiry with
+`google-auth` against Google's cached certificates, pinning `aud` to the deployment's own client id.
+No call to the `tokeninfo` debugging endpoint, so a sign-in costs no extra round trip and does not
+inherit that endpoint's rate limit. The transport is the existing urllib shim in `fcm_client`, which
+is why `requests` still is not a dependency. The route is public — a new user has no credential by
+definition — and shares the same 10-per-15-minute per-IP limiter as signup and login.
+
+**Both halves are configuration-gated and dark by default.** With no OAuth client id the app omits
+the band entirely rather than disabling it (a dead band in Yo's chromeless idiom is
+indistinguishable from a live one) and the backend answers `503 google_not_configured`. A
+deployment without `google-auth` installed answers `503 google_unavailable` instead of failing to
+start. See §7 for the one console value needed to switch it on.
+*Source: this task.*
+
 ## 4. Technical requirements
 
 **Android.** Kotlin, Jetpack Compose, Hilt, Room, Coroutines. minSdk 24, targetSdk 34, compileSdk
@@ -217,10 +259,15 @@ than re-derived. Build tooling only — none of that project's crypto, Signal-pr
 code is relevant here.
 
 **Backend.** Python ≥ 3.10 (uses PEP-604 `X | Y` annotations — 3.9 fails to import),
-`ThreadingHTTPServer` + SQLite, `google-auth` as the only runtime dependency and only for
-configured FCM delivery. Endpoints: `/healthz`, `/install`, `/v1/signup`, `/v1/login`,
-`/v1/session` (DELETE), `/v1/register`, `/v1/friends` (GET/POST/DELETE), `/v1/block`
-(POST/DELETE), `/v1/blocked`, `/v1/send`, `/v1/photo` (POST + GET), `/v1/broadcast`.
+`ThreadingHTTPServer` + SQLite, `google-auth` as the only runtime dependency, used for configured
+FCM delivery and for verifying Google ID tokens (FR10). Endpoints: `/healthz`, `/install`,
+`/v1/signup`, `/v1/login`, `/v1/google`, `/v1/session` (DELETE), `/v1/register`, `/v1/friends`
+(GET/POST/DELETE), `/v1/block` (POST/DELETE), `/v1/blocked`, `/v1/send`, `/v1/photo` (POST + GET),
+`/v1/broadcast`.
+
+`google-auth` is imported lazily, inside the verifier. A deployment that has not installed it
+serves every other route normally and answers 503 on `/v1/google`, rather than refusing to start
+over a dependency most installations never exercise.
 
 Schema changes are additive — the only mechanism is `CREATE TABLE IF NOT EXISTS` plus a guarded
 `ALTER TABLE ... ADD COLUMN`, so an existing database gains the new tables on next start and needs
@@ -345,6 +392,7 @@ Recorded rather than smoothed over:
 | Monetization | Yo raised funding, never monetized | No revenue requirement. |
 | Email / phone verification, password reset | Yo asked for a username and password only | Adding recovery means adding an email channel and an address to store; deliberately out of scope. A forgotten password means a new account. |
 | Friend requests and acceptance | Yo added people unilaterally | Would contradict the original's whole social model. Blocking is the control instead — see FR9. |
+| Several Yo accounts signed in at once | n/a | Considered and declined when FR10 was scoped. Google sign-in offers the device's account picker so you choose *which* account; one Yo account is signed in at a time, and switching means signing out. A switcher would also force the device's single FCM token to fan out across accounts. |
 
 ---
 
@@ -427,6 +475,22 @@ so it slows credential stuffing rather than preventing account creation at scale
 (which would need an emulator). The G6 class of bug is now caught; static-analysis and on-device
 regressions are not.
 
+**G13 — Google sign-in is built but dark.** FR10 ships complete and tested on both sides, and is
+switched off in every build and on the live host, because no Google Cloud project exists for this
+app — the same missing project that keeps G2 open. Three things are needed and none can be created
+without an interactive console login: an OAuth **web** client id (type 3), the app's signing SHA-1
+registered against an Android client in the same project, and `pip install google-auth` on the
+backend host, where it is declared in `requirements.txt` but has never actually been installed.
+Until then the band is absent from the UI and the route answers 503. Verified in that state: both
+503 paths, and a well-formed token rejected 401 once the library is present.
+
+**G14 — A Google account has no second way in and cannot be unlinked.** The link is one Google
+account to one Yo account, fixed at first sign-in. There is no route to attach a password to a
+Google-created account, to attach a second Google account to an existing one, or to unlink. Losing
+access to the Google account therefore means losing the Yo username, with no recovery path — the
+same trade already accepted for forgotten passwords in §5, but worth naming separately because
+here the credential is held by a third party.
+
 ---
 
 ## 7. Deployment state (as of 2026-07-26)
@@ -454,6 +518,30 @@ because the fleet bridge on `:8787` answers `/healthz` and blanket-rejects every
 Verified end-to-end on a physical S25 with USB port-forwarding removed: friends fetched and a Yo
 sent over the public internet, `GET /v1/friends 200` and `POST /v1/send 200` server-side, with
 history rendering the sent Yo. Gap G2 still applies to the push itself.
+
+### 7.1 Switching on Google sign-in (FR10)
+
+FR10 is deployed but dark (G13). Nothing about it is a secret — a client id is public by design —
+so the only barrier is that the Google Cloud project does not exist yet. To enable it:
+
+1. In the Google Cloud console, create (or reuse) a project and configure the OAuth consent screen.
+2. Create an **Android** OAuth client: package `com.example.yo`, SHA-1
+   `BC:E5:5B:00:AA:7E:68:4D:72:EF:B7:2F:53:AF:B3:97:20:F7:F8:88` (the debug keystore this app is
+   currently signed with; a release keystore needs its own client).
+3. Create a **Web application** OAuth client in the *same* project. Its id — not the Android one —
+   is what both halves use, because Android sends it as the `serverClientId` and the backend pins
+   the token's audience to it.
+4. Backend: `pip install google-auth` for the interpreter in the plist, add
+   `YO_GOOGLE_CLIENT_ID=<web client id>` to the agent's `EnvironmentVariables`, and
+   `launchctl kickstart -k gui/$UID/com.yo.backend`.
+5. App: build with `-PyoGoogleClientId=<same web client id>` (or set `yoGoogleClientId` in
+   `local.properties`) and reinstall.
+
+Steps 4 and 5 take the same value. Getting them out of step fails closed — a mismatched audience is
+rejected as an invalid token, not accepted.
+
+Doing this also unblocks G2: the same project supplies `google-services.json` and the FCM service
+account.
 
 ---
 

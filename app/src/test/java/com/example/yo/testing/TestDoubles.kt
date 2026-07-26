@@ -3,8 +3,12 @@ package com.example.yo.testing
 import com.example.yo.data.remote.AddFriendOutcome
 import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.domain.model.AuthFailure
+import android.content.Context
 import com.example.yo.domain.model.AuthResult
+import com.example.yo.domain.model.GoogleAuthResult
 import com.example.yo.domain.model.YoSession
+import com.example.yo.domain.repository.GoogleIdTokenProvider
+import com.example.yo.domain.repository.GoogleIdTokenResult
 import com.example.yo.domain.repository.SessionStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +25,11 @@ open class StubYoBackendApi : YoBackendApi {
 
     override suspend fun logIn(username: String, password: String): AuthResult =
         AuthResult.Failure(AuthFailure.Unreachable)
+
+    override suspend fun signInWithGoogle(
+        idToken: String,
+        username: String?,
+    ): GoogleAuthResult = GoogleAuthResult.Failure(AuthFailure.Unreachable)
 
     override suspend fun logOut(): Boolean = true
 
@@ -44,7 +53,27 @@ open class StubYoBackendApi : YoBackendApi {
     ): Boolean = true
 }
 
+/**
+ * Stands in for the device account picker. [result] is what the picker "returns"; [calls] records
+ * that it was shown at all, which is how tests tell "did not ask Google" apart from "asked and
+ * was refused".
+ */
+class FakeGoogleIdTokenProvider(
+    var result: GoogleIdTokenResult = GoogleIdTokenResult.Success(TEST_GOOGLE_ID_TOKEN),
+    override val isConfigured: Boolean = true,
+) : GoogleIdTokenProvider {
+    var calls = 0
+        private set
+
+    override suspend fun requestIdToken(context: Context): GoogleIdTokenResult {
+        calls++
+        return result
+    }
+}
+
 const val TEST_USERNAME = "ME"
+
+const val TEST_GOOGLE_ID_TOKEN = "google.id.token"
 
 class FakeSessionStore(
     initial: YoSession? = YoSession(username = TEST_USERNAME, token = "test-token"),

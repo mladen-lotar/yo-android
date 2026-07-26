@@ -82,6 +82,21 @@ class YoDatabase:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS identities(
+                    provider TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at INTEGER,
+                    PRIMARY KEY (provider, subject)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_identities_username"
+                " ON identities(username)"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS friendships(
                     owner TEXT NOT NULL,
                     friend TEXT NOT NULL,
@@ -153,6 +168,59 @@ class YoDatabase:
                 (username,),
             ).fetchone()
         return row is not None
+
+    def username_for_identity(self, provider: str, subject: str) -> Optional[str]:
+        """The account an external identity signs in to, or None if it has never signed in."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT username FROM identities WHERE provider = ? AND subject = ?",
+                (provider, subject),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def create_linked_account(
+        self,
+        username: str,
+        provider: str,
+        subject: str,
+        password_hash: str,
+        created_at: Optional[int] = None,
+    ) -> bool:
+        """Create an account and link it to an external identity, both or neither.
+
+        One transaction on purpose. Two separate writes could leave an account that exists and
+        is linked to nothing, and since the username is then taken its owner could never claim
+        it - the failure would be permanent and invisible.
+
+        Returns False when the username is already taken or the identity is already linked.
+        """
+        timestamp = int(time.time()) if created_at is None else created_at
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO accounts(username, password_hash, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (username, password_hash, timestamp),
+            )
+            if cursor.rowcount != 1:
+                return False
+            linked = connection.execute(
+                """
+                INSERT OR IGNORE INTO identities(provider, subject, username, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (provider, subject, username, timestamp),
+            )
+            if linked.rowcount != 1:
+                # The identity was claimed between the lookup and here. Undo the account so the
+                # username stays free; `with connection` would otherwise commit it.
+                connection.execute(
+                    "DELETE FROM accounts WHERE username = ?",
+                    (username,),
+                )
+                return False
+        return True
 
     def store_token(
         self,

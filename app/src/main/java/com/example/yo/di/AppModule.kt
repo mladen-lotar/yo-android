@@ -9,6 +9,7 @@ import com.example.yo.data.local.GroupDao
 import com.example.yo.data.local.YoDao
 import com.example.yo.data.local.YoDatabase
 import com.example.yo.data.photo.BitmapPhotoEncoder
+import com.example.yo.data.remote.CredentialManagerGoogleIdTokenProvider
 import com.example.yo.data.remote.FirebaseFcmTokenProvider
 import com.example.yo.data.remote.HttpYoBackendApi
 import com.example.yo.data.remote.SharedPreferencesDeviceRegistrationStore
@@ -22,6 +23,7 @@ import com.example.yo.domain.photo.PhotoEncoder
 import com.example.yo.domain.repository.ContactsRepository
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
+import com.example.yo.domain.repository.GoogleIdTokenProvider
 import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.SessionStore
 import com.example.yo.domain.repository.YoRemoteDeliveryPort
@@ -57,6 +59,10 @@ object AppModule {
     @Provides
     @InviteUrl
     fun provideInviteUrl(): String = BuildConfig.YO_INVITE_URL
+
+    @Provides
+    @GoogleClientId
+    fun provideGoogleClientId(): String = BuildConfig.YO_GOOGLE_CLIENT_ID
 
     @Provides
     @Singleton
@@ -95,6 +101,12 @@ abstract class RepositoryModule {
     @Binds
     @Singleton
     abstract fun bindSessionStore(impl: SharedPreferencesSessionStore): SessionStore
+
+    @Binds
+    @Singleton
+    abstract fun bindGoogleIdTokenProvider(
+        impl: CredentialManagerGoogleIdTokenProvider,
+    ): GoogleIdTokenProvider
 }
 
 @Module

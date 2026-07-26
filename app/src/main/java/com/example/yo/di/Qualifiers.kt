@@ -9,3 +9,11 @@ import javax.inject.Qualifier
 @Qualifier
 @Retention(AnnotationRetention.BINARY)
 annotation class InviteUrl
+
+/**
+ * The Google OAuth web client id. Blank when this build has none, which is how the sign-in screen
+ * knows to leave the Google band off.
+ */
+@Qualifier
+@Retention(AnnotationRetention.BINARY)
+annotation class GoogleClientId

@@ -21,6 +21,15 @@ blocked sender still sees an ordinary "delivered", so blocking never notifies th
 The backend issues a bearer token per device at sign-in. No shared API key is compiled into the
 app, so extracting the APK yields no credentials.
 
+**Sign in with Google** is offered alongside, never instead. Tapping `CONTINUE WITH GOOGLE` opens
+the device's account picker — every Google account on the phone, every time, so you choose which
+one rather than the app latching onto the first. One Yo account is signed in at a time; to use
+another, sign out. The first time a Google account is used it is asked to pick a Yo username, since
+Google supplies an email and friends are addressed by username; after that it is one tap.
+
+The band only appears when the build carries an OAuth client id, and **no build currently does** —
+see "Google sign-in" below and gap G13 in the PRD.
+
 ## Build
 
 Use JDK 17 and an Android SDK with API 34 installed:
@@ -63,3 +72,20 @@ sign-in.
 
 Plain HTTP only works in debug builds (`usesCleartextTraffic` is set in the debug manifest); release
 builds require HTTPS. See [backend/README.md](backend/README.md) to run the server.
+
+## Google sign-in
+
+Off unless configured, in both halves. Pass the OAuth **web** client id (type 3) of your Google
+Cloud project — not the Android client id — the same way as any other build property:
+
+```properties
+yoGoogleClientId=<web-client-id>.apps.googleusercontent.com
+```
+
+Leave it unset and the app omits the Google band entirely. The backend needs the identical value as
+`YO_GOOGLE_CLIENT_ID`, plus `pip install -r backend/requirements.txt`, or `/v1/google` answers 503.
+A mismatch between the two fails closed: the token's audience will not match and it is rejected.
+
+Unlike the old `yoBackendKey`, this is not a secret — an OAuth client id is public by design and
+grants nothing without the Google account it names. Your app's signing SHA-1 must be registered
+against an Android client in the same project. Full walkthrough: PRD §7.1.

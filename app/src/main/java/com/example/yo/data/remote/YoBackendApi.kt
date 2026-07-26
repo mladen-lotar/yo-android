@@ -2,6 +2,7 @@ package com.example.yo.data.remote
 
 import com.example.yo.domain.model.AuthFailure
 import com.example.yo.domain.model.AuthResult
+import com.example.yo.domain.model.GoogleAuthResult
 import com.example.yo.domain.model.YoSession
 import com.example.yo.domain.repository.SessionStore
 import java.io.IOException
@@ -25,6 +26,13 @@ interface YoBackendApi {
     suspend fun signUp(username: String, password: String): AuthResult
 
     suspend fun logIn(username: String, password: String): AuthResult
+
+    /**
+     * Exchange a Google ID token for a session. [username] is null on the first attempt and set
+     * only after the backend has answered [GoogleAuthResult.UsernameRequired]; once the Google
+     * account is known the server ignores it and returns the account it is already linked to.
+     */
+    suspend fun signInWithGoogle(idToken: String, username: String?): GoogleAuthResult
 
     suspend fun logOut(): Boolean
 
@@ -96,6 +104,51 @@ class HttpYoBackendApi(
             },
         )
     }
+
+    override suspend fun signInWithGoogle(
+        idToken: String,
+        username: String?,
+    ): GoogleAuthResult {
+        val body =
+            JSONObject()
+                .put("id_token", idToken)
+                .apply { if (username != null) put("username", username) }
+                .toString()
+        val response =
+            try {
+                execute(method = "POST", path = "/v1/google", body = body)
+            } catch (error: IOException) {
+                return GoogleAuthResult.Failure(AuthFailure.Unreachable)
+            }
+        if (response.isSuccessful) {
+            val payload = JSONObject(response.body)
+            return GoogleAuthResult.Success(
+                YoSession(
+                    username = payload.getString("username"),
+                    token = payload.getString("token"),
+                ),
+            )
+        }
+        if (response.statusCode == HttpURLConnection.HTTP_NOT_FOUND &&
+            errorCode(response.body) == "username_required"
+        ) {
+            return GoogleAuthResult.UsernameRequired
+        }
+        return GoogleAuthResult.Failure(
+            when (response.statusCode) {
+                HttpURLConnection.HTTP_CONFLICT -> AuthFailure.UsernameTaken
+                HttpURLConnection.HTTP_UNAUTHORIZED -> AuthFailure.GoogleRejected
+                HttpURLConnection.HTTP_BAD_REQUEST -> AuthFailure.Rejected
+                HttpURLConnection.HTTP_UNAVAILABLE -> AuthFailure.GoogleUnavailable
+                TOO_MANY_REQUESTS -> AuthFailure.RateLimited
+                else -> AuthFailure.Unreachable
+            },
+        )
+    }
+
+    /** The `error` field, or empty when the body is not the JSON object we expect. */
+    private fun errorCode(body: String): String =
+        runCatching { JSONObject(body).optString("error") }.getOrDefault("")
 
     override suspend fun logOut(): Boolean =
         runCatching { execute(method = "DELETE", path = "/v1/session").isSuccessful }

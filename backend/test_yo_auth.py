@@ -67,6 +67,33 @@ class PasswordHashingTest(unittest.TestCase):
         self.assertGreaterEqual(yo_auth.DEFAULT_ITERATIONS, 600_000)
 
 
+class UnusablePasswordTest(unittest.TestCase):
+    """The sentinel stored for accounts that sign in through Google and have no password."""
+
+    def test_nothing_verifies_against_it(self):
+        for candidate in (
+            "",
+            "!",
+            yo_auth.UNUSABLE_PASSWORD_HASH,
+            "correct-horse-battery",
+            "pbkdf2_sha256$1$00$00",
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertFalse(
+                    yo_auth.verify_password(
+                        candidate,
+                        yo_auth.UNUSABLE_PASSWORD_HASH,
+                    )
+                )
+
+    def test_hash_password_can_never_produce_it(self):
+        """If it could, a chosen password would unlock every passwordless account."""
+        self.assertNotEqual(
+            yo_auth.UNUSABLE_PASSWORD_HASH,
+            yo_auth.hash_password("!", iterations=1),
+        )
+
+
 class UsernameRulesTest(unittest.TestCase):
     def test_normalisation_uppercases_and_trims(self):
         self.assertEqual("ALICE", yo_auth.normalize_username("  alice "))

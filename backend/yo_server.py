@@ -13,6 +13,7 @@ from typing import Any, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 import yo_auth
+import yo_google
 from fcm_client import FCMClient, FCMDeliveryError, FCMNotConfiguredError
 from yo_db import YoDatabase
 
@@ -152,11 +153,15 @@ class YoHTTPServer(ThreadingHTTPServer):
         database: YoDatabase,
         fcm_client: Any,
         password_iterations: int = yo_auth.DEFAULT_ITERATIONS,
+        google_verifier: Optional[Any] = None,
     ):
         super().__init__(server_address, YoRequestHandler)
         self.database = database
         self.fcm_client = fcm_client
         self.password_iterations = password_iterations
+        # None when no YO_GOOGLE_CLIENT_ID is configured, which keeps /v1/google answering 503
+        # rather than pretending to verify tokens against an audience nobody set.
+        self.google_verifier = google_verifier
         self.credential_limiter = RateLimiter(
             CREDENTIAL_ATTEMPTS,
             CREDENTIAL_WINDOW_SECONDS,
@@ -222,6 +227,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         # Signup and login mint credentials, so they cannot themselves require one.
         if parsed.path in ("/v1/signup", "/v1/login"):
             self._handle_credentials(parsed.path)
+            return
+        if parsed.path == "/v1/google":
+            self._handle_google()
             return
         client_id: Optional[str] = None
         username: Optional[str] = None
@@ -350,6 +358,95 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 return
             status = HTTPStatus.OK
 
+        self._issue_token(status, username)
+
+    def _handle_google(self) -> None:
+        """POST /v1/google - sign in with a Google ID token.
+
+        Two steps by necessity rather than by choice. Google hands over a subject and an email;
+        neither is a Yo username, and the username is how friends address each other. So a Google
+        account nobody has seen before is answered with `username_required`, the app asks for one,
+        and it posts the same token again. Every later sign-in is a single round trip.
+        """
+        verifier = self.server.google_verifier
+        if verifier is None:
+            self._write_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "google_not_configured"},
+            )
+            return
+        if not self.server.credential_limiter.allow(self._client_address()):
+            self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
+            return
+        try:
+            body = self._read_json_body()
+            raw_token = self._required_string(body, "id_token")
+        except BadRequestError as error:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "bad_request", "reason": str(error)},
+            )
+            return
+
+        try:
+            subject = verifier.subject_for(raw_token)
+        except yo_google.GoogleAuthError:
+            # The library's reason is not echoed back: it is derived from attacker-controlled
+            # input and tells an honest caller nothing they can act on.
+            self._write_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"error": "invalid_google_token"},
+            )
+            return
+        except yo_google.GoogleUnavailableError:
+            self._write_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "google_unavailable"},
+            )
+            return
+
+        username = self.server.database.username_for_identity(
+            yo_google.PROVIDER,
+            subject,
+        )
+        if username is not None:
+            self._issue_token(HTTPStatus.OK, username)
+            return
+
+        requested = body.get("username")
+        if not isinstance(requested, str) or not requested.strip():
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "username_required"})
+            return
+        try:
+            username = yo_auth.validate_username(requested)
+        except yo_auth.CredentialError as error:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "bad_request", "reason": str(error)},
+            )
+            return
+
+        created = self.server.database.create_linked_account(
+            username,
+            yo_google.PROVIDER,
+            subject,
+            yo_auth.UNUSABLE_PASSWORD_HASH,
+        )
+        if not created:
+            # Either the name belongs to somebody else, or this Google account was linked by a
+            # request that arrived while this one was verifying. Only the second can sign in.
+            linked = self.server.database.username_for_identity(
+                yo_google.PROVIDER,
+                subject,
+            )
+            if linked is None:
+                self._write_json(HTTPStatus.CONFLICT, {"error": "username_taken"})
+                return
+            self._issue_token(HTTPStatus.OK, linked)
+            return
+        self._issue_token(HTTPStatus.CREATED, username)
+
+    def _issue_token(self, status: HTTPStatus, username: str) -> None:
         token = yo_auth.new_token()
         self.server.database.store_token(yo_auth.hash_token(token), username)
         self._write_json(status, {"token": token, "username": username})
@@ -660,14 +757,20 @@ def create_server(
     database_path: os.PathLike | str,
     fcm_client: Optional[Any] = None,
     password_iterations: int = yo_auth.DEFAULT_ITERATIONS,
+    google_verifier: Optional[Any] = None,
 ) -> YoHTTPServer:
     database = YoDatabase(database_path)
     database.initialize()
+    if google_verifier is None:
+        client_id = yo_google.configured_client_id()
+        if client_id is not None:
+            google_verifier = yo_google.GoogleIdTokenVerifier(client_id)
     return YoHTTPServer(
         (host, port),
         database=database,
         fcm_client=fcm_client or FCMClient(),
         password_iterations=password_iterations,
+        google_verifier=google_verifier,
     )
 
 
