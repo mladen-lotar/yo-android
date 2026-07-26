@@ -10,6 +10,7 @@ import androidx.exifinterface.media.ExifInterface
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
 import java.io.FileOutputStream
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -21,8 +22,17 @@ import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class BitmapPhotoEncoderTest {
+    // The encoder hardcoded Dispatchers.IO, so its work hopped to a shared pool that runTest's
+    // 10s wall-clock budget cannot wait out on a loaded machine. Injecting the test dispatcher
+    // keeps the encode on the test scheduler. Fixture bitmaps are built before runTest is
+    // entered: writing a 4032x3024 JPEG is test setup, not the behaviour under test, and it
+    // alone burned ~4s of that budget under load.
+    private val testDispatcher = StandardTestDispatcher()
+
+    private fun encoder(context: Context) = BitmapPhotoEncoder(context, testDispatcher)
+
     @Test
-    fun `encodeForUpload returns a valid JPEG payload`() = runTest {
+    fun `encodeForUpload returns a valid JPEG payload`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val uri =
             writeBitmap(
@@ -32,33 +42,37 @@ class BitmapPhotoEncoderTest {
                 format = Bitmap.CompressFormat.PNG,
             )
 
-        val payload = BitmapPhotoEncoder(context).encodeForUpload(uri.toString())
+        runTest(testDispatcher) {
+            val payload = encoder(context).encodeForUpload(uri.toString())
 
-        assertNotNull(payload)
-        val encodedPayload = requireNotNull(payload)
-        assertEquals("image/jpeg", encodedPayload.mimeType)
-        val jpegBytes = Base64.decode(encodedPayload.base64Data, Base64.NO_WRAP)
-        val decoded = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-        assertNotNull(decoded)
-        val decodedBitmap = requireNotNull(decoded)
-        assertEquals(64, decodedBitmap.width)
-        assertEquals(32, decodedBitmap.height)
+            assertNotNull(payload)
+            val encodedPayload = requireNotNull(payload)
+            assertEquals("image/jpeg", encodedPayload.mimeType)
+            val jpegBytes = Base64.decode(encodedPayload.base64Data, Base64.NO_WRAP)
+            val decoded = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+            assertNotNull(decoded)
+            val decodedBitmap = requireNotNull(decoded)
+            assertEquals(64, decodedBitmap.width)
+            assertEquals(32, decodedBitmap.height)
+        }
     }
 
     @Test
-    fun `encodeForUpload returns null for a nonexistent Uri`() = runTest {
+    fun `encodeForUpload returns null for a nonexistent Uri`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val missingFile = File(context.cacheDir, "missing-photo-${System.nanoTime()}.jpg")
 
-        val payload =
-            BitmapPhotoEncoder(context)
-                .encodeForUpload(Uri.fromFile(missingFile).toString())
+        runTest(testDispatcher) {
+            val payload =
+                encoder(context)
+                    .encodeForUpload(Uri.fromFile(missingFile).toString())
 
-        assertNull(payload)
+            assertNull(payload)
+        }
     }
 
     @Test
-    fun `encodeForUpload applies EXIF rotation`() = runTest {
+    fun `encodeForUpload applies EXIF rotation`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val sourceWidth = 80
         val sourceHeight = 40
@@ -80,12 +94,14 @@ class BitmapPhotoEncoderTest {
             ),
         )
 
-        val payload = requireNotNull(BitmapPhotoEncoder(context).encodeForUpload(uri.toString()))
-        val jpegBytes = Base64.decode(payload.base64Data, Base64.NO_WRAP)
-        val decoded = requireNotNull(BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size))
+        runTest(testDispatcher) {
+            val payload = requireNotNull(encoder(context).encodeForUpload(uri.toString()))
+            val jpegBytes = Base64.decode(payload.base64Data, Base64.NO_WRAP)
+            val decoded = requireNotNull(BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size))
 
-        assertEquals(sourceHeight, decoded.width)
-        assertEquals(sourceWidth, decoded.height)
+            assertEquals(sourceHeight, decoded.width)
+            assertEquals(sourceWidth, decoded.height)
+        }
     }
 
     @Test
@@ -96,7 +112,7 @@ class BitmapPhotoEncoderTest {
     }
 
     @Test
-    fun `encoded JPEG long edge does not exceed the upload cap`() = runTest {
+    fun `encoded JPEG long edge does not exceed the upload cap`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val uri =
             writeBitmap(
@@ -106,15 +122,17 @@ class BitmapPhotoEncoderTest {
                 format = Bitmap.CompressFormat.JPEG,
             )
 
-        val payload = BitmapPhotoEncoder(context).encodeForUpload(uri.toString())
+        runTest(testDispatcher) {
+            val payload = encoder(context).encodeForUpload(uri.toString())
 
-        assertNotNull(payload)
-        val jpegBytes = Base64.decode(requireNotNull(payload).base64Data, Base64.NO_WRAP)
-        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, options)
-        assertTrue(options.outWidth > 0)
-        assertTrue(options.outHeight > 0)
-        assertTrue(maxOf(options.outWidth, options.outHeight) <= UPLOAD_MAX_EDGE_PX)
+            assertNotNull(payload)
+            val jpegBytes = Base64.decode(requireNotNull(payload).base64Data, Base64.NO_WRAP)
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, options)
+            assertTrue(options.outWidth > 0)
+            assertTrue(options.outHeight > 0)
+            assertTrue(maxOf(options.outWidth, options.outHeight) <= UPLOAD_MAX_EDGE_PX)
+        }
     }
 
     private fun writeBitmap(

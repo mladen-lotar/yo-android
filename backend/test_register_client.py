@@ -38,20 +38,41 @@ class RegisterClientTest(unittest.TestCase):
     def test_subscribe_flag_seeds_subscriptions(self):
         database = YoDatabase(self.database_path)
         database.initialize()
-        database.upsert_device("alice", "alice-token")
-        database.upsert_device("bob", "bob-token")
+        # Accounts - and therefore devices, which /v1/register keys off the token's username -
+        # are canonically uppercase, so that is what the join has to match.
+        database.upsert_device("ALICE", "alice-token")
+        database.upsert_device("BOB", "bob-token")
 
         self.run_register_client(
             "--client-id",
             "fedex",
             "--subscribe",
-            "alice",
+            "ALICE",
             "--subscribe",
-            "bob",
+            "BOB",
         )
 
         self.assertEqual(
             ["alice-token", "bob-token"],
+            database.list_subscriber_tokens("fedex"),
+        )
+
+    def test_subscribe_normalises_a_username_typed_in_lower_case(self):
+        """Operators type `--subscribe alice`; without normalisation the join finds nothing
+        and the broadcast silently reports zero subscribers."""
+        database = YoDatabase(self.database_path)
+        database.initialize()
+        database.upsert_device("ALICE", "alice-token")
+
+        self.run_register_client(
+            "--client-id",
+            "fedex",
+            "--subscribe",
+            "  alice ",
+        )
+
+        self.assertEqual(
+            ["alice-token"],
             database.list_subscriber_tokens("fedex"),
         )
 

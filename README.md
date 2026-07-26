@@ -7,8 +7,19 @@ third-party clients. Sends are delivered over FCM and mirrored to local Room his
 
 The app is deliberately small. Before adding anything, read **[docs/PRD.md](docs/PRD.md)** — it
 records what the original product actually was, which features were intentionally left out and why,
-and the known gaps in the current build (notably that real FCM push needs credentials, and that the
-backend shared key ships inside the APK).
+and the known gaps in the current build (notably that real FCM push still needs credentials).
+
+## Accounts
+
+Sign up with a username and a password on first launch — the same two fields the original asked for,
+and nothing else. Usernames are uppercase, 2–32 characters of `A–Z`, `0–9` or `_`.
+
+Your friend list starts empty. Add people by username from **ADD FRIEND** in the menu; adding is
+unilateral, as it was in Yo, and **BLOCK** rather than approval is the control on unwanted Yos. A
+blocked sender still sees an ordinary "delivered", so blocking never notifies the person blocked.
+
+The backend issues a bearer token per device at sign-in. No shared API key is compiled into the
+app, so extracting the APK yields no credentials.
 
 ## Build
 
@@ -17,6 +28,16 @@ Use JDK 17 and an Android SDK with API 34 installed:
 ```sh
 ./gradlew assembleDebug
 ```
+
+## Test
+
+```sh
+./gradlew :app:testDebugUnitTest              # Android unit tests
+cd backend && python3 -m unittest discover    # backend, Python >= 3.10
+```
+
+Both suites run on every push and pull request — see
+[.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Run
 
@@ -28,13 +49,17 @@ With an emulator or Android device connected:
 
 ## Backend configuration
 
-The app reads its backend location and shared key from Gradle properties, falling back to the
-gitignored `local.properties`, and defaults to `http://10.0.2.2:8790` for emulator use:
+The app reads its backend location from a Gradle property, falling back to the gitignored
+`local.properties`, and defaults to `http://10.0.2.2:8790` for emulator use:
 
 ```properties
 yoBackendUrl=https://your-backend.example
-yoBackendKey=<shared key, must match the server's YO_SERVER_KEY>
+yoInviteUrl=https://your-backend.example/install
 ```
+
+There is deliberately **no** `yoBackendKey`. A single shared key baked into every APK used to grant
+whoever extracted it full access to every account; credentials are now per user and issued at
+sign-in.
 
 Plain HTTP only works in debug builds (`usesCleartextTraffic` is set in the debug manifest); release
 builds require HTTPS. See [backend/README.md](backend/README.md) to run the server.

@@ -1,16 +1,20 @@
 package com.example.yo.ui.main
 
+import com.example.yo.data.remote.AddFriendOutcome
 import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.domain.location.LocationCoordinates
 import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.DeviceRegistration
 import com.example.yo.domain.model.Group
 import com.example.yo.domain.model.PhoneContact
-import com.example.yo.domain.model.YoIdentity
 import com.example.yo.domain.model.YoMessage
+import com.example.yo.domain.model.YoSession
 import com.example.yo.domain.repository.ContactsRepository
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
+import com.example.yo.testing.FakeSessionStore
+import com.example.yo.testing.StubYoBackendApi
+import com.example.yo.testing.TEST_USERNAME
 import com.example.yo.domain.repository.GroupRepository
 import com.example.yo.domain.repository.YoRepository
 import com.example.yo.domain.usecase.BuildInviteMessageUseCase
@@ -31,6 +35,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -226,7 +231,7 @@ class MainViewModelTest {
         val history = viewModel.history.value
         assertEquals(1, history.size)
         assertEquals("Alice", history.single().recipient)
-        assertEquals(YoIdentity.CURRENT_USERNAME, history.single().sender)
+        assertEquals(TEST_USERNAME, history.single().sender)
 
         collectorJob.cancel()
     }
@@ -394,7 +399,7 @@ class MainViewModelTest {
             group.memberUsernames.toSet(),
             history.map { message -> message.recipient }.toSet(),
         )
-        assertTrue(history.all { message -> message.sender == "me" })
+        assertTrue(history.all { message -> message.sender == TEST_USERNAME })
 
         collectorJob.cancel()
     }
@@ -416,6 +421,140 @@ class MainViewModelTest {
         collectorJob.cancel()
     }
 
+    @Test
+    fun `addFriend trims and uppercases the typed name before sending it`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.addFriend("  ada ")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf("ADA"), backendApi.addedFriends)
+    }
+
+    @Test
+    fun `a successful add re-fetches the list so the new band appears`() = runTest {
+        val backendApi = FakeYoBackendApi(friends = listOf("LIN"))
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(listOf("LIN"), viewModel.friends.value)
+
+        viewModel.addFriend("ada")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf("LIN", "ADA"), viewModel.friends.value)
+        assertEquals(AddFriendOutcome.Added, viewModel.addFriendOutcome.value)
+        // One fetch at startup, one after the add.
+        assertEquals(2, backendApi.fetchCount)
+    }
+
+    @Test
+    fun `an unknown username is reported and does not re-fetch the list`() = runTest {
+        val backendApi =
+            FakeYoBackendApi(friends = listOf("LIN"), addOutcome = AddFriendOutcome.NoSuchUser)
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.addFriend("nobody")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(AddFriendOutcome.NoSuchUser, viewModel.addFriendOutcome.value)
+        assertEquals(listOf("LIN"), viewModel.friends.value)
+        assertEquals(1, backendApi.fetchCount)
+    }
+
+    @Test
+    fun `clearAddFriendOutcome resets the reported outcome`() = runTest {
+        val backendApi = FakeYoBackendApi(addOutcome = AddFriendOutcome.Rejected)
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.addFriend("ada")
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(AddFriendOutcome.Rejected, viewModel.addFriendOutcome.value)
+
+        viewModel.clearAddFriendOutcome()
+
+        assertNull(viewModel.addFriendOutcome.value)
+    }
+
+    @Test
+    fun `a blank add friend input is ignored entirely`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.addFriend("")
+        viewModel.addFriend("   ")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(backendApi.addedFriends.isEmpty())
+        assertNull(viewModel.addFriendOutcome.value)
+        assertEquals(1, backendApi.fetchCount)
+    }
+
+    @Test
+    fun `removeFriend re-fetches so the band disappears`() = runTest {
+        val backendApi = FakeYoBackendApi(friends = listOf("ADA", "LIN"))
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.removeFriend("ADA")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf("ADA"), backendApi.removedFriends)
+        assertEquals(listOf("LIN"), viewModel.friends.value)
+        assertEquals(2, backendApi.fetchCount)
+    }
+
+    @Test
+    fun `blockFriend re-fetches so the band disappears`() = runTest {
+        val backendApi = FakeYoBackendApi(friends = listOf("ADA", "LIN"))
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.blockFriend("LIN")
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf("LIN"), backendApi.blockedFriends)
+        assertEquals(listOf("ADA"), viewModel.friends.value)
+        assertEquals(2, backendApi.fetchCount)
+    }
+
+    @Test
+    fun `logOut revokes server-side while the token is still present, then clears it`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val sessionStore = FakeSessionStore()
+        backendApi.sessionProbe = { sessionStore.current() }
+        val viewModel = createViewModel(backendApi = backendApi, sessionStore = sessionStore)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.logOut()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, backendApi.logOutCount)
+        // The order is the point: a revoke sent after the local wipe would carry no token and the
+        // server would keep honouring the stolen one.
+        assertNotNull(backendApi.sessionAtLogOut)
+        assertEquals(TEST_USERNAME, backendApi.sessionAtLogOut?.username)
+        assertNull(sessionStore.current())
+        assertNull(sessionStore.session.value)
+    }
+
+    @Test
+    fun `username comes from the session store`() = runTest {
+        val sessionStore = FakeSessionStore(YoSession(username = "LEO", token = "t"))
+        val viewModel = createViewModel(sessionStore = sessionStore)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals("LEO", viewModel.username)
+
+        sessionStore.clear()
+
+        assertEquals("", viewModel.username)
+    }
+
     private fun createViewModel(
         repository: FakeYoRepository = FakeYoRepository(),
         groupRepository: FakeGroupRepository = FakeGroupRepository(),
@@ -423,8 +562,9 @@ class MainViewModelTest {
         friendsFailure: Throwable? = null,
         locationProvider: OneShotLocationProvider = FakeOneShotLocationProvider(),
         contactsRepository: ContactsRepository = FakeContactsRepository(),
+        backendApi: FakeYoBackendApi = FakeYoBackendApi(friends, friendsFailure),
+        sessionStore: FakeSessionStore = FakeSessionStore(),
     ): MainViewModel {
-        val backendApi = FakeYoBackendApi(friends, friendsFailure)
         val sendYoUseCase = SendYoUseCase(repository)
         return MainViewModel(
             sendYoUseCase = sendYoUseCase,
@@ -439,6 +579,7 @@ class MainViewModelTest {
                     backendApi = backendApi,
                     tokenProvider = FakeFcmTokenProvider(),
                     registrationStore = FakeDeviceRegistrationStore(),
+                    sessionStore = sessionStore,
                 ),
             repository = repository,
             groupRepository = groupRepository,
@@ -446,6 +587,8 @@ class MainViewModelTest {
             contactsRepository = contactsRepository,
             buildInviteMessage = BuildInviteMessageUseCase(),
             filterContacts = FilterContactsUseCase(),
+            sessionStore = sessionStore,
+            backendApi = backendApi,
             inviteUrl = INVITE_URL,
         )
     }
@@ -507,29 +650,59 @@ class MainViewModelTest {
     }
 
     private class FakeYoBackendApi(
-        private val friends: List<String>,
-        private val friendsFailure: Throwable?,
-    ) : YoBackendApi {
-        override suspend fun register(
-            username: String,
-            fcmToken: String,
-        ): Boolean = true
+        friends: List<String> = emptyList(),
+        private val friendsFailure: Throwable? = null,
+        private val addOutcome: AddFriendOutcome = AddFriendOutcome.Added,
+    ) : StubYoBackendApi() {
+        /** Mutable, so a re-fetch after an add or a remove genuinely sees a different list. */
+        private val stored = friends.toMutableList()
+
+        val addedFriends = mutableListOf<String>()
+        val removedFriends = mutableListOf<String>()
+        val blockedFriends = mutableListOf<String>()
+
+        var fetchCount = 0
+            private set
+
+        var logOutCount = 0
+            private set
+
+        /** Reads the session store at the moment logOut runs, to pin down the ordering. */
+        var sessionProbe: (() -> YoSession?)? = null
+        var sessionAtLogOut: YoSession? = null
+            private set
 
         override suspend fun fetchFriends(): List<String> {
+            fetchCount += 1
             friendsFailure?.let { throw it }
-            return friends
+            return stored.toList()
         }
 
-        override suspend fun sendYo(
-            sender: String,
-            recipient: String,
-        ): Boolean = true
+        override suspend fun addFriend(username: String): AddFriendOutcome {
+            addedFriends += username
+            if (addOutcome == AddFriendOutcome.Added) {
+                stored += username
+            }
+            return addOutcome
+        }
 
-        override suspend fun uploadPhoto(
-            messageId: String,
-            base64Data: String,
-            mimeType: String,
-        ): Boolean = true
+        override suspend fun removeFriend(username: String): Boolean {
+            removedFriends += username
+            stored -= username
+            return true
+        }
+
+        override suspend fun block(username: String): Boolean {
+            blockedFriends += username
+            stored -= username
+            return true
+        }
+
+        override suspend fun logOut(): Boolean {
+            logOutCount += 1
+            sessionAtLogOut = sessionProbe?.invoke()
+            return true
+        }
     }
 
     private class FakeFcmTokenProvider : FcmTokenProvider {

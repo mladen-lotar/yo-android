@@ -1,8 +1,8 @@
 # Yo (Android) — Product Requirements Document
 
 Status: consolidated 2026-07-25 from GitHub issues #1–#7 and #11, then reconciled against the
-historical record of the original app.
-Repo: `mladen-lotar/yo-android` · Package: `com.example.yo` · Baseline commit: `b8d6d07`
+historical record of the original app. Last revised 2026-07-26, when gaps G3–G7 were closed.
+Repo: `mladen-lotar/yo-android` · Package: `com.example.yo` · Baseline commit: `a7843b8`
 
 This document is the single source of truth for *what this app is meant to be*. It exists because
 the specification previously lived only in closed GitHub issues, so a reader of the checkout saw a
@@ -72,19 +72,22 @@ why, so absence is never mistaken for incompleteness.
 
 ## 3. Functional requirements (shipped)
 
-All of the following are implemented and verified on a physical Galaxy S25 (SM_S931B) against the
-live backend.
+FR1–FR8 are implemented and verified on a physical Galaxy S25 (SM_S931B) against the live backend.
+FR9 is implemented and covered by tests, but has **not** yet been exercised on the phone — it landed
+while the device was disconnected, and it is a breaking change for the installed build (§7).
 
 ### FR1 — Send a Yo (historical: 2014-04-01 core)
 Single "Yo" button sends to the selected friend. Persisted to Room as local history, rendered as
-`"<sender> sent Yo to <recipient>"`. All sends route through `SendYoUseCase`.
+`"<sender> sent Yo to <recipient>"`. All sends route through `SendYoUseCase`. The sender is the
+signed-in account (FR9); the client does not name it and the server would not believe it if it did.
 *Source: issue #2.*
 
 ### FR2 — Push delivery (historical: core "text and audio notification")
 Backend registers device tokens and fans a Yo out over FCM.
 `YoFirebaseMessagingService` receives it; `YoNotifier` posts a high-importance notification titled
-"Yo" with body `"<sender> says Yo!"`, the bundled spoken-"Yo" clip as its sound, and vibration
-pattern `[0, 150, 100, 150]`. Push-only — no polling (P2).
+"Yo" over the body `"From <SENDER>"`, the bundled spoken-"Yo" clip as its sound, and vibration
+pattern `[0, 150, 100, 150]`. The wording is not invented — it is read off Yo's own store
+screenshots, as recorded in §4.1. Push-only — no polling (P2).
 
 The sound is `res/raw/yo.mp3`: a ~0.47s mono clip of a synthesized voice saying "Yo!", normalized to
 −14 LUFS with the tail tapered. It is **our own** synthesis, not the original app's asset, and
@@ -156,10 +159,55 @@ backend. Declining the permission degrades honestly: the list is empty and a **S
 still shares the invite without any contact.
 
 The link points at `BuildConfig.YO_INVITE_URL` (default `https://yo.the-shop.io/install`,
-overridable via `yoInviteUrl`). The backend serves that page publicly — an invitee has no shared key
+overridable via `yoInviteUrl`). The backend serves that page publicly — an invitee has no credential
 by definition — styled from Yo's own values. It offers the APK only when `YO_APK_PATH` is set, and
 says so plainly when it isn't rather than serving a broken download.
 *Source: this task. Wording reuses Yo's own App Store copy.*
+
+### FR9 — Accounts, credentials and friends (closes G3, G4, G5)
+Until 2026-07-26 there was no identity at all: every install called itself `"me"`, every install
+carried the same API key, and "friends" meant every device that had ever registered. Those were
+gaps G3, G4 and G5, and they were a single problem wearing three hats — you cannot have a friend
+list without accounts, and you cannot have per-user credentials without users.
+
+**Sign-in.** First launch shows a two-band sign-in screen asking for a username and a password and
+nothing else — no email, no phone verification — matching what Yo asked for. Usernames are
+canonically uppercase, 2–32 characters of `A–Z`, `0–9`, `_`; Yo's own API documented the field as an
+"UPPERCASE username". Passwords are 8–256 characters, stored as PBKDF2-HMAC-SHA256 at OWASP's
+600,000-iteration floor, with the cost encoded alongside the hash so it can be raised later without
+invalidating anyone. `hashlib` only: `google-auth` stays the single runtime dependency (§4).
+
+**Credentials.** `POST /v1/signup` and `POST /v1/login` mint a bearer token, stored server-side as a
+SHA-256 hash. Every other `/v1` route requires it and derives the caller's identity from it, so
+`sender` and `username` request fields are simply gone — sending as somebody else, or pointing
+another account's push notifications at your device, are no longer expressible requests rather than
+merely forbidden ones. Login is per device: a second login does not revoke the first, and
+`DELETE /v1/session` revokes only the token presented. A wrong password and an unknown username
+return byte-identical 401s, so the endpoint cannot be used to enumerate who exists.
+
+Signup and login must be public — an invitee has no credential by definition — so they, not the old
+shared key, are now the abuse surface. Both are rate limited per caller IP (10 per 15 minutes) and
+sends per account (60 per minute). The limiter keys on `CF-Connecting-IP`, because the service is
+published through a Cloudflare tunnel and every socket therefore reports `127.0.0.1`: keying on the
+socket would have made one global bucket for the entire internet and turned a single abuser into a
+lockout for every user.
+
+**Friends.** `list_friends` returns the people you added, never the user table. Adding is
+unilateral and needs no acceptance — that is how Yo worked, and why "Yo <USERNAME>" was something
+people printed on posters. **Blocking**, not approval, is the control: it is one-directional, drops
+the person from your list, and a blocked sender still receives an ordinary `{"delivered":true}` with
+no push sent, because telling senders they are blocked turns a block into a notification for the
+person who was blocked.
+
+The visible consequence is that a new account's home screen is **empty** until it adds somebody, so
+the menu gained an **ADD FRIEND** band — the counterpart of Yo's own "FIND FRIENDS" row. Without it
+this change would have shipped a blank app.
+
+**Photos** are now scoped too: uploads record an owner and an optional recipient, only those two can
+read one back, and only the owner can overwrite a `message_id` (which the client chooses, so
+otherwise anyone could clobber anyone's photo by reusing their id).
+*Source: this task. Historical claims about uppercase usernames and unilateral adds follow Yo's own
+API documentation and the well-documented spammability of the original.*
 
 ## 4. Technical requirements
 
@@ -170,22 +218,32 @@ code is relevant here.
 
 **Backend.** Python ≥ 3.10 (uses PEP-604 `X | Y` annotations — 3.9 fails to import),
 `ThreadingHTTPServer` + SQLite, `google-auth` as the only runtime dependency and only for
-configured FCM delivery. Endpoints: `/healthz`, `/v1/register`, `/v1/friends`, `/v1/send`,
-`/v1/photo` (POST + GET), `/v1/broadcast`.
+configured FCM delivery. Endpoints: `/healthz`, `/install`, `/v1/signup`, `/v1/login`,
+`/v1/session` (DELETE), `/v1/register`, `/v1/friends` (GET/POST/DELETE), `/v1/block`
+(POST/DELETE), `/v1/blocked`, `/v1/send`, `/v1/photo` (POST + GET), `/v1/broadcast`.
 
-**Auth.** Every endpoint except `/healthz` requires the shared `X-Yo-Key`, compared with
-`hmac.compare_digest`. Broadcast clients use per-client hashed keys. See gap G3.
+Schema changes are additive — the only mechanism is `CREATE TABLE IF NOT EXISTS` plus a guarded
+`ALTER TABLE ... ADD COLUMN`, so an existing database gains the new tables on next start and needs
+no migration step.
 
-**Configuration.** `yoBackendUrl` / `yoBackendKey` come from Gradle properties or the gitignored
-`local.properties`, baked into `BuildConfig`. Defaults to `http://10.0.2.2:8790` for emulator use.
+**Auth.** Public: `/healthz`, the `/install` pages, and `/v1/signup` + `/v1/login` (which mint
+credentials and so cannot require one). Everything else requires a bearer token, resolved to an
+account server-side. Broadcast clients keep their separate `X-Yo-Client-Id` / `X-Yo-Client-Key`
+pair verified against a stored hash — that path is unchanged. See FR9.
+
+**Configuration.** `yoBackendUrl` and `yoInviteUrl` come from Gradle properties or the gitignored
+`local.properties`, baked into `BuildConfig`; the backend defaults to `http://10.0.2.2:8790` for
+emulator use. There is deliberately **no** `yoBackendKey` and no `YO_SERVER_KEY` — see FR9.
 The Firebase Gradle plugin is applied only if `app/google-services.json` exists, so the app builds
 and runs without Firebase configured.
 
 **Cleartext policy.** `usesCleartextTraffic="true"` is set in the **debug** manifest only, so plain
-HTTP works for local development while release builds require HTTPS.
+HTTP works for local development while release builds require HTTPS. `allowBackup` is `false`, to
+keep the session token out of cloud backups.
 
-**Testing.** 43 JVM unit tests (`testDebugUnitTest`), plus backend pytest for the server and the
-broadcast client. See gap G6 on flakiness and G7 on absent CI.
+**Testing.** JVM unit tests via `./gradlew :app:testDebugUnitTest`; backend via
+`python3 -m unittest discover` (unittest, not pytest). Both run on every push and pull request —
+see §6 G7.
 
 ---
 
@@ -285,6 +343,8 @@ Recorded rather than smoothed over:
 | E2E encryption, mesh relay | never in Yo | Available in a sibling repo; importing it would contradict P5. |
 | Runtime LLM features | n/a | Violates P2 — see P4. |
 | Monetization | Yo raised funding, never monetized | No revenue requirement. |
+| Email / phone verification, password reset | Yo asked for a username and password only | Adding recovery means adding an email channel and an address to store; deliberately out of scope. A forgotten password means a new account. |
+| Friend requests and acceptance | Yo added people unilaterally | Would contradict the original's whole social model. Blocking is the control instead — see FR9. |
 
 ---
 
@@ -303,35 +363,87 @@ returns `{"delivered":false,"reason":"fcm_not_configured"}`. Sending, history, f
 photos all work; the actual push notification does not arrive. Blocked on interactive
 `firebase login` + `gcloud auth login`.
 
-**G3 — The shared key ships inside the APK.** `BuildConfig.YO_BACKEND_KEY` is embedded in the
-binary, so anyone who extracts an installed APK obtains full API access: registering or overwriting
-any username's FCM token, sending as any `sender`, and fetching stored photos. There is no rate
-limiting. Acceptable for a controlled prototype; **not** acceptable for public multi-user use. A
-real fix requires per-user credentials issued server-side.
+**G3 — The shared key ships inside the APK. — RESOLVED 2026-07-26.** `BuildConfig.YO_BACKEND_KEY`
+was embedded in the binary, so extracting an installed APK granted full API access: registering or
+overwriting any username's FCM token, sending as any `sender`, and fetching any stored photo. The
+key is gone from the build entirely and credentials are per account, issued at sign-in and stored
+hashed; rate limiting was added at the same time. See FR9, and G8/G9/G10 for what remains.
 
-**G4 — No real identity.** `YoIdentity.CURRENT_USERNAME` is the hardcoded constant `"me"`. There is
-no sign-up, no authentication of the sender, and `/v1/send` accepts an arbitrary `sender` string.
+**G4 — No real identity. — RESOLVED 2026-07-26.** `YoIdentity.CURRENT_USERNAME` was the constant
+`"me"`. There are now real accounts with passwords, and the sender is derived from the caller's
+token rather than accepted from the request. See FR9.
 
-**G5 — No friendship model.** `list_friends(requester)` returns *every registered device except
-yourself*. There is no friend request, acceptance, or blocking. Any registered user is visible to
-every other user.
+**G5 — No friendship model. — RESOLVED 2026-07-26.** `list_friends` returned every registered
+device. Friendships are now explicit and per account, with blocking. See FR9.
 
-**G6 — Load-sensitive tests.** The suite is green (43 tests, 0 failures) on an idle machine, but
-`GroupRepositoryImplTest` (×2) and `BitmapPhotoEncoderTest` (×1) fail under heavy load with
-`UncompletedCoroutinesError: ... not completing` after `runTest`'s 10-second default, caused by
-Room/Robolectric blocking work inside the test coroutine. Re-run in isolation before treating a
-failure as a regression.
+**G6 — Load-sensitive tests. — RESOLVED 2026-07-26.** The recorded diagnosis was wrong and is kept
+here because the correction is the useful part. This entry previously blamed "Room/Robolectric
+blocking work inside the test coroutine" that `runTest`'s virtual clock could not fast-forward. It
+is not a virtual-clock problem at all: `runTest`'s 10 seconds is a real wall-clock budget, proved by
+`runTest { Thread.sleep(12_000) }` failing identically to the off-dispatcher version — so moving
+work onto the test scheduler could never have been sufficient on its own.
 
-**G7 — No CI.** There is no `.github/workflows`. Tests have only ever run on developer and agent
-machines, which is why G6 went unnoticed.
+The true causes were dispatch starvation on Room's fixed four-thread `ArchTaskExecutor` pool (a
+`SELECT` against an *empty* in-memory database failed to complete within 10s under load) and Room's
+lazy open charging the one-time SQLite open and schema creation to whichever test ran first. Fixed
+by giving Room the test dispatcher as its query and transaction executor, forcing the database open
+in `@Before`, injecting a dispatcher into `BitmapPhotoEncoder`, and moving fixture creation out of
+the timed block. Verified by reproduction, not assertion: 5/5 runs failed before the fix under 300
+CPU spinners, 5/5 passed after at equal or heavier load, with no assertion changed.
+
+**G7 — No CI. — RESOLVED 2026-07-26.** `.github/workflows/ci.yml` runs both suites on every push to
+`main` and every pull request: JDK 17 + Gradle for `:app:testDebugUnitTest` and `:app:assembleDebug`,
+and Python 3.12 for the backend. Test reports upload as an artifact on failure. Note the workflow
+has never executed on a GitHub runner — the first push is its real test, particularly Robolectric's
+runtime jar download.
+
+The gaps below were opened, or surfaced, by the work that closed G3–G7. They are recorded rather
+than smoothed over: closing a security gap honestly means naming what it did *not* close.
+
+**G8 — The session token is stored in the clear.** `SharedPreferencesSessionStore` writes it to
+MODE_PRIVATE preferences. Other apps cannot read it, it sits in file-based-encrypted app storage,
+and `allowBackup="false"` keeps it out of cloud backups — but a rooted device or a physical
+extraction yields a working token. `EncryptedSharedPreferences` would close this; it was judged
+disproportionate for a prototype, and it is worth noting that it would not have helped against the
+threat G3 was actually about, since a token only exists after a real login.
+
+**G9 — `/v1/send` is a device-registration oracle.** Login was hardened so an unknown user and a
+wrong password are indistinguishable, but `send` still answers 404 `recipient_not_found` for an
+account with no registered device and 200 for one with a device. An authenticated caller can
+therefore learn which accounts have a live install. Bounded — account *existence* is already
+discoverable by design, since you must be able to add someone by name — but the blocked-sender path
+shows the fix: return an indistinguishable success.
+
+**G10 — Tokens never expire.** The `tokens` table has a `created_at` that nothing reads. There is
+no TTL, no "sign out everywhere", and no per-device labelling, so an exfiltrated token is valid
+until that exact session calls `DELETE /v1/session`.
+
+**G11 — Signup is open to the internet.** This is inherent to a public signup endpoint rather than
+a defect, and it is a deliberate trade: the alternative was keeping a bootstrap secret in the APK,
+which is precisely G3. Rate limiting is the only control, and it resets when the process restarts,
+so it slows credential stuffing rather than preventing account creation at scale.
+
+**G12 — CI is unit tests only.** No ktlint/detekt, no `:app:lint`, and no instrumentation tests
+(which would need an emulator). The G6 class of bug is now caught; static-analysis and on-device
+regressions are not.
 
 ---
 
-## 7. Deployment state (as of 2026-07-25)
+## 7. Deployment state (as of 2026-07-26)
 
 The backend runs on the operator's Mac as launchd agent `com.yo.backend` (KeepAlive), bound to
 `127.0.0.1:8790`, database `backend/yo.db`, log `~/.ai-fleet/logs/yo-backend.log`. It must be
 launched with Homebrew's `python3` (see §4).
+
+**FR9 is a breaking deployment.** The agent loads `yo_server.py` straight out of the working tree
+with `KeepAlive`, so merging changes the running server as soon as it restarts, and the previously
+installed APK — which sends `X-Yo-Key` and nothing else — will get 401 on every route. Landing
+therefore requires all three, together: merge, `launchctl kickstart -k` the agent, and reinstall the
+APK. `YO_SERVER_KEY` in the plist is now ignored and can be deleted.
+
+The existing database survives untouched (new tables are additive), but its two rows are the
+hand-seeded `Alice` / `Bob` demo pair with no accounts behind them, so they cannot be signed in as
+and will not appear in anyone's friend list. Nothing of value is lost by ignoring them.
 
 It is publicly reachable at **`https://yo.the-shop.io`** via a CNAME on the existing `fleet-bridge`
 Cloudflare tunnel. A dedicated hostname is required rather than a path on `alfred.the-shop.io`,
@@ -351,5 +463,6 @@ history rendering the sent Yo. Gap G2 still applies to the push itself.
   integrations, 2016 shutdown, 2018 Patreon.
 - `mladen-lotar/yo-android` issues #1–#7, #11 — product brief, per-feature scope, boundaries, and
   dependencies. Issue #1 carries the originating operator ticket.
-- The code at `b8d6d07` — every "shipped" and "gap" claim above was read from or executed against
-  it, not inferred from the issues.
+- The code at `a7843b8` plus the FR9 work on top of it — every "shipped" and "gap" claim above was
+  read from or executed against the code, not inferred from the issues. The G6 entry in particular
+  records a reproduction, not a hypothesis.

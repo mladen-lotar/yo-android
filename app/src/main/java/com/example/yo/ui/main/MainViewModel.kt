@@ -6,10 +6,12 @@ import com.example.yo.di.InviteUrl
 import com.example.yo.domain.location.OneShotLocationProvider
 import com.example.yo.domain.model.Group
 import com.example.yo.domain.model.PhoneContact
-import com.example.yo.domain.model.YoIdentity
+import com.example.yo.data.remote.AddFriendOutcome
+import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.domain.repository.ContactsRepository
 import com.example.yo.domain.repository.GroupRepository
+import com.example.yo.domain.repository.SessionStore
 import com.example.yo.domain.repository.YoRepository
 import com.example.yo.domain.usecase.BuildInviteMessageUseCase
 import com.example.yo.domain.usecase.FetchFriendsUseCase
@@ -39,10 +41,19 @@ class MainViewModel @Inject constructor(
     private val contactsRepository: ContactsRepository,
     private val buildInviteMessage: BuildInviteMessageUseCase,
     private val filterContacts: FilterContactsUseCase,
+    private val sessionStore: SessionStore,
+    private val backendApi: YoBackendApi,
     @InviteUrl private val inviteUrl: String,
 ) : ViewModel() {
+    /** The signed-in account. Empty only in the instant before the sign-in screen takes over. */
+    val username: String
+        get() = sessionStore.current()?.username.orEmpty()
+
     private val _friends = MutableStateFlow<List<String>>(emptyList())
     val friends: StateFlow<List<String>> = _friends.asStateFlow()
+
+    private val _addFriendOutcome = MutableStateFlow<AddFriendOutcome?>(null)
+    val addFriendOutcome: StateFlow<AddFriendOutcome?> = _addFriendOutcome.asStateFlow()
 
     private val _friendsLoadFailed = MutableStateFlow(false)
     val friendsLoadFailed: StateFlow<Boolean> = _friendsLoadFailed.asStateFlow()
@@ -84,7 +95,7 @@ class MainViewModel @Inject constructor(
         buildInviteMessage(
             contact = contact,
             inviteUrl = inviteUrl,
-            senderUsername = YoIdentity.CURRENT_USERNAME,
+            senderUsername = username,
         )
 
     /**
@@ -114,15 +125,63 @@ class MainViewModel @Inject constructor(
     init {
         viewModelScope.launch {
             runCatching { registerDeviceUseCase() }
-            runCatching { fetchFriendsUseCase() }
-                .onSuccess { loadedFriends ->
-                    _friends.value = loadedFriends
-                    _friendsLoadFailed.value = false
-                }
-                .onFailure {
-                    _friends.value = emptyList()
-                    _friendsLoadFailed.value = true
-                }
+            loadFriends()
+        }
+    }
+
+    private suspend fun loadFriends() {
+        runCatching { fetchFriendsUseCase() }
+            .onSuccess { loadedFriends ->
+                _friends.value = loadedFriends
+                _friendsLoadFailed.value = false
+            }
+            .onFailure {
+                _friends.value = emptyList()
+                _friendsLoadFailed.value = true
+            }
+    }
+
+    /**
+     * Add someone by username. This is what populates the home screen: friendships are explicit
+     * now, so a new account starts with no bands until it adds somebody (gap G5).
+     */
+    fun addFriend(rawUsername: String) {
+        val candidate = rawUsername.trim().uppercase()
+        if (candidate.isEmpty()) {
+            return
+        }
+        viewModelScope.launch {
+            val outcome = backendApi.addFriend(candidate)
+            _addFriendOutcome.value = outcome
+            if (outcome == AddFriendOutcome.Added) {
+                loadFriends()
+            }
+        }
+    }
+
+    fun clearAddFriendOutcome() {
+        _addFriendOutcome.value = null
+    }
+
+    fun removeFriend(friend: String) {
+        viewModelScope.launch {
+            backendApi.removeFriend(friend)
+            loadFriends()
+        }
+    }
+
+    fun blockFriend(friend: String) {
+        viewModelScope.launch {
+            backendApi.block(friend)
+            loadFriends()
+        }
+    }
+
+    /** Drops the token server-side first, so a stolen copy of it dies with the logout. */
+    fun logOut() {
+        viewModelScope.launch {
+            backendApi.logOut()
+            sessionStore.clear()
         }
     }
 
@@ -135,7 +194,7 @@ class MainViewModel @Inject constructor(
     ) {
         viewModelScope.launch {
             val coords = if (attachLocation) locationProvider.getCurrentLocation() else null
-            sendYoUseCase(sender = YoIdentity.CURRENT_USERNAME, recipient = recipient) {
+            sendYoUseCase(sender = username, recipient = recipient) {
                 copy(
                     link = link?.takeIf { it.isNotBlank() },
                     hashtag = hashtag?.takeIf { it.isNotBlank() }?.trimStart('#')?.takeIf { it.isNotBlank() },
@@ -155,7 +214,7 @@ class MainViewModel @Inject constructor(
 
     fun sendYoToGroup(groupId: String) {
         viewModelScope.launch {
-            sendYoToGroupUseCase(sender = YoIdentity.CURRENT_USERNAME, groupId = groupId)
+            sendYoToGroupUseCase(sender = username, groupId = groupId)
         }
     }
 }

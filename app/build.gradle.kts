@@ -18,10 +18,9 @@ val yoBackendUrl =
     providers.gradleProperty("yoBackendUrl").orNull
         ?: localProperties.getProperty("yoBackendUrl")
         ?: "http://10.0.2.2:8790"
-val yoBackendKey =
-    providers.gradleProperty("yoBackendKey").orNull
-        ?: localProperties.getProperty("yoBackendKey")
-        ?: ""
+// NOTE: there is deliberately no yoBackendKey any more. A single shared key baked into every
+// APK was gap G3 - extracting it granted full API access as any user. Callers now authenticate
+// with a per-account bearer token obtained at sign-in, which never ships in the binary.
 // Where "invite a contact" points people. Overridable per build so a fork or a local test can send
 // invites somewhere else; the default is the install page served by the backend.
 val yoInviteUrl =
@@ -29,7 +28,6 @@ val yoInviteUrl =
         ?: localProperties.getProperty("yoInviteUrl")
         ?: "https://yo.the-shop.io/install"
 val escapedYoBackendUrl = yoBackendUrl.replace("\\", "\\\\").replace("\"", "\\\"")
-val escapedYoBackendKey = yoBackendKey.replace("\\", "\\\\").replace("\"", "\\\"")
 val escapedYoInviteUrl = yoInviteUrl.replace("\\", "\\\\").replace("\"", "\\\"")
 
 android {
@@ -45,7 +43,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "YO_BACKEND_URL", "\"$escapedYoBackendUrl\"")
-        buildConfigField("String", "YO_BACKEND_KEY", "\"$escapedYoBackendKey\"")
         buildConfigField("String", "YO_INVITE_URL", "\"$escapedYoInviteUrl\"")
     }
 

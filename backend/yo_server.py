@@ -3,12 +3,16 @@ import hashlib
 import hmac
 import json
 import os
+import threading
+import time
+from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
+import yo_auth
 from fcm_client import FCMClient, FCMDeliveryError, FCMNotConfiguredError
 from yo_db import YoDatabase
 
@@ -18,9 +22,67 @@ DEFAULT_DATABASE = Path(__file__).with_name("yo.db")
 MAX_BODY_BYTES = 2_000_000
 MAX_PHOTO_BYTES = 1_400_000
 
+# Signup and login are necessarily public - an invitee has no credentials by definition - so
+# they are the abuse surface that replaces the old shared key. Sends are limited per account.
+CREDENTIAL_ATTEMPTS = 10
+CREDENTIAL_WINDOW_SECONDS = 900
+SEND_ATTEMPTS = 60
+SEND_WINDOW_SECONDS = 60
+
+# How many allowed requests between sweeps of the rate limiter's idle keys.
+_SWEEP_EVERY = 256
+
 
 def _hash_client_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+class RateLimiter:
+    """A fixed-capacity sliding window per key, held in memory.
+
+    In-memory is the honest scope here: this is a single-process ThreadingHTTPServer, so there
+    is no second instance to share state with. It resets on restart, which is acceptable for
+    slowing credential stuffing and unacceptable as a billing control - it is only the former.
+    """
+
+    def __init__(self, limit: int, window_seconds: float, clock=time.monotonic):
+        self._limit = limit
+        self._window = window_seconds
+        self._clock = clock
+        self._hits: Dict[str, Deque[float]] = defaultdict(deque)
+        self._sweep_counter = 0
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = self._clock()
+        with self._lock:
+            hits = self._hits[key]
+            while hits and now - hits[0] >= self._window:
+                hits.popleft()
+            if len(hits) >= self._limit:
+                return False
+            hits.append(now)
+            self._evict_idle(now)
+            return True
+
+    def _evict_idle(self, now: float) -> None:
+        """Drop keys whose window has fully expired.
+
+        Without this the dict is a slow leak: it is keyed on caller IP and nothing ever removes
+        an entry, so it grows for the lifetime of the process - and since the key comes from a
+        request header, an attacker could grow it as fast as they can send requests.
+        """
+        self._sweep_counter += 1
+        if self._sweep_counter < _SWEEP_EVERY:
+            return
+        self._sweep_counter = 0
+        stale = [
+            key
+            for key, hits in self._hits.items()
+            if not hits or now - hits[-1] >= self._window
+        ]
+        for key in stale:
+            del self._hits[key]
 
 
 def _configured_apk_path() -> Optional[Path]:
@@ -88,13 +150,18 @@ class YoHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         database: YoDatabase,
-        shared_key: str,
         fcm_client: Any,
+        password_iterations: int = yo_auth.DEFAULT_ITERATIONS,
     ):
         super().__init__(server_address, YoRequestHandler)
         self.database = database
-        self.shared_key = shared_key
         self.fcm_client = fcm_client
+        self.password_iterations = password_iterations
+        self.credential_limiter = RateLimiter(
+            CREDENTIAL_ATTEMPTS,
+            CREDENTIAL_WINDOW_SECONDS,
+        )
+        self.send_limiter = RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS)
 
 
 class YoRequestHandler(BaseHTTPRequestHandler):
@@ -114,38 +181,34 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/install/yo.apk":
             self._handle_install_apk()
             return
-        if not self._authorize():
+        username = self._authenticate()
+        if username is None:
             return
         if parsed.path == "/v1/friends":
-            self._handle_friends(parsed.query)
+            self._handle_friends(username)
+            return
+        if parsed.path == "/v1/blocked":
+            self._handle_list_blocked(username)
             return
         if parsed.path == "/v1/photo":
-            self._handle_photo_fetch(parsed.query)
+            self._handle_photo_fetch(username, parsed.query)
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def do_POST(self) -> None:
+    def do_DELETE(self) -> None:
         parsed = urlsplit(self.path)
-        client_id: Optional[str] = None
-        if parsed.path == "/v1/broadcast":
-            client_id = self._authorize_client()
-            if client_id is None:
-                return
-        elif not self._authorize():
+        username = self._authenticate()
+        if username is None:
             return
         try:
-            body = self._read_json_body()
-            if client_id is not None:
-                self._handle_broadcast(client_id, body)
+            if parsed.path == "/v1/session":
+                self._handle_logout()
                 return
-            if parsed.path == "/v1/register":
-                self._handle_register(body)
+            if parsed.path == "/v1/friends":
+                self._handle_remove_friend(username, parsed.query)
                 return
-            if parsed.path == "/v1/send":
-                self._handle_send(body)
-                return
-            if parsed.path == "/v1/photo":
-                self._handle_photo_upload(body)
+            if parsed.path == "/v1/block":
+                self._handle_unblock(username, parsed.query)
                 return
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except BadRequestError as error:
@@ -154,15 +217,146 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 {"error": "bad_request", "reason": str(error)},
             )
 
-    def _authorize(self) -> bool:
-        supplied_key = self.headers.get("X-Yo-Key", "")
-        if hmac.compare_digest(supplied_key, self.server.shared_key):
-            return True
-        self._write_json(
-            HTTPStatus.UNAUTHORIZED,
-            {"error": "unauthorized"},
-        )
-        return False
+    def do_POST(self) -> None:
+        parsed = urlsplit(self.path)
+        # Signup and login mint credentials, so they cannot themselves require one.
+        if parsed.path in ("/v1/signup", "/v1/login"):
+            self._handle_credentials(parsed.path)
+            return
+        client_id: Optional[str] = None
+        username: Optional[str] = None
+        if parsed.path == "/v1/broadcast":
+            client_id = self._authorize_client()
+            if client_id is None:
+                return
+        else:
+            username = self._authenticate()
+            if username is None:
+                return
+        try:
+            body = self._read_json_body()
+            if client_id is not None:
+                self._handle_broadcast(client_id, body)
+                return
+            if parsed.path == "/v1/friends":
+                self._handle_add_friend(username, body)
+                return
+            if parsed.path == "/v1/block":
+                self._handle_block(username, body)
+                return
+            if parsed.path == "/v1/register":
+                self._handle_register(username, body)
+                return
+            if parsed.path == "/v1/send":
+                self._handle_send(username, body)
+                return
+            if parsed.path == "/v1/photo":
+                self._handle_photo_upload(username, body)
+                return
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+        except BadRequestError as error:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "bad_request", "reason": str(error)},
+            )
+
+    def _authenticate(self) -> Optional[str]:
+        """Resolve the caller from their bearer token, or answer 401 and return None.
+
+        This is what closes gap G3: the caller's identity comes from a per-device token the
+        server issued, so an attacker who extracts an APK gets the credentials of nobody.
+        """
+        token = self._bearer_token()
+        if token:
+            username = self.server.database.username_for_token(
+                yo_auth.hash_token(token)
+            )
+            if username is not None:
+                return username
+        self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+        return None
+
+    def _bearer_token(self) -> str:
+        header = self.headers.get("Authorization", "")
+        if header.lower().startswith("bearer "):
+            return header[7:].strip()
+        return self.headers.get("X-Yo-Token", "").strip()
+
+    def _client_address(self) -> str:
+        """The caller's real IP, which is NOT the socket address.
+
+        The server binds 127.0.0.1 and is published through a Cloudflare tunnel, so every
+        socket reports 127.0.0.1. Keying a rate limiter on that would make one global bucket
+        for the whole internet, turning any single abuser into a lockout for every user.
+        Trusting these headers is only safe *because* the socket is loopback-only: a spoofed
+        CF-Connecting-IP requires local access, which is already game over.
+        """
+        forwarded = self.headers.get("CF-Connecting-IP", "").strip()
+        if forwarded:
+            return forwarded
+        chain = self.headers.get("X-Forwarded-For", "").strip()
+        if chain:
+            return chain.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _handle_credentials(self, path: str) -> None:
+        """POST /v1/signup and POST /v1/login - the only routes that mint a token."""
+        if not self.server.credential_limiter.allow(self._client_address()):
+            self._write_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "rate_limited"},
+            )
+            return
+        try:
+            body = self._read_json_body()
+            username = yo_auth.validate_username(
+                self._required_string(body, "username")
+            )
+            password = yo_auth.validate_password(body.get("password"))
+        except BadRequestError as error:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "bad_request", "reason": str(error)},
+            )
+            return
+        except yo_auth.CredentialError as error:
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "bad_request", "reason": str(error)},
+            )
+            return
+
+        if path == "/v1/signup":
+            created = self.server.database.create_account(
+                username,
+                yo_auth.hash_password(password, self.server.password_iterations),
+            )
+            if not created:
+                self._write_json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "username_taken"},
+                )
+                return
+            status = HTTPStatus.CREATED
+        else:
+            stored = self.server.database.get_password_hash(username)
+            if not yo_auth.verify_password(password, stored):
+                # Deliberately identical for an unknown user and a wrong password, so the
+                # response cannot be used to enumerate which usernames exist.
+                self._write_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "invalid_credentials"},
+                )
+                return
+            status = HTTPStatus.OK
+
+        token = yo_auth.new_token()
+        self.server.database.store_token(yo_auth.hash_token(token), username)
+        self._write_json(status, {"token": token, "username": username})
+
+    def _handle_logout(self) -> None:
+        self.server.database.delete_token(yo_auth.hash_token(self._bearer_token()))
+        self._write_json(HTTPStatus.OK, {"ended": True})
 
     def _authorize_client(self) -> Optional[str]:
         client_id = self.headers.get("X-Yo-Client-Id", "")
@@ -184,8 +378,8 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         )
         return None
 
-    def _handle_register(self, body: Dict[str, Any]) -> None:
-        username = self._required_string(body, "username")
+    def _handle_register(self, username: str, body: Dict[str, Any]) -> None:
+        """The username comes from the token, never the body - you may only claim your own."""
         fcm_token = self._required_string(body, "fcm_token")
         self.server.database.upsert_device(username, fcm_token)
         self._write_json(
@@ -193,25 +387,66 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             {"registered": True, "username": username},
         )
 
-    def _handle_friends(self, query: str) -> None:
-        parameters = parse_qs(query, keep_blank_values=True)
-        values = parameters.get("username") or parameters.get("requester")
-        if not values or not values[0].strip():
-            self._write_json(
-                HTTPStatus.BAD_REQUEST,
-                {
-                    "error": "bad_request",
-                    "reason": "username is required",
-                },
-            )
-            return
-        username = values[0].strip()
+    def _handle_friends(self, username: str) -> None:
         friends = self.server.database.list_friends(username)
         self._write_json(HTTPStatus.OK, {"friends": friends})
 
-    def _handle_send(self, body: Dict[str, Any]) -> None:
-        sender = self._required_string(body, "sender")
-        recipient = self._required_string(body, "recipient")
+    def _handle_add_friend(self, username: str, body: Dict[str, Any]) -> None:
+        friend = self._target_username(body)
+        if friend == username:
+            raise BadRequestError("you cannot add yourself")
+        if not self.server.database.account_exists(friend):
+            self._write_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "no_such_user"},
+            )
+            return
+        self.server.database.add_friend(username, friend)
+        self._write_json(HTTPStatus.OK, {"added": friend})
+
+    def _handle_remove_friend(self, username: str, query: str) -> None:
+        friend = self._query_username(query)
+        self.server.database.remove_friend(username, friend)
+        self._write_json(HTTPStatus.OK, {"removed": friend})
+
+    def _handle_block(self, username: str, body: Dict[str, Any]) -> None:
+        blocked = self._target_username(body)
+        if blocked == username:
+            raise BadRequestError("you cannot block yourself")
+        # Refuse unknown names so an authenticated caller cannot stuff the blocks table with
+        # arbitrary junk; there is no cap on its size.
+        if not self.server.database.account_exists(blocked):
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "no_such_user"})
+            return
+        self.server.database.block(username, blocked)
+        # Blocking also drops them from your own list, so the block is visible immediately.
+        self.server.database.remove_friend(username, blocked)
+        self._write_json(HTTPStatus.OK, {"blocked": blocked})
+
+    def _handle_unblock(self, username: str, query: str) -> None:
+        blocked = self._query_username(query)
+        self.server.database.unblock(username, blocked)
+        self._write_json(HTTPStatus.OK, {"unblocked": blocked})
+
+    def _handle_list_blocked(self, username: str) -> None:
+        self._write_json(
+            HTTPStatus.OK,
+            {"blocked": self.server.database.list_blocked(username)},
+        )
+
+    def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
+        recipient = self._target_username(body, key="recipient")
+        if not self.server.send_limiter.allow(sender):
+            self._write_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"delivered": False, "reason": "rate_limited"},
+            )
+            return
+        if self.server.database.is_blocked(recipient, sender):
+            # Indistinguishable from a delivered Yo on purpose: telling the sender they were
+            # blocked turns the block into a notification for the person who was blocked.
+            self._write_json(HTTPStatus.OK, {"delivered": True})
+            return
         fcm_token = self.server.database.get_fcm_token(recipient)
         if fcm_token is None:
             self._write_json(
@@ -244,20 +479,37 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
 
-    def _handle_photo_upload(self, body: Dict[str, Any]) -> None:
+    def _handle_photo_upload(self, username: str, body: Dict[str, Any]) -> None:
         message_id = self._required_string(body, "message_id")
         mime_type = self._required_string(body, "mime_type")
         data = self._required_string(body, "data")
+        recipient = (
+            self._target_username(body, key="recipient")
+            if body.get("recipient")
+            else None
+        )
         if len(data.encode("utf-8")) > MAX_PHOTO_BYTES:
             self._write_json(
                 HTTPStatus.BAD_REQUEST,
                 {"error": "photo_too_large"},
             )
             return
-        self.server.database.store_photo(message_id, mime_type, data)
+        existing = self.server.database.get_photo(message_id)
+        if existing is not None and existing[2] not in (None, username):
+            # message_id is chosen by the client, so without this a caller could overwrite
+            # somebody else's photo simply by reusing their id.
+            self._write_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+            return
+        self.server.database.store_photo(
+            message_id,
+            mime_type,
+            data,
+            owner=username,
+            recipient=recipient,
+        )
         self._write_json(HTTPStatus.OK, {"stored": True})
 
-    def _handle_photo_fetch(self, query: str) -> None:
+    def _handle_photo_fetch(self, username: str, query: str) -> None:
         parameters = parse_qs(query, keep_blank_values=True)
         values = parameters.get("message_id")
         message_id = values[0].strip() if values else ""
@@ -265,7 +517,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if photo is None:
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        mime_type, data = photo
+        mime_type, data, owner, recipient = photo
+        # Only the two ends of the conversation. A row with no owner predates ownership and is
+        # denied outright rather than left world-readable - there were none in any live database
+        # when this shipped, so nothing legitimate is lost.
+        if username not in (owner, recipient):
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
         self._write_json(
             HTTPStatus.OK,
             {"mime_type": mime_type, "data": data},
@@ -338,6 +596,25 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             raise BadRequestError(f"{key} is required")
         return value.strip()
 
+    @classmethod
+    def _target_username(cls, body: Dict[str, Any], key: str = "username") -> str:
+        """Another user named in a request body, normalised to the canonical uppercase form."""
+        try:
+            return yo_auth.validate_username(cls._required_string(body, key))
+        except yo_auth.CredentialError as error:
+            raise BadRequestError(str(error)) from error
+
+    @staticmethod
+    def _query_username(query: str, key: str = "username") -> str:
+        parameters = parse_qs(query, keep_blank_values=True)
+        values = parameters.get(key)
+        if not values or not values[0].strip():
+            raise BadRequestError(f"{key} is required")
+        try:
+            return yo_auth.validate_username(values[0])
+        except yo_auth.CredentialError as error:
+            raise BadRequestError(str(error)) from error
+
     def _handle_install_page(self) -> None:
         apk = _configured_apk_path()
         if apk is not None:
@@ -381,18 +658,16 @@ def create_server(
     host: str,
     port: int,
     database_path: os.PathLike | str,
-    shared_key: str,
     fcm_client: Optional[Any] = None,
+    password_iterations: int = yo_auth.DEFAULT_ITERATIONS,
 ) -> YoHTTPServer:
-    if not shared_key:
-        raise ValueError("shared_key must not be empty")
     database = YoDatabase(database_path)
     database.initialize()
     return YoHTTPServer(
         (host, port),
         database=database,
-        shared_key=shared_key,
         fcm_client=fcm_client or FCMClient(),
+        password_iterations=password_iterations,
     )
 
 
@@ -403,15 +678,12 @@ def main() -> None:
     parser.add_argument("--database", default=str(DEFAULT_DATABASE))
     arguments = parser.parse_args()
 
-    server_key = os.environ.get("YO_SERVER_KEY", "").strip()
-    if not server_key:
-        parser.error("YO_SERVER_KEY must be set")
-
+    # YO_SERVER_KEY is deliberately gone. A single shared key that every install carried was
+    # gap G3; callers now authenticate with a per-account token issued by /v1/signup.
     server = create_server(
         host=arguments.host,
         port=arguments.port,
         database_path=arguments.database,
-        shared_key=server_key,
     )
     try:
         print(

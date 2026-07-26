@@ -2,9 +2,11 @@ package com.example.yo.domain.usecase
 
 import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.domain.model.DeviceRegistration
-import com.example.yo.domain.model.YoIdentity
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
+import com.example.yo.testing.FakeSessionStore
+import com.example.yo.testing.StubYoBackendApi
+import com.example.yo.testing.TEST_USERNAME
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -17,13 +19,13 @@ class RegisterDeviceUseCaseTest {
         val backendApi = FakeYoBackendApi()
         val tokenProvider = FakeFcmTokenProvider(token = "token-1")
         val registrationStore = FakeDeviceRegistrationStore()
-        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore)
+        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore, FakeSessionStore())
 
         val registered = useCase()
 
         assertTrue(registered)
         assertEquals(
-            listOf(DeviceRegistration(YoIdentity.CURRENT_USERNAME, "token-1")),
+            listOf(DeviceRegistration(TEST_USERNAME, "token-1")),
             backendApi.registrations,
         )
         assertEquals(backendApi.registrations, registrationStore.markedRegistrations)
@@ -34,7 +36,7 @@ class RegisterDeviceUseCaseTest {
         val backendApi = FakeYoBackendApi()
         val tokenProvider = FakeFcmTokenProvider(token = "token-1")
         val registrationStore = FakeDeviceRegistrationStore()
-        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore)
+        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore, FakeSessionStore())
 
         assertTrue(useCase())
         assertTrue(useCase())
@@ -48,14 +50,14 @@ class RegisterDeviceUseCaseTest {
     fun `forced rotated token bypasses registered token guard`() = runTest {
         val rotatedRegistration =
             DeviceRegistration(
-                username = YoIdentity.CURRENT_USERNAME,
+                username = TEST_USERNAME,
                 fcmToken = "token-2",
             )
         val backendApi = FakeYoBackendApi()
         val tokenProvider = FakeFcmTokenProvider(token = "unused-token")
         val registrationStore =
             FakeDeviceRegistrationStore(initialRegistrations = setOf(rotatedRegistration))
-        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore)
+        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore, FakeSessionStore())
 
         val registered = useCase(fcmToken = rotatedRegistration.fcmToken, force = true)
 
@@ -69,7 +71,7 @@ class RegisterDeviceUseCaseTest {
         val backendApi = FakeYoBackendApi()
         val tokenProvider = FakeFcmTokenProvider(failure = IllegalStateException("no token"))
         val registrationStore = FakeDeviceRegistrationStore()
-        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore)
+        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore, FakeSessionStore())
 
         val registered = useCase()
 
@@ -83,7 +85,7 @@ class RegisterDeviceUseCaseTest {
         val backendApi = FakeYoBackendApi(registerFailure = IllegalStateException("offline"))
         val tokenProvider = FakeFcmTokenProvider(token = "token-1")
         val registrationStore = FakeDeviceRegistrationStore()
-        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore)
+        val useCase = RegisterDeviceUseCase(backendApi, tokenProvider, registrationStore, FakeSessionStore())
 
         val registered = useCase()
 
@@ -92,32 +94,55 @@ class RegisterDeviceUseCaseTest {
         assertTrue(registrationStore.markedRegistrations.isEmpty())
     }
 
+    @Test
+    fun `no session returns false without calling the backend`() = runTest {
+        // Registering binds an FCM token to an account, so before sign-in there is nothing to bind
+        // it to — and the call would go out with no bearer token attached.
+        val backendApi = FakeYoBackendApi()
+        val tokenProvider = FakeFcmTokenProvider(token = "token-1")
+        val registrationStore = FakeDeviceRegistrationStore()
+        val useCase =
+            RegisterDeviceUseCase(
+                backendApi,
+                tokenProvider,
+                registrationStore,
+                FakeSessionStore(initial = null),
+            )
+
+        val registered = useCase()
+
+        assertFalse(registered)
+        assertTrue(backendApi.registrations.isEmpty())
+        assertEquals(0, tokenProvider.callCount)
+        assertTrue(registrationStore.markedRegistrations.isEmpty())
+    }
+
+    @Test
+    fun `no session returns false even when the caller forces a known token`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val registrationStore = FakeDeviceRegistrationStore()
+        val useCase =
+            RegisterDeviceUseCase(
+                backendApi,
+                FakeFcmTokenProvider(token = "token-1"),
+                registrationStore,
+                FakeSessionStore(initial = null),
+            )
+
+        assertFalse(useCase(fcmToken = "token-2", force = true))
+        assertTrue(backendApi.registrations.isEmpty())
+    }
+
     private class FakeYoBackendApi(
         private val registerFailure: Throwable? = null,
-    ) : YoBackendApi {
+    ) : StubYoBackendApi() {
         val registrations = mutableListOf<DeviceRegistration>()
 
-        override suspend fun register(
-            username: String,
-            fcmToken: String,
-        ): Boolean {
-            registrations += DeviceRegistration(username, fcmToken)
+        override suspend fun register(fcmToken: String): Boolean {
+            registrations += DeviceRegistration(TEST_USERNAME, fcmToken)
             registerFailure?.let { throw it }
             return true
         }
-
-        override suspend fun fetchFriends(): List<String> = emptyList()
-
-        override suspend fun sendYo(
-            sender: String,
-            recipient: String,
-        ): Boolean = true
-
-        override suspend fun uploadPhoto(
-            messageId: String,
-            base64Data: String,
-            mimeType: String,
-        ): Boolean = true
     }
 
     private class FakeFcmTokenProvider(

@@ -12,6 +12,7 @@ import com.example.yo.data.photo.BitmapPhotoEncoder
 import com.example.yo.data.remote.FirebaseFcmTokenProvider
 import com.example.yo.data.remote.HttpYoBackendApi
 import com.example.yo.data.remote.SharedPreferencesDeviceRegistrationStore
+import com.example.yo.data.remote.SharedPreferencesSessionStore
 import com.example.yo.data.remote.YoBackendApi
 import com.example.yo.data.remote.YoRemoteDeliveryPortImpl
 import com.example.yo.data.repository.GroupRepositoryImpl
@@ -22,6 +23,7 @@ import com.example.yo.domain.repository.ContactsRepository
 import com.example.yo.domain.repository.DeviceRegistrationStore
 import com.example.yo.domain.repository.FcmTokenProvider
 import com.example.yo.domain.repository.GroupRepository
+import com.example.yo.domain.repository.SessionStore
 import com.example.yo.domain.repository.YoRemoteDeliveryPort
 import com.example.yo.domain.repository.YoRepository
 import dagger.Binds
@@ -58,10 +60,10 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideYoBackendApi(): YoBackendApi =
+    fun provideYoBackendApi(sessionStore: SessionStore): YoBackendApi =
         HttpYoBackendApi(
             baseUrl = BuildConfig.YO_BACKEND_URL,
-            sharedKey = BuildConfig.YO_BACKEND_KEY,
+            sessionStore = sessionStore,
         )
 }
 
@@ -89,6 +91,10 @@ abstract class RepositoryModule {
     abstract fun bindDeviceRegistrationStore(
         impl: SharedPreferencesDeviceRegistrationStore,
     ): DeviceRegistrationStore
+
+    @Binds
+    @Singleton
+    abstract fun bindSessionStore(impl: SharedPreferencesSessionStore): SessionStore
 }
 
 @Module

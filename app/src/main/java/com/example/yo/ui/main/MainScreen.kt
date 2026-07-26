@@ -60,6 +60,7 @@ import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.yo.data.photo.decodeSampledBitmap
 import com.example.yo.domain.model.Group
+import com.example.yo.data.remote.AddFriendOutcome
 import com.example.yo.domain.model.PhoneContact
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.ui.theme.YoBody
@@ -113,6 +114,7 @@ fun MainScreen(
     val contacts by viewModel.contacts.collectAsState()
     val contactQuery by viewModel.contactQuery.collectAsState()
     val contactsFilteredToNothing by viewModel.contactsFilteredToNothing.collectAsState()
+    val addFriendOutcome by viewModel.addFriendOutcome.collectAsState()
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
@@ -212,10 +214,24 @@ fun MainScreen(
 
     when (sheet) {
         Sheet.Menu -> MenuSheet(
+            username = viewModel.username,
             onDismiss = { sheet = null },
             onHistory = { sheet = Sheet.History },
             onCreateGroup = { sheet = Sheet.CreateGroup },
             onInvite = { sheet = Sheet.Invite },
+            onAddFriend = { sheet = Sheet.AddFriend },
+            onLogOut = {
+                sheet = null
+                viewModel.logOut()
+            },
+        )
+        Sheet.AddFriend -> AddFriendSheet(
+            outcome = addFriendOutcome,
+            onDismiss = {
+                viewModel.clearAddFriendOutcome()
+                sheet = null
+            },
+            onAdd = viewModel::addFriend,
         )
         Sheet.Invite -> InviteSheet(
             contacts = contacts,
@@ -243,7 +259,7 @@ fun MainScreen(
     }
 }
 
-private enum class Sheet { Menu, History, CreateGroup, Invite }
+private enum class Sheet { Menu, History, CreateGroup, Invite, AddFriend }
 
 /** A send target — a person or a group. Both render as an identical colour band. */
 private sealed interface SendTarget {
@@ -372,35 +388,104 @@ private fun YoSheet(
  */
 @Composable
 private fun MenuSheet(
+    username: String,
     onDismiss: () -> Unit,
     onHistory: () -> Unit,
     onCreateGroup: () -> Unit,
     onInvite: () -> Unit,
+    onAddFriend: () -> Unit,
+    onLogOut: () -> Unit,
 ) {
     YoSheet(onDismiss = onDismiss) {
         Column(modifier = Modifier.fillMaxWidth()) {
+            // ADD FRIEND is the counterpart of Yo's "FIND FRIENDS" row, and it is load-bearing:
+            // friendships are explicit, so without it a fresh account has no bands at all.
+            Band(
+                color = YoPalette.colorForIndex(0),
+                label = "ADD FRIEND",
+                onClick = onAddFriend,
+                onLongClick = onAddFriend,
+            )
             // INVITE is not an invention: Yo's own menu render carried INVITE and FIND FRIENDS
             // rows, and the Windows Phone build had a dedicated INVITE band in the contact list.
             Band(
-                color = YoPalette.colorForIndex(0),
+                color = YoPalette.colorForIndex(1),
                 label = "INVITE",
                 onClick = onInvite,
                 onLongClick = onInvite,
             )
             Band(
-                color = YoPalette.colorForIndex(1),
+                color = YoPalette.colorForIndex(2),
                 label = "HISTORY",
                 onClick = onHistory,
                 onLongClick = onHistory,
             )
             Band(
-                color = YoPalette.colorForIndex(2),
+                color = YoPalette.colorForIndex(3),
                 label = "NEW GROUP",
                 onClick = onCreateGroup,
                 onLongClick = onCreateGroup,
             )
+            Band(
+                color = YoPalette.colorForIndex(4),
+                label = if (username.isEmpty()) "LOG OUT" else "LOG OUT $username",
+                onClick = onLogOut,
+                onLongClick = onLogOut,
+            )
             Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+}
+
+/**
+ * Add somebody by typing their username. Unilateral and with no acceptance step, matching Yo:
+ * you added a name and could Yo it immediately. Blocking, not approval, was the control.
+ */
+@Composable
+private fun AddFriendSheet(
+    outcome: AddFriendOutcome?,
+    onDismiss: () -> Unit,
+    onAdd: (String) -> Unit,
+) {
+    var candidate by rememberSaveable { mutableStateOf("") }
+
+    // Close on success rather than making the user dismiss a sheet that has done its job.
+    LaunchedEffect(outcome) {
+        if (outcome == AddFriendOutcome.Added) {
+            onDismiss()
+        }
+    }
+
+    YoSheet(onDismiss = onDismiss) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+            Spacer(modifier = Modifier.height(18.dp))
+            ChromelessField(
+                value = candidate,
+                onValueChange = { candidate = it.uppercase() },
+                placeholder = "USERNAME",
+            )
+            val problem = when (outcome) {
+                AddFriendOutcome.NoSuchUser -> "NOBODY HERE BY THAT NAME"
+                AddFriendOutcome.Rejected -> "THAT IS NOT A USERNAME YOU CAN ADD"
+                AddFriendOutcome.Unreachable -> "CAN'T REACH YO"
+                AddFriendOutcome.Added, null -> null
+            }
+            if (problem != null) {
+                Text(
+                    text = problem,
+                    style = YoLabel,
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                )
+            }
+            Spacer(modifier = Modifier.height(18.dp))
+        }
+        Band(
+            color = YoPalette.colorForIndex(0),
+            label = "ADD",
+            onClick = { onAdd(candidate) },
+            onLongClick = { onAdd(candidate) },
+        )
+        Spacer(modifier = Modifier.height(24.dp))
     }
 }
 
