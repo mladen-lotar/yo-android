@@ -52,6 +52,41 @@ class BuildInviteMessageUseCaseTest {
     }
 
     @Test
+    fun `accented first names are greeted properly`() {
+        assertTrue(buildInviteMessage(contact("Željko Đurić"), url, "me").startsWith("Hey Željko, "))
+    }
+
+    @Test
+    fun `business names are not greeted as people`() {
+        // Seen on a real device: "Hey AS;Pizza/1, get Yo" — a first token containing punctuation
+        // or digits is not a name, so the greeting is dropped entirely.
+        for (name in listOf("AS;Pizza/1", "Yo-Backend", "Cafe#2", "A1 Taxi")) {
+            val message = buildInviteMessage(contact(name), url, "me")
+            assertFalse("name=[$name] was greeted", message.startsWith("Hey"))
+            assertTrue(message.startsWith("get Yo"))
+        }
+    }
+
+    @Test
+    fun `contacts stored as bare phone numbers are not greeted as people`() {
+        // Also seen live: "Hey 031," from a nameless contact whose display name is its number.
+        for (name in listOf("031 210 904", "091 646 4773", "+385 91 1234567")) {
+            val message = buildInviteMessage(contact(name), url, "me")
+            assertFalse("name=[$name] was greeted", message.startsWith("Hey"))
+        }
+    }
+
+    @Test
+    fun `single-letter names are not greeted, since "Hey A," reads like a bug`() {
+        assertFalse(buildInviteMessage(contact("A"), url, "me").startsWith("Hey"))
+    }
+
+    @Test
+    fun `an emoji-tagged name still greets on the leading word`() {
+        assertTrue(buildInviteMessage(contact("Mum ❤"), url, "me").startsWith("Hey Mum, "))
+    }
+
+    @Test
     fun `carries Yo's own tagline verbatim`() {
         assertTrue(buildInviteMessage(null, url, "me").endsWith("Yo. It's that simple."))
     }
