@@ -27,6 +27,10 @@ one rather than the app latching onto the first. One Yo account is signed in at 
 another, sign out. The first time a Google account is used it is asked to pick a Yo username, since
 Google supplies an email and friends are addressed by username; after that it is one tap.
 
+Working end to end on a physical device as of 2026-07-26 (PRD §7.1). Note that Google Sign-In needs
+**two** OAuth clients in one project — a Web client *and* an Android client for your package and
+signing SHA-1. With only the Web client the account picker never appears at all; see gap G13.
+
 The band only appears when the build carries an OAuth client id. The operator's build has one — see
 "Google sign-in" below, and PRD §7.1 for the provisioned values.
 

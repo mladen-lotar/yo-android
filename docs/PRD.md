@@ -477,25 +477,36 @@ so it slows credential stuffing rather than preventing account creation at scale
 (which would need an emulator). The G6 class of bug is now caught; static-analysis and on-device
 regressions are not.
 
-**G13 — Google sign-in is configured; the on-device picker is the one leg still unproven.**
-Was "built but dark". The Google Cloud project now exists (`yo-theshop`, project number
-747034506241) and the backend half is verified against production with genuinely Google-signed
-tokens — see §7.1. What has *not* been exercised is the Credential Manager account picker on a
-real handset, because the S25 was locked for the duration and the picker cannot be driven past a
-keyguard. Two consequences follow, and neither is visible from the backend:
+**G13 — Google sign-in works end to end. — RESOLVED 2026-07-26.** Proven on a physical S25 against
+the production backend over the public internet: picker → `404 username_required` → username
+claimed → `201` → `GET /v1/friends 200`, then log out and back in for `200` with no username asked.
+See §7.1 for the run.
 
-- Firebase registered the Android app and its SHA-1, but `google-services.json` came back with
-  **zero `oauth_client` entries** — Firebase only mints those when Google is enabled as a sign-in
-  provider in Firebase Authentication, which this design does not use. The web client was created
-  through the IAP API instead. Whether Play services will issue an ID token to
-  `com.example.yo` without a matching *Android* OAuth client in the project is therefore untested;
-  if it refuses, the symptom is a `GetCredentialException` surfacing as
-  `GOOGLE SIGN-IN UNAVAILABLE`, and the fix is one Android OAuth client for package
-  `com.example.yo` + the SHA-1 in §7.1, which has no public API and must be made in the console.
-- The consent screen is an IAP-created brand with **`orgInternalOnly: true`**, so only
-  `the-shop.hr` Workspace accounts can complete sign-in. A personal `@gmail.com` account on the
-  device will be offered by the picker and then refused. Publishing the brand externally is a
-  console action.
+Getting there required diagnosing one thing the backend could never show. Credential Manager needs
+**two** OAuth clients, not one: the Web client the app sends as `serverClientId` and the backend
+pins `aud` to, *and* an **Android** client matching package + signing SHA-1. With only the web
+client, `GetGoogleIdOption` fails in ~200ms with `cmsh: [28444]`, **shows no picker at all**, and
+surfaces as `NoCredentialException` — which reads like "this device has no Google account" and is
+not (the S25 had four). An empty `oauth_client` array in `google-services.json` is the cheap way to
+spot this before ever touching a device.
+
+Android OAuth clients have **no public API** — not gcloud, not the IAP API (which creates web
+clients fine and is how ours was made), not the Firebase CLI, and `clientauthconfig.googleapis.com`
+is not exposed. The only programmatic route is Firebase auto-creating the pair when an Android app
++ SHA-1 is registered in a project that already has Google enabled as a sign-in provider, and that
+needs the project on billing (G15). See §7.1 for what was done instead and the cleanup it implies.
+
+**G16 — the working OAuth clients live in the wrong project.** Because `yo-theshop` has no billing
+and Firebase Auth would not initialize there, the Android app was registered in
+`blocksurge-theshop` (which is billed and already had Google sign-in enabled), and Firebase
+auto-created both clients there. Yo therefore borrows an unrelated project's OAuth identity. It
+works and the consent sheet correctly reads "Sign in to Yo?", but the arrangement is wrong on the
+merits: Yo's sign-in breaks if Block Surge's project is changed, and Yo's users appear under Block
+Surge's consent screen. Correcting it means one Android OAuth client created by hand in
+`yo-theshop` (package `com.example.yo`, SHA-1 in §7.1), then pointing `YO_GOOGLE_CLIENT_ID` and
+`yoGoogleClientId` back at the `yo-theshop` web client. Nothing else changes; both values already
+exist. The borrowed app entry can be removed with the Firebase Management API
+(`androidApps:remove`), since this CLI version has no `apps:delete`.
 
 **G15 — Firebase Auth cannot be initialized on this project without billing.** Not a defect in
 Yo, but it explains the shape of the above: `identityPlatform:initializeAuth` answers
@@ -543,23 +554,29 @@ history rendering the sent Yo. Gap G2 still applies to the push itself.
 
 FR10 is live. Nothing here is a secret — an OAuth client id is public by design.
 
-**As provisioned (2026-07-26).** Google Cloud / Firebase project `yo-theshop`, number
-`747034506241`, on the free Spark tier with no billing account attached.
+**As provisioned (2026-07-26).** Two projects are involved, which is not the intended end state —
+see G16.
 
 | Piece | Value |
 |---|---|
-| Web (server) client id | `747034506241-c56bjfe0hihuarel9rucuo7b4oogvbkg.apps.googleusercontent.com` |
-| Firebase Android app | `1:747034506241:android:2643dabcb1f28ae548bc00`, package `com.example.yo` |
+| **Live** web (server) client id | `973904690282-a4dnbf8b3gv1o9v0v6ts2phe9em4kg41.apps.googleusercontent.com` (in `blocksurge-theshop`) |
+| **Live** Android OAuth client | `973904690282-c1l1eqe5veh16ialmru3apmdm74i0n7j.apps.googleusercontent.com`, auto-created |
+| Firebase Android app (live) | `1:973904690282:android:a648ab962c3b942bb4de13`, package `com.example.yo` |
 | Registered SHA-1 | `BC:E5:5B:00:AA:7E:68:4D:72:EF:B7:2F:53:AF:B3:97:20:F7:F8:88` (debug keystore; a release keystore needs its own) |
-| Consent screen | IAP brand `projects/747034506241/brands/747034506241`, `orgInternalOnly: true` |
 | Backend interpreter | `~/.local/share/yo-backend-venv/bin/python` (holds `google-auth` 2.56.2) |
 | Backend env | `YO_GOOGLE_CLIENT_ID` in the launchd plist |
 | App config | `yoGoogleClientId` in the gitignored `local.properties` |
 
-The web client was created through the **IAP API** (`iap.googleapis.com/v1/projects/{n}/brands`
-then `.../identityAwareProxyClients`) rather than the console, because Google exposes no public API
-for ordinary OAuth clients and Firebase would only auto-create them via Firebase Auth, which needs
-billing on this project (G15). Android OAuth clients have no API at all — see G13.
+Dormant, kept for the migration in G16: project `yo-theshop` (`747034506241`, free tier, no
+billing) with web client `747034506241-c56bjfe0hihuarel9rucuo7b4oogvbkg.apps.googleusercontent.com`,
+Android app `1:747034506241:android:2643dabcb1f28ae548bc00` and the same SHA-1 registered, plus an
+IAP brand `projects/747034506241/brands/747034506241` that is `orgInternalOnly: true`.
+
+That `yo-theshop` web client was created through the **IAP API**
+(`iap.googleapis.com/v1/projects/{n}/brands` then `.../identityAwareProxyClients`) because Google
+exposes no public API for ordinary OAuth clients. It verifies real tokens correctly but is not
+usable for sign-in on its own, since no Android client can be created alongside it without the
+console — which is the whole of G13.
 
 **Two launchd gotchas, both of which cost time here.** `launchctl kickstart -k` restarts the job
 but re-uses the *loaded* configuration, so plist edits are silently ignored; use
@@ -588,6 +605,23 @@ the web client id, since a human account cannot mint a token for an arbitrary au
 | Token for another audience | `401 invalid_google_token` |
 
 `GTEST` and its identity and tokens were deleted from the production database afterwards.
+
+**Verified on the handset** on 2026-07-26, once the Android OAuth client existed (G13). Against a
+scratch backend first, then repeated against production over the public internet:
+
+| Step | Result |
+|---|---|
+| Tap `GOOGLE SIGN-IN` | Credential Manager sheet, "Sign in to Yo?" — the app's own name, not the borrowed project's |
+| Choose account, Sign in | `POST /v1/google` → `404 username_required` |
+| Type a username, IME Done | `201` — account created and linked, then `GET /v1/friends 200` |
+| Signed-in home screen | Renders, friend list empty as FR9 requires for a new account |
+| Menu | Reads `LOG OUT MLADEN` — the claimed username, end to end |
+| Log out, tap `GOOGLE SIGN-IN` again | `POST /v1/google` → **`200`, no username asked**, then `GET /v1/friends 200` |
+| Dismiss the sheet instead of signing in | Screen shows nothing at all, as designed |
+
+Two tokens existed for the one account afterwards, one per sign-in — per-device tokens behaving as
+FR9 specifies. The account `MLADEN` created during the production run is a real account and was
+left in place; delete it if it is not wanted.
 
 The same project is what G2 has been waiting on: `google-services.json` is now obtainable with
 `firebase apps:sdkconfig ANDROID 1:747034506241:android:2643dabcb1f28ae548bc00 --project
