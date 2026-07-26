@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -110,6 +111,8 @@ fun MainScreen(
     val history by viewModel.history.collectAsState()
     val friends by viewModel.friends.collectAsState()
     val friendsLoadFailed by viewModel.friendsLoadFailed.collectAsState()
+    val pushUnavailable by viewModel.pushUnavailable.collectAsState()
+    val pushRetrying by viewModel.pushRetrying.collectAsState()
     val groups by viewModel.groups.collectAsState()
     val contacts by viewModel.contacts.collectAsState()
     val contactQuery by viewModel.contactQuery.collectAsState()
@@ -186,6 +189,22 @@ fun MainScreen(
                         style = YoLabel,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .padding(vertical = 14.dp),
+                    )
+                }
+            }
+
+            // Says the consequence, not the mechanism: "push registration failed" means nothing to
+            // someone wondering why their phone is quiet. Tappable because the cause is usually
+            // transient, so asking again is the one thing that actually helps (gap G17).
+            if (pushUnavailable) {
+                item(key = "push-error") {
+                    Text(
+                        text = if (pushRetrying) "RECONNECTING..." else "NOT RECEIVING YOS - TAP TO RETRY",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !pushRetrying) { viewModel.retryDeviceRegistration() }
                             .padding(vertical = 14.dp),
                     )
                 }

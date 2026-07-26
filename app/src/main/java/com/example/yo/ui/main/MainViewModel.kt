@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.yo.di.InviteUrl
 import com.example.yo.domain.location.OneShotLocationProvider
+import com.example.yo.domain.model.DeviceRegistrationOutcome
 import com.example.yo.domain.model.Group
 import com.example.yo.domain.model.PhoneContact
 import com.example.yo.data.remote.AddFriendOutcome
@@ -57,6 +58,16 @@ class MainViewModel @Inject constructor(
 
     private val _friendsLoadFailed = MutableStateFlow(false)
     val friendsLoadFailed: StateFlow<Boolean> = _friendsLoadFailed.asStateFlow()
+
+    /**
+     * True once registering for push has actually failed. Starts false so a working install never
+     * flashes a warning, and stays false before sign-in, when there is nothing to register.
+     */
+    private val _pushUnavailable = MutableStateFlow(false)
+    val pushUnavailable: StateFlow<Boolean> = _pushUnavailable.asStateFlow()
+
+    private val _pushRetrying = MutableStateFlow(false)
+    val pushRetrying: StateFlow<Boolean> = _pushRetrying.asStateFlow()
 
     private val _contacts = MutableStateFlow<List<PhoneContact>>(emptyList())
 
@@ -124,8 +135,34 @@ class MainViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
-            runCatching { registerDeviceUseCase() }
+            registerDevice()
             loadFriends()
+        }
+    }
+
+    private suspend fun registerDevice() {
+        val outcome =
+            runCatching { registerDeviceUseCase() }
+                .getOrDefault(DeviceRegistrationOutcome.Failed)
+        // NotSignedIn is not a failure: there is simply no account to bind a token to yet.
+        _pushUnavailable.value = outcome == DeviceRegistrationOutcome.Failed
+    }
+
+    /**
+     * Ask again, after the use case's own retries have already given up. The failure that prompts
+     * this is usually transient, so the one thing the user can do about it is worth offering.
+     */
+    fun retryDeviceRegistration() {
+        if (_pushRetrying.value) {
+            return
+        }
+        viewModelScope.launch {
+            _pushRetrying.value = true
+            try {
+                registerDevice()
+            } finally {
+                _pushRetrying.value = false
+            }
         }
     }
 

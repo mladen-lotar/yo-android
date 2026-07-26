@@ -160,6 +160,16 @@ curl -X POST http://127.0.0.1:8790/v1/send \
   -d '{"recipient":"friend"}'
 ```
 
+When a Yo cannot be delivered, `reason` says which of two different things went wrong:
+
+| Reason | Meaning |
+|---|---|
+| `recipient_not_found` | No account by that name |
+| `recipient_unregistered` | The account exists but has no device registered for push |
+
+They were one string until 2026-07-26, which meant a real friend whose registration had failed was
+reported to the sender as a nonexistent user.
+
 ## Photo attachment
 
 Upload a base64-encoded photo for a message:
