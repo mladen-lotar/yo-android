@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -36,6 +37,7 @@ import com.example.yo.domain.model.AuthFailure
 import com.example.yo.ui.theme.YoLabel
 import com.example.yo.ui.theme.YoPalette
 import com.example.yo.ui.theme.YoRowText
+import com.example.yo.ui.theme.YoRowTextSmall
 import com.example.yo.ui.theme.YoTagline
 import com.example.yo.ui.theme.YoWordmark
 
@@ -146,10 +148,15 @@ fun AuthScreen(viewModel: AuthViewModel = hiltViewModel()) {
             // in Yo's own idiom is indistinguishable from a live one.
             if (viewModel.googleAvailable) {
                 ActionBand(
-                    label = "CONTINUE WITH GOOGLE",
+                    // "CONTINUE WITH GOOGLE" does not fit: Montserrat Bold caps run about 0.75em,
+                    // so twenty of them need ~467dp at the row size against this screen's 411dp.
+                    // It wrapped and the 89dp band clipped the second line. Measured on an S25 -
+                    // dropping to the long-label size was still not enough, hence a shorter label.
+                    label = "GOOGLE SIGN-IN",
                     color = YoPalette.Rows[6],
                     enabled = !state.busy,
                     onClick = { viewModel.continueWithGoogle(context) },
+                    style = YoRowTextSmall,
                 )
             }
         }
@@ -162,6 +169,7 @@ private fun ActionBand(
     color: Color,
     enabled: Boolean,
     onClick: () -> Unit,
+    style: TextStyle = YoRowText,
 ) {
     Box(
         modifier = Modifier
@@ -171,7 +179,9 @@ private fun ActionBand(
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Text(text = label, style = YoRowText)
+        // A band is a fixed 89dp, so a label that wraps loses its second line rather than growing
+        // the band. One line, always.
+        Text(text = label, style = style, maxLines = 1)
     }
 }
 
