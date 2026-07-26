@@ -64,8 +64,10 @@ class AuthViewModel @Inject constructor(
                 // Dismissing the picker is an answer, not an error. Saying anything here would
                 // scold the user for changing their mind.
                 GoogleIdTokenResult.Cancelled -> _state.value = State()
-                GoogleIdTokenResult.NoAccount ->
-                    _state.value = State(message = "NO GOOGLE ACCOUNT ON THIS PHONE")
+                // Deliberately does not claim the phone has no Google account. It may have
+                // several and still land here - see GoogleIdTokenResult.NoUsableAccount.
+                GoogleIdTokenResult.NoUsableAccount ->
+                    _state.value = State(message = "NO GOOGLE ACCOUNT AVAILABLE")
                 GoogleIdTokenResult.Unavailable ->
                     _state.value = State(message = "GOOGLE SIGN-IN UNAVAILABLE")
             }
