@@ -22,8 +22,15 @@ val yoBackendKey =
     providers.gradleProperty("yoBackendKey").orNull
         ?: localProperties.getProperty("yoBackendKey")
         ?: ""
+// Where "invite a contact" points people. Overridable per build so a fork or a local test can send
+// invites somewhere else; the default is the install page served by the backend.
+val yoInviteUrl =
+    providers.gradleProperty("yoInviteUrl").orNull
+        ?: localProperties.getProperty("yoInviteUrl")
+        ?: "https://yo.the-shop.io/install"
 val escapedYoBackendUrl = yoBackendUrl.replace("\\", "\\\\").replace("\"", "\\\"")
 val escapedYoBackendKey = yoBackendKey.replace("\\", "\\\\").replace("\"", "\\\"")
+val escapedYoInviteUrl = yoInviteUrl.replace("\\", "\\\\").replace("\"", "\\\"")
 
 android {
     namespace = "com.example.yo"
@@ -39,6 +46,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "YO_BACKEND_URL", "\"$escapedYoBackendUrl\"")
         buildConfigField("String", "YO_BACKEND_KEY", "\"$escapedYoBackendKey\"")
+        buildConfigField("String", "YO_INVITE_URL", "\"$escapedYoInviteUrl\"")
     }
 
     buildFeatures {

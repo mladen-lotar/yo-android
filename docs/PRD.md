@@ -127,6 +127,28 @@ verified against a stored hash. Backend-only; no Android changes.
 
 ---
 
+### FR8 — Invite contacts (historical: the INVITE row; "Find Friends")
+`READ_CONTACTS` is requested on first launch alongside `POST_NOTIFICATIONS`, so the user answers
+once rather than being interrupted later. The menu's **INVITE** band lists device contacts as colour
+bands; tapping one opens the **system share sheet** (`ACTION_SEND`, `text/plain`) with an invite
+message and an install link, so Viber, Messenger, WhatsApp, Signal, Telegram, SMS and email all
+appear without Yo integrating with any of them.
+
+This is not an invented screen: Yo's own menu render carried **INVITE** and **FIND FRIENDS** rows,
+and the Windows Phone build had a dedicated uppercase INVITE band in the contact list itself.
+
+Privacy is deliberate. `PhoneContact` carries **only an id and a display name** — no phone number,
+no email. The recipient is chosen inside the messaging app after the chooser opens, so Yo never
+reads, stores or transmits anyone's contact details, and nothing about the address book reaches the
+backend. Declining the permission degrades honestly: the list is empty and a **SHARE LINK** band
+still shares the invite without any contact.
+
+The link points at `BuildConfig.YO_INVITE_URL` (default `https://yo.the-shop.io/install`,
+overridable via `yoInviteUrl`). The backend serves that page publicly — an invitee has no shared key
+by definition — styled from Yo's own values. It offers the APK only when `YO_APK_PATH` is set, and
+says so plainly when it isn't rather than serving a broken download.
+*Source: this task. Wording reuses Yo's own App Store copy.*
+
 ## 4. Technical requirements
 
 **Android.** Kotlin, Jetpack Compose, Hilt, Room, Coroutines. minSdk 24, targetSdk 34, compileSdk

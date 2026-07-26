@@ -23,6 +23,59 @@ def _hash_client_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
+def _configured_apk_path() -> Optional[Path]:
+    """The APK to hand out at /install/yo.apk, or None if none is configured."""
+    configured = os.environ.get("YO_APK_PATH", "").strip()
+    if not configured:
+        return None
+    path = Path(configured)
+    return path if path.is_file() else None
+
+
+# Styled from Yo's own values: Amethyst #9B59B6, Montserrat Bold, white centred type, the mixed-case
+# "Yo" wordmark and the tagline "It's that simple." See docs/PRD.md section 4.1.
+INSTALL_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#9b59b6">
+<title>Yo - It's that simple.</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Montserrat:700,400">
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #9B59B6;
+    font-family: 'Montserrat', arial, sans-serif;
+    font-weight: 700;
+    color: white;
+    text-align: center;
+    text-rendering: optimizeLegibility;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 24px;
+    box-sizing: border-box;
+  }
+  h1 { font-size: 22vw; line-height: 1; margin: 0; letter-spacing: -0.04em; }
+  h2 { font-size: 5vw; margin: 12px 0 36px; font-weight: 700; }
+  .btn {
+    display: inline-block; background: #1ABC9C; color: white;
+    text-decoration: none; padding: 18px 34px; border: 0; border-radius: 5px;
+    font-size: 18px; font-family: inherit;
+  }
+  .small { font-size: 13px; font-weight: 400; opacity: 0.85; max-width: 22em; }
+  @media (min-width: 700px) { h1 { font-size: 150px; } h2 { font-size: 32px; } }
+</style>
+</head>
+<body>
+  <h1>Yo</h1>
+  <h2>It's that simple.</h2>
+  {{ACTION}}
+</body>
+</html>
+"""
+
+
 class BadRequestError(ValueError):
     pass
 
@@ -51,6 +104,15 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/healthz":
             self._write_json(HTTPStatus.OK, {"ok": True})
+            return
+        # The install page is the target of shared invite links, so it has to be reachable by
+        # someone who does not have the app and therefore has no shared key. It is static and
+        # exposes no data.
+        if parsed.path in ("/install", "/install/"):
+            self._handle_install_page()
+            return
+        if parsed.path == "/install/yo.apk":
+            self._handle_install_apk()
             return
         if not self._authorize():
             return
@@ -275,6 +337,36 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(value, str) or not value.strip():
             raise BadRequestError(f"{key} is required")
         return value.strip()
+
+    def _handle_install_page(self) -> None:
+        apk = _configured_apk_path()
+        if apk is not None:
+            action = (
+                '<a class="btn" href="/install/yo.apk">Download Yo</a>'
+                '<p class="small">Android only. You may need to allow installs '
+                "from your browser.</p>"
+            )
+        else:
+            action = '<p class="small">The download is not published yet.</p>'
+        body = INSTALL_PAGE_TEMPLATE.replace("{{ACTION}}", action).encode("utf-8")
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_install_apk(self) -> None:
+        apk = _configured_apk_path()
+        if apk is None:
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        data = apk.read_bytes()
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "application/vnd.android.package-archive")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", 'attachment; filename="yo.apk"')
+        self.end_headers()
+        self.wfile.write(data)
 
     def _write_json(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
