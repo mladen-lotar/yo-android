@@ -27,8 +27,18 @@ val yoInviteUrl =
     providers.gradleProperty("yoInviteUrl").orNull
         ?: localProperties.getProperty("yoInviteUrl")
         ?: "https://yo.the-shop.io/install"
+// The OAuth *web* client id (type 3) of the Google Cloud project, which is what an Android app
+// must send as the server client id so the backend can pin the token's audience to it. Blank by
+// default and blank is a supported state: the app hides its Google band rather than showing a
+// button that cannot work. Unlike the old yoBackendKey this is not a secret - a client id is
+// public by design, and possessing it grants nothing without the account it names.
+val yoGoogleClientId =
+    providers.gradleProperty("yoGoogleClientId").orNull
+        ?: localProperties.getProperty("yoGoogleClientId")
+        ?: ""
 val escapedYoBackendUrl = yoBackendUrl.replace("\\", "\\\\").replace("\"", "\\\"")
 val escapedYoInviteUrl = yoInviteUrl.replace("\\", "\\\\").replace("\"", "\\\"")
+val escapedYoGoogleClientId = yoGoogleClientId.replace("\\", "\\\\").replace("\"", "\\\"")
 
 android {
     namespace = "com.example.yo"
@@ -44,6 +54,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "YO_BACKEND_URL", "\"$escapedYoBackendUrl\"")
         buildConfigField("String", "YO_INVITE_URL", "\"$escapedYoInviteUrl\"")
+        buildConfigField("String", "YO_GOOGLE_CLIENT_ID", "\"$escapedYoGoogleClientId\"")
     }
 
     buildFeatures {
@@ -100,6 +111,12 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.foundation:foundation")
+
+    // Credential Manager rather than the deprecated GoogleSignInClient. It is also what puts the
+    // device account picker on screen, which is the whole point of the feature.
+    implementation("androidx.credentials:credentials:1.2.2")
+    implementation("androidx.credentials:credentials-play-services-auth:1.2.2")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.0")
 
     implementation("com.google.dagger:hilt-android:2.48")
     kapt("com.google.dagger:hilt-compiler:2.48")

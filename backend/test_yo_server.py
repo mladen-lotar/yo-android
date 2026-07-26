@@ -6,6 +6,8 @@ import unittest
 from email.message import Message
 from types import SimpleNamespace
 
+import yo_auth
+import yo_google
 from fcm_client import FCMDeliveryError, FCMNotConfiguredError
 from yo_db import YoDatabase
 from yo_server import (
@@ -41,6 +43,23 @@ class RecordingFCMClient:
         return self.result
 
 
+class StubGoogleVerifier:
+    """Stands in for GoogleIdTokenVerifier: the network and the signing certificates are
+    yo_google's problem, tested in test_yo_google.py. What matters here is what the route does
+    with a subject."""
+
+    def __init__(self, subject="google-subject-alice"):
+        self.subject = subject
+        self.error = None
+        self.calls = []
+
+    def subject_for(self, raw_token):
+        self.calls.append(raw_token)
+        if self.error is not None:
+            raise self.error
+        return self.subject
+
+
 class YoServerTestCase(unittest.TestCase):
     """Shared harness: a real sqlite database plus a SimpleNamespace standing in for the server.
 
@@ -64,6 +83,9 @@ class YoServerTestCase(unittest.TestCase):
                 CREDENTIAL_WINDOW_SECONDS,
             ),
             send_limiter=RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS),
+            # Unconfigured by default, matching a deployment with no YO_GOOGLE_CLIENT_ID.
+            # GoogleSignInTest installs a stub.
+            google_verifier=None,
         )
 
     def tearDown(self):
@@ -340,6 +362,219 @@ class CredentialTest(YoServerTestCase):
 
         self.assertEqual(429, blocked)
         self.assertEqual(201, other_caller)
+
+
+class GoogleSignInTest(YoServerTestCase):
+    """POST /v1/google - "continue with Google"."""
+
+    def setUp(self):
+        super().setUp()
+        self.verifier = StubGoogleVerifier()
+        self.server.google_verifier = self.verifier
+
+    def google(self, username=None, id_token="an.id.token", extra_headers=None):
+        body = {"id_token": id_token}
+        if username is not None:
+            body["username"] = username
+        return self.request(
+            "POST",
+            "/v1/google",
+            body,
+            token=None,
+            extra_headers=extra_headers,
+        )
+
+    def test_an_unknown_google_account_is_asked_for_a_username(self):
+        status, body = self.google()
+        self.assertEqual(404, status)
+        self.assertEqual("username_required", body["error"])
+        # Nothing was created on the way to asking.
+        self.assertFalse(self.server.database.account_exists("ALICE"))
+
+    def test_signing_in_with_a_username_creates_the_account(self):
+        status, body = self.google(username="ALICE")
+        self.assertEqual(201, status, body)
+        self.assertEqual("ALICE", body["username"])
+        self.assertTrue(self.server.database.account_exists("ALICE"))
+
+    def test_the_issued_token_authenticates_the_new_account(self):
+        _, body = self.google(username="ALICE")
+        status, friends = self.request(
+            "GET",
+            "/v1/friends",
+            token=body["token"],
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([], friends["friends"])
+
+    def test_a_returning_google_account_needs_no_username(self):
+        self.google(username="ALICE")
+        status, body = self.google()
+        self.assertEqual(200, status, body)
+        self.assertEqual("ALICE", body["username"])
+
+    def test_a_returning_account_is_matched_on_subject_not_on_the_token_string(self):
+        """Google mints a fresh ID token on every sign-in; only `sub` is stable."""
+        self.google(username="ALICE", id_token="first.id.token")
+        status, body = self.google(id_token="a.completely.different.token")
+        self.assertEqual(200, status, body)
+        self.assertEqual("ALICE", body["username"])
+
+    def test_a_supplied_username_is_ignored_once_the_account_exists(self):
+        """Otherwise a second sign-in could silently rename or fork the account."""
+        self.google(username="ALICE")
+        status, body = self.google(username="MALLORY")
+        self.assertEqual(200, status)
+        self.assertEqual("ALICE", body["username"])
+        self.assertFalse(self.server.database.account_exists("MALLORY"))
+
+    def test_a_junk_username_cannot_break_a_sign_in_that_needs_no_username(self):
+        """Once the Google account is linked the body's username is not read at all, so an app
+        that sends a stale or malformed one still signs its user in rather than 400-ing them out
+        of their own account."""
+        self.google(username="ALICE")
+        status, body = self.google(username="!! not a username !!")
+        self.assertEqual(200, status, body)
+        self.assertEqual("ALICE", body["username"])
+
+    def test_a_second_google_account_cannot_take_an_existing_username(self):
+        self.signup("ALICE")
+        self.verifier.subject = "google-subject-mallory"
+        status, body = self.google(username="ALICE")
+        self.assertEqual(409, status)
+        self.assertEqual("username_taken", body["error"])
+
+    def test_a_failed_claim_leaves_the_google_account_unlinked(self):
+        """The username was rejected, so nothing may be recorded - not even a dangling link."""
+        self.signup("ALICE")
+        self.verifier.subject = "google-subject-mallory"
+        self.google(username="ALICE")
+        self.assertIsNone(
+            self.server.database.username_for_identity(
+                "google",
+                "google-subject-mallory",
+            )
+        )
+
+    def test_one_google_account_cannot_hold_two_usernames(self):
+        """Exercised directly because only a concurrent request can reach this branch through
+        the route: it re-checks the identity table immediately before writing."""
+        database = self.server.database
+        self.assertTrue(
+            database.create_linked_account(
+                "ALICE",
+                "google",
+                "subject-1",
+                yo_auth.UNUSABLE_PASSWORD_HASH,
+            )
+        )
+        self.assertFalse(
+            database.create_linked_account(
+                "ALICE2",
+                "google",
+                "subject-1",
+                yo_auth.UNUSABLE_PASSWORD_HASH,
+            )
+        )
+        # The second username must not survive as an account nobody can ever sign in to.
+        self.assertFalse(database.account_exists("ALICE2"))
+        self.assertEqual("ALICE", database.username_for_identity("google", "subject-1"))
+
+    def test_the_username_is_normalised_to_uppercase(self):
+        status, body = self.google(username="  alice ")
+        self.assertEqual(201, status)
+        self.assertEqual("ALICE", body["username"])
+
+    def test_an_invalid_username_is_rejected(self):
+        for username in ("a", "has spaces", "!!", "x" * 33):
+            with self.subTest(username=username):
+                status, body = self.google(username=username)
+                self.assertEqual(400, status)
+                self.assertEqual("bad_request", body["error"])
+
+    def test_a_missing_id_token_is_a_bad_request(self):
+        status, body = self.request("POST", "/v1/google", {"username": "ALICE"})
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+    def test_a_rejected_token_is_401_and_says_nothing_more(self):
+        self.verifier.error = yo_google.GoogleAuthError("Token expired: 1699999999")
+        status, body = self.google(username="ALICE")
+        self.assertEqual(401, status)
+        self.assertEqual({"error": "invalid_google_token"}, body)
+
+    def test_an_unverifiable_token_is_503_not_401(self):
+        """Google being unreachable is our outage; answering 401 would tell the user to
+        re-authenticate over a problem no amount of re-authenticating can fix."""
+        self.verifier.error = yo_google.GoogleUnavailableError("certs unreachable")
+        status, body = self.google(username="ALICE")
+        self.assertEqual(503, status)
+        self.assertEqual("google_unavailable", body["error"])
+
+    def test_the_route_is_503_when_no_client_id_is_configured(self):
+        self.server.google_verifier = None
+        status, body = self.google(username="ALICE")
+        self.assertEqual(503, status)
+        self.assertEqual("google_not_configured", body["error"])
+
+    def test_an_unconfigured_route_never_reaches_the_database(self):
+        self.server.google_verifier = None
+        self.google(username="ALICE")
+        self.assertFalse(self.server.database.account_exists("ALICE"))
+
+    def test_attempts_are_rate_limited_per_caller(self):
+        headers = {"CF-Connecting-IP": "203.0.113.9"}
+        self.verifier.error = yo_google.GoogleAuthError("nope")
+        for _ in range(CREDENTIAL_ATTEMPTS):
+            status, _ = self.google(username="ALICE", extra_headers=headers)
+            self.assertEqual(401, status)
+        status, body = self.google(username="ALICE", extra_headers=headers)
+        self.assertEqual(429, status)
+        self.assertEqual("rate_limited", body["error"])
+
+    def test_a_google_account_cannot_be_logged_into_with_a_password(self):
+        """The stored hash is a sentinel that no password can produce, so /v1/login stays shut
+        for accounts that have no password - including for the sentinel's own text."""
+        self.google(username="ALICE")
+        for password in (
+            TEST_PASSWORD,
+            yo_auth.UNUSABLE_PASSWORD_HASH,
+            "!" * 8,
+            "",
+        ):
+            with self.subTest(password=password):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/login",
+                    {"username": "ALICE", "password": password},
+                )
+                self.assertIn(status, (400, 401))
+
+    def test_a_google_account_stores_no_usable_password_hash(self):
+        self.google(username="ALICE")
+        self.assertEqual(
+            yo_auth.UNUSABLE_PASSWORD_HASH,
+            self.server.database.get_password_hash("ALICE"),
+        )
+
+    def test_a_google_account_is_a_normal_account_everywhere_else(self):
+        """It must be addressable as a friend, or signing in with Google would be a dead end."""
+        google_token = self.google(username="ALICE")[1]["token"]
+        bob_token = self.signup("BOB")
+        status, _ = self.request(
+            "POST",
+            "/v1/friends",
+            {"username": "ALICE"},
+            token=bob_token,
+        )
+        self.assertEqual(200, status)
+        status, body = self.request(
+            "POST",
+            "/v1/friends",
+            {"username": "BOB"},
+            token=google_token,
+        )
+        self.assertEqual(200, status, body)
 
 
 class TokenAuthTest(YoServerTestCase):

@@ -3,6 +3,7 @@ package com.example.yo.ui.auth
 import com.example.yo.domain.model.AuthFailure
 import com.example.yo.domain.model.AuthResult
 import com.example.yo.domain.model.YoSession
+import com.example.yo.testing.FakeGoogleIdTokenProvider
 import com.example.yo.testing.FakeSessionStore
 import com.example.yo.testing.StubYoBackendApi
 import kotlinx.coroutines.CompletableDeferred
@@ -222,7 +223,12 @@ class AuthViewModelTest {
     private fun createViewModel(
         backendApi: FakeAuthApi = FakeAuthApi(),
         sessionStore: FakeSessionStore = FakeSessionStore(initial = null),
-    ): AuthViewModel = AuthViewModel(backendApi = backendApi, sessionStore = sessionStore)
+    ): AuthViewModel =
+        AuthViewModel(
+            backendApi = backendApi,
+            sessionStore = sessionStore,
+            googleIdTokenProvider = FakeGoogleIdTokenProvider(),
+        )
 
     private class FakeAuthApi(
         private val result: AuthResult = AuthResult.Success(SESSION),

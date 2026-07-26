@@ -71,7 +71,11 @@ class _UrllibAuthRequest:
             raise TransportError(str(error)) from error
 
 
-def _new_auth_request() -> Any:
+def new_auth_request() -> Any:
+    """A google-auth transport built on urllib, so `requests` stays out of requirements.txt.
+
+    Shared with yo_google, which needs the same transport to fetch Google's signing certificates.
+    """
     try:
         from google.auth.transport.requests import Request
     except ImportError:
@@ -175,7 +179,7 @@ class FCMClient:
 
             if not self._credentials.valid:
                 try:
-                    self._credentials.refresh(_new_auth_request())
+                    self._credentials.refresh(new_auth_request())
                 except Exception as error:
                     raise FCMDeliveryError(
                         f"Unable to refresh Firebase access token: {error}"

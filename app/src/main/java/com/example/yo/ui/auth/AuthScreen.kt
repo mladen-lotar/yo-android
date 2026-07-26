@@ -24,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -41,20 +42,27 @@ import com.example.yo.ui.theme.YoWordmark
 private val ROW_HEIGHT = 89.dp
 
 /**
- * The sign-in gate. Two 89dp bands over the Amethyst field, in the same chromeless idiom as the
- * main screen: no app bar, no card, no outlined text fields.
+ * The sign-in gate. 89dp bands over the Amethyst field, in the same chromeless idiom as the main
+ * screen: no app bar, no card, no outlined text fields.
  *
  * Yo asked for a username and a password and nothing else - no email, no phone verification - and
- * that is exactly what this asks for.
+ * that is exactly what this asks for. Google sign-in is offered alongside, never instead, and only
+ * when the build carries a client id.
+ *
+ * The screen has two shapes. Normally it takes a username and a password. After Google identifies
+ * an account the backend has never seen, it asks for a username alone - the password field would
+ * be meaningless, because a Google account never gets one.
  */
 @Composable
 fun AuthScreen(viewModel: AuthViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsState()
+    val context = LocalContext.current
     var username by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
 
     val submitSignUp = { viewModel.signUp(username, password) }
     val submitLogIn = { viewModel.logIn(username, password) }
+    val submitGoogleUsername = { viewModel.confirmGoogleUsername(username) }
 
     Column(
         modifier = Modifier
@@ -80,20 +88,22 @@ fun AuthScreen(viewModel: AuthViewModel = hiltViewModel()) {
                 placeholder = "USERNAME",
                 capitalize = true,
                 isPassword = false,
-                imeAction = ImeAction.Next,
-                onSubmit = submitSignUp,
+                imeAction = if (state.awaitingUsername) ImeAction.Done else ImeAction.Next,
+                onSubmit = if (state.awaitingUsername) submitGoogleUsername else submitSignUp,
                 modifier = Modifier.padding(top = 40.dp),
             )
-            CredentialField(
-                value = password,
-                onValueChange = { password = it },
-                placeholder = "PASSWORD",
-                capitalize = false,
-                isPassword = true,
-                imeAction = ImeAction.Done,
-                onSubmit = submitSignUp,
-                modifier = Modifier.padding(top = 8.dp),
-            )
+            if (!state.awaitingUsername) {
+                CredentialField(
+                    value = password,
+                    onValueChange = { password = it },
+                    placeholder = "PASSWORD",
+                    capitalize = false,
+                    isPassword = true,
+                    imeAction = ImeAction.Done,
+                    onSubmit = submitSignUp,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
 
             val message = state.message
             if (message != null) {
@@ -106,18 +116,43 @@ fun AuthScreen(viewModel: AuthViewModel = hiltViewModel()) {
             }
         }
 
-        ActionBand(
-            label = if (state.busy) "..." else "SIGN UP",
-            color = YoPalette.Rows[0],
-            enabled = !state.busy,
-            onClick = submitSignUp,
-        )
-        ActionBand(
-            label = "LOG IN",
-            color = YoPalette.Rows[2],
-            enabled = !state.busy,
-            onClick = submitLogIn,
-        )
+        if (state.awaitingUsername) {
+            ActionBand(
+                label = if (state.busy) "..." else "CLAIM IT",
+                color = YoPalette.Rows[0],
+                enabled = !state.busy,
+                onClick = submitGoogleUsername,
+            )
+            ActionBand(
+                label = "CANCEL",
+                color = YoPalette.Rows[3],
+                enabled = !state.busy,
+                onClick = viewModel::cancelGoogle,
+            )
+        } else {
+            ActionBand(
+                label = if (state.busy) "..." else "SIGN UP",
+                color = YoPalette.Rows[0],
+                enabled = !state.busy,
+                onClick = submitSignUp,
+            )
+            ActionBand(
+                label = "LOG IN",
+                color = YoPalette.Rows[2],
+                enabled = !state.busy,
+                onClick = submitLogIn,
+            )
+            // Absent entirely rather than disabled when the build has no client id: a dead band
+            // in Yo's own idiom is indistinguishable from a live one.
+            if (viewModel.googleAvailable) {
+                ActionBand(
+                    label = "CONTINUE WITH GOOGLE",
+                    color = YoPalette.Rows[6],
+                    enabled = !state.busy,
+                    onClick = { viewModel.continueWithGoogle(context) },
+                )
+            }
+        }
     }
 }
 
@@ -184,5 +219,7 @@ fun AuthFailure.message(): String = when (this) {
     AuthFailure.InvalidCredentials -> "WRONG USERNAME OR PASSWORD"
     AuthFailure.Rejected -> "2-32 LETTERS OR DIGITS, PASSWORD 8+"
     AuthFailure.RateLimited -> "TOO MANY TRIES — WAIT A MINUTE"
+    AuthFailure.GoogleRejected -> "GOOGLE SIGN-IN FAILED"
+    AuthFailure.GoogleUnavailable -> "GOOGLE SIGN-IN UNAVAILABLE"
     AuthFailure.Unreachable -> "CAN'T REACH YO"
 }

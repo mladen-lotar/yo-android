@@ -2,8 +2,10 @@
 
 This service keeps the registered username-to-device-token directory and sends
 data-only Firebase Cloud Messaging notifications. It uses Python's
-`ThreadingHTTPServer` and SQLite; `google-auth` is the only package needed for
-configured FCM delivery.
+`ThreadingHTTPServer` and SQLite; `google-auth` is the only package it needs, for
+configured FCM delivery and for verifying Google ID tokens. Both features are off
+until configured, and `google-auth` is imported lazily, so the server runs without
+it installed.
 
 ## Setup
 
@@ -25,6 +27,13 @@ python3 yo_server.py --port 8790
 There is no `YO_SERVER_KEY` any more. A single shared key that every install carried was the
 security gap G3: extracting one APK gave the holder full access as any user. Callers now
 authenticate with a per-account bearer token issued by `/v1/signup`.
+
+Optional environment:
+
+| Variable | Effect when unset |
+|---|---|
+| `YO_GOOGLE_CLIENT_ID` | `/v1/google` answers `503 google_not_configured`; everything else is unaffected. |
+| `YO_APK_PATH` | `/install` says the download is not published yet. |
 
 The SQLite registry defaults to `backend/yo.db`. Use
 `--database /path/to/yo.db` to select another file. The server binds to
@@ -56,8 +65,8 @@ notification text, sound, and vibration.
 ## API
 
 `GET /healthz` and the `/install` pages are unauthenticated — an invitee has no credential by
-definition. `POST /v1/signup` and `POST /v1/login` are public because they *mint* credentials;
-both are rate limited per caller IP. Everything else needs
+definition. `POST /v1/signup`, `POST /v1/login` and `POST /v1/google` are public because they *mint*
+credentials; all three are rate limited per caller IP. Everything else needs
 `Authorization: Bearer <token>` (`X-Yo-Token: <token>` is accepted too).
 
 Create an account. Usernames are canonically uppercase, 2–32 of `A-Z`, `0-9`, `_`; passwords are
@@ -73,6 +82,34 @@ export YO_TOKEN='the-token-printed-above'
 
 `POST /v1/login` takes the same body and returns a fresh token without revoking existing ones, so
 each device holds its own. `DELETE /v1/session` revokes just the token presented.
+
+### Sign in with Google
+
+Requires `YO_GOOGLE_CLIENT_ID` (the OAuth **web** client id, which the token's `aud` is pinned to)
+and `google-auth` installed. Without either, the route answers `503` — `google_not_configured` or
+`google_unavailable` respectively — and every other route is unaffected.
+
+```sh
+curl -X POST http://127.0.0.1:8790/v1/google \
+  -H 'Content-Type: application/json' \
+  -d '{"id_token":"<google id token>"}'
+# 200 {"token":"...","username":"ME"}      already linked
+# 404 {"error":"username_required"}        first time for this Google account
+```
+
+On `username_required`, post the **same** token again with a username; the account is created and
+linked in one transaction and the reply is `201`:
+
+```sh
+curl -X POST http://127.0.0.1:8790/v1/google \
+  -H 'Content-Type: application/json' \
+  -d '{"id_token":"<the same token>","username":"me"}'
+```
+
+The link is keyed on Google's `sub`, never the email address — addresses are reassignable, and none
+is stored. `409 username_taken` if the name belongs to someone else; once linked, a username in the
+body is ignored, so a stale one cannot lock its owner out. Accounts created this way have no
+password and cannot be logged into through `/v1/login` at all.
 
 Register or rotate this device's FCM token. The account comes from the bearer token, so a caller
 can only ever claim their own:

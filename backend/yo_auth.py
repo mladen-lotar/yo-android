@@ -23,6 +23,12 @@ _TOKEN_BYTES = 32
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 256
 
+# What is stored for an account that has no password at all, because it signs in through Google.
+# The column stays NOT NULL and "no password" never degrades into "any password works":
+# verify_password rejects this structurally rather than by a check, since it does not split into
+# the four fields an encoded hash has. No caller can opt out of that.
+UNUSABLE_PASSWORD_HASH = "!"
+
 # Yo's own API documented the field as an "UPPERCASE username", and the app rendered every
 # username in caps, so uppercase is the canonical form rather than a display choice.
 USERNAME_PATTERN = re.compile(r"^[A-Z0-9_]{2,32}$")
