@@ -49,7 +49,9 @@ export YO_FIREBASE_SA_KEY='/absolute/path/to/service-account.json'
 export YO_FIREBASE_PROJECT_ID='your-firebase-project-id'
 ```
 
-Keep the service-account file outside the repository. If either Firebase
+Keep the service-account file outside the repository. The project must be the
+same one the app's `google-services.json` names — a token minted for one project
+cannot be targeted by a server authenticated as another. If either Firebase
 variable is missing, `/v1/send` remains available and returns:
 
 ```json
@@ -58,9 +60,10 @@ variable is missing, `/v1/send` remains available and returns:
 
 Messages use an FCM data-only payload so
 `YoFirebaseMessagingService.onMessageReceived` remains the only notification
-receive path. Android can delay data-only delivery while the app is backgrounded
-or the device is in Doze mode. This is an accepted tradeoff for fully controlled
-notification text, sound, and vibration.
+receive path, which is what buys fully controlled notification text, sound, and
+vibration. Data-only messages default to *normal* priority, which Doze may hold
+until its next maintenance window, so the payload sets
+`android.priority = high` — a Yo that arrives ten minutes late is not a Yo.
 
 ## API
 
