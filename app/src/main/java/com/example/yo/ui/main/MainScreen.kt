@@ -151,12 +151,31 @@ fun MainScreen(
 
             // Yo's "+" row: the bottom-most band, same height and treatment as any contact, and it
             // takes whatever colour its position lands on rather than a reserved one.
-            item(key = "add-row") {
+            //
+            // It says what it does rather than just "+". A bare plus was fine in the original,
+            // where it sat under a list of people you already had; here a new account sees an
+            // empty screen whose only affordance silently offers to group the nobody it knows.
+            val hasNoContacts = friends.isEmpty()
+            if (hasNoContacts) {
+                // Only while the list is empty. Once there are people to Yo, the list itself is
+                // the point and this would just be a permanent banner in the way.
+                item(key = "add-contacts-row") {
+                    Band(
+                        color = YoPalette.colorForIndex(targets.size),
+                        label = "+ ADD CONTACTS",
+                        onClick = { sheet = Sheet.AddFriend },
+                        onLongClick = { sheet = Sheet.AddFriend },
+                        clickLabel = "Add contacts",
+                    )
+                }
+            }
+            item(key = "create-group-row") {
                 Band(
-                    color = YoPalette.colorForIndex(targets.size),
-                    label = "+",
+                    color = YoPalette.colorForIndex(targets.size + if (hasNoContacts) 1 else 0),
+                    label = "+ CREATE GROUP",
                     onClick = { sheet = Sheet.CreateGroup },
                     onLongClick = { sheet = Sheet.CreateGroup },
+                    clickLabel = "Create a group",
                 )
             }
 
@@ -322,6 +341,11 @@ private fun Band(
     label: String,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    /**
+     * What a screen reader announces. Defaults to the send action every contact band performs;
+     * the bands that are not people pass their own, so TalkBack stops saying "Yo + CREATE GROUP".
+     */
+    clickLabel: String? = null,
 ) {
     val text = label.uppercase()
     Box(
@@ -329,7 +353,11 @@ private fun Band(
             .fillMaxWidth()
             .height(ROW_HEIGHT)
             .background(color)
-            .yoTap(onClick = onClick, onLongClick = onLongClick, clickLabel = "Yo $text"),
+            .yoTap(
+                onClick = onClick,
+                onLongClick = onLongClick,
+                clickLabel = clickLabel ?: "Yo $text",
+            ),
         contentAlignment = Alignment.Center,
     ) {
         Text(
