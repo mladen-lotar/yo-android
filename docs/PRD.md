@@ -405,13 +405,11 @@ gap keeps its number rather than being deleted, so earlier references stay valid
 voice saying "Yo"; `YoNotifier` used the device's generic tone. Now bundles its own synthesized
 spoken-"Yo" clip as the channel sound — see FR2.
 
-**G2 — Real FCM push is unconfigured.** Without `google-services.json` and a backend
-service-account key, no device obtains an FCM token, so no `/v1/register` occurs and `/v1/send`
-returns `{"delivered":false,"reason":"fcm_not_configured"}`. Sending, history, friends, groups, and
-photos all work; the actual push notification does not arrive. **No longer blocked on credentials** —
-project `yo-theshop` now exists and the Android app is registered (§7.1), so `google-services.json`
-is one CLI call away. What remains is fetching it, adding the FCM service-account key to the
-backend, and rebuilding.
+**G2 — Real FCM push is unconfigured. — RESOLVED 2026-07-26.** Until now no device obtained an FCM
+token, so no `/v1/register` ever occurred and `/v1/send` answered
+`{"delivered":false,"reason":"fcm_not_configured"}` — everything except the actual notification
+worked. Both halves are now provisioned against project `yo-theshop` and a Yo has been delivered
+to a physical device end to end; see §7.2 for the values and the walkthrough.
 
 **G3 — The shared key ships inside the APK. — RESOLVED 2026-07-26.** `BuildConfig.YO_BACKEND_KEY`
 was embedded in the binary, so extracting an installed APK granted full API access: registering or
@@ -522,6 +520,20 @@ access to the Google account therefore means losing the Yo username, with no rec
 same trade already accepted for forgotten passwords in §5, but worth naming separately because
 here the credential is held by a third party.
 
+**G17 — A device whose FCM registration fails is indistinguishable from one that worked.**
+`RegisterDeviceUseCase` wraps every step in `runCatching` and returns `false` on failure: no retry,
+no log, nothing on screen. This is not hypothetical — the S23's first attempt failed with
+`SERVICE_NOT_AVAILABLE` while dozing (§7.2) and only succeeded on the next launch. The app looked
+perfectly healthy the whole time; the only symptom was that Yos sent to it vanished. A device that
+never recovers stays silently unreachable forever, because the only other registration trigger is
+`onNewToken`, which fires on token *rotation*, not on launch.
+
+**G18 — `recipient_not_found` conflates "no such user" with "user has no device".** `_handle_send`
+resolves the recipient account first, then looks up their FCM token; a missing token returns
+`404 {"reason":"recipient_not_found"}`. So a real, existing friend whose registration silently
+failed under G17 is reported to the sender as a nonexistent user. Same class of mistake as the
+`NoCredentialException` copy fixed in G13: an error asserting a fact it has not established.
+
 ---
 
 ## 7. Deployment state (as of 2026-07-26)
@@ -623,10 +635,49 @@ Two tokens existed for the one account afterwards, one per sign-in — per-devic
 FR9 specifies. The account `MLADEN` created during the production run is a real account and was
 left in place; delete it if it is not wanted.
 
-The same project is what G2 has been waiting on: `google-services.json` is now obtainable with
-`firebase apps:sdkconfig ANDROID 1:747034506241:android:2643dabcb1f28ae548bc00 --project
-yo-theshop`. Closing G2 additionally needs the FCM service-account key and the app rebuilt with
-that file present, which is separate work.
+---
+
+### 7.2 Push delivery — provisioned 2026-07-26
+
+Push runs on `yo-theshop` (project number `747034506241`), a different project from the one Google
+sign-in borrows (§7.1, gap G16). They do not interact: Credential Manager reads
+`BuildConfig.YO_GOOGLE_CLIENT_ID`, never `google-services.json`, so the two can sit side by side.
+What must match is the **sender**: an FCM token minted for project A cannot be targeted by a server
+authenticated as project B, so the app's `google-services.json` and the backend's service-account
+key both have to come from `yo-theshop`.
+
+| Piece | Value |
+|---|---|
+| App id | `1:747034506241:android:2643dabcb1f28ae548bc00` |
+| `app/google-services.json` | `firebase apps:sdkconfig ANDROID <app id> -P yo-theshop --out app/google-services.json` |
+| `YO_FIREBASE_PROJECT_ID` | `yo-theshop` |
+| `YO_FIREBASE_SA_KEY` | key for `firebase-adminsdk-fbsvc@yo-theshop.iam.gserviceaccount.com`, kept outside the repo |
+
+`google-services.json` is gitignored and `app/build.gradle.kts` only applies the google-services
+plugin when the file is present, so a fresh clone still builds — with the Firebase half dark. No
+billing is involved; FCM is free and `fcm.googleapis.com` was already enabled.
+
+**Verified on a physical S23 against production**, app backgrounded behind a locked screen — a real
+push, not a foreground one:
+
+| Step | Result |
+|---|---|
+| App launch, signed in | `POST /v1/register 200`, real FCM token stored for `MLADEN` |
+| `POST /v1/send` | `{"delivered":true}` |
+| Device, ~1s later | Notification posted: title `Yo`, text `From MLADEN` |
+| Channel | `yo_push_v2`, importance 4, sound `android.resource://com.example.yo/…`, vibration `0/150/100/150`, accent `0xff9b59b6` |
+
+One bug was found and fixed in the course of this. `fcm_client.send_yo` sent a data-only message
+with no priority, and FCM defaults those to *normal*, which Doze may hold until its next
+maintenance window — for an app whose entire product is immediacy, the wrong default. The payload
+now sets `android.priority = high`. It would not have shown up in this test: a screen-on, plugged-in
+handset is never in Doze, so the defect would have shipped behind a green run.
+
+A second, unrelated observation: the first token attempt failed with
+`FirebaseMessaging: … java.io.IOException: SERVICE_NOT_AVAILABLE` while the handset was dozing, and
+succeeded on the next launch with the screen awake. `RegisterDeviceUseCase` swallows that failure
+and returns `false` with nothing surfaced to the user, so an install whose registration never
+succeeds looks identical to one that worked until somebody tries to Yo it. See gap G17.
 
 ---
 

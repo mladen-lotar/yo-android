@@ -106,6 +106,9 @@ class FCMClient:
         payload: Dict[str, object] = {
             "message": {
                 "token": fcm_token,
+                # Data-only messages default to normal priority, which Doze may hold back until
+                # the next maintenance window. A Yo that arrives in ten minutes is not a Yo.
+                "android": {"priority": "high"},
                 "data": {
                     "type": "yo",
                     "sender": sender,

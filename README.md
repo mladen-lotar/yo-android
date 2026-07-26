@@ -7,7 +7,7 @@ third-party clients. Sends are delivered over FCM and mirrored to local Room his
 
 The app is deliberately small. Before adding anything, read **[docs/PRD.md](docs/PRD.md)** — it
 records what the original product actually was, which features were intentionally left out and why,
-and the known gaps in the current build (notably that real FCM push still needs credentials).
+and the known gaps in the current build.
 
 ## Accounts
 
@@ -76,6 +76,33 @@ sign-in.
 
 Plain HTTP only works in debug builds (`usesCleartextTraffic` is set in the debug manifest); release
 builds require HTTPS. See [backend/README.md](backend/README.md) to run the server.
+
+## Push
+
+Yos are delivered over FCM, and both halves are off until configured — the app builds and runs
+without them, it just never receives anything.
+
+The app needs `app/google-services.json` for its Firebase project. It is gitignored, and
+`app/build.gradle.kts` applies the google-services plugin only when the file is present, so a clone
+without it still builds:
+
+```sh
+firebase apps:sdkconfig ANDROID <android-app-id> -P <project> --out app/google-services.json
+```
+
+The backend needs a service-account key for the **same** project, since an FCM token minted for one
+project cannot be targeted by a server authenticated as another:
+
+```sh
+gcloud iam service-accounts keys create <path>.json \
+  --iam-account=firebase-adminsdk-<id>@<project>.iam.gserviceaccount.com --project=<project>
+export YO_FIREBASE_SA_KEY=<path>.json
+export YO_FIREBASE_PROJECT_ID=<project>
+```
+
+Keep the key outside the repository. With either half missing, `/v1/send` answers
+`{"delivered":false,"reason":"fcm_not_configured"}` rather than failing — everything else keeps
+working. Working end to end on a physical device as of 2026-07-26; see PRD §7.2.
 
 ## Google sign-in
 
