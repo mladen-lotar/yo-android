@@ -168,7 +168,7 @@ class AuthViewModelGoogleTest {
 
     @Test
     fun `a picker that cannot run explains itself and sends nothing`() = runTest {
-        for (outcome in listOf(GoogleIdTokenResult.NoAccount, GoogleIdTokenResult.Unavailable)) {
+        for (outcome in listOf(GoogleIdTokenResult.NoUsableAccount, GoogleIdTokenResult.Unavailable)) {
             val backendApi = FakeGoogleApi(GoogleAuthResult.Success(SESSION))
             val viewModel =
                 createViewModel(backendApi, provider = FakeGoogleIdTokenProvider(result = outcome))
@@ -180,6 +180,29 @@ class AuthViewModelGoogleTest {
             assertFalse(viewModel.state.value.busy)
             assertTrue(backendApi.googleCalls.isEmpty())
         }
+    }
+
+    @Test
+    fun `an unusable account is never reported as the phone having none`() = runTest {
+        // Credential Manager answers NoCredentialException both when the device has no Google
+        // account and when it has several that may not be used here - which is what an S25 with
+        // four accounts actually did, against a project missing its Android OAuth client. Telling
+        // that user "no Google account on this phone" sends them looking for a problem they do
+        // not have.
+        val viewModel =
+            createViewModel(
+                provider = FakeGoogleIdTokenProvider(result = GoogleIdTokenResult.NoUsableAccount),
+            )
+
+        viewModel.continueWithGoogle(context)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val message = viewModel.state.value.message
+        assertNotNull(message)
+        assertFalse(
+            "message asserts a device fact Credential Manager cannot know: $message",
+            message!!.contains("PHONE") || message.contains("DEVICE"),
+        )
     }
 
     @Test

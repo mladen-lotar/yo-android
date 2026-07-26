@@ -29,8 +29,17 @@ sealed interface GoogleIdTokenResult {
      */
     data object Cancelled : GoogleIdTokenResult
 
-    /** The device has no Google account to offer. */
-    data object NoAccount : GoogleIdTokenResult
+    /**
+     * Credential Manager had no credential to return for this request.
+     *
+     * This is NOT the same as "the device has no Google account", however much the name of the
+     * underlying `NoCredentialException` suggests it. Play services answers identically when the
+     * phone is signed into several Google accounts but none of them may be used here - most often
+     * because the project owning the server client id has no Android OAuth client registered for
+     * this package and signing certificate. Observed on an S25 with four Google accounts present.
+     * So anything shown to the user must not assert that they have no account.
+     */
+    data object NoUsableAccount : GoogleIdTokenResult
 
     /** Play services is missing or too old, or this build's client id is wrong. */
     data object Unavailable : GoogleIdTokenResult

@@ -48,7 +48,7 @@ class CredentialManagerGoogleIdTokenProvider @Inject constructor(
             } catch (cancelled: GetCredentialCancellationException) {
                 return GoogleIdTokenResult.Cancelled
             } catch (empty: NoCredentialException) {
-                return GoogleIdTokenResult.NoAccount
+                return GoogleIdTokenResult.NoUsableAccount
             } catch (failed: GetCredentialException) {
                 return GoogleIdTokenResult.Unavailable
             }
