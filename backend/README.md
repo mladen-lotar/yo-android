@@ -16,12 +16,15 @@ python3 -m venv .venv
 python3 -m pip install -r requirements.txt
 ```
 
-Set the shared API key before starting the server:
+Start the server:
 
 ```sh
-export YO_SERVER_KEY='replace-with-a-long-random-value'
 python3 yo_server.py --port 8790
 ```
+
+There is no `YO_SERVER_KEY` any more. A single shared key that every install carried was the
+security gap G3: extracting one APK gave the holder full access as any user. Callers now
+authenticate with a per-account bearer token issued by `/v1/signup`.
 
 The SQLite registry defaults to `backend/yo.db`. Use
 `--database /path/to/yo.db` to select another file. The server binds to
@@ -52,33 +55,69 @@ notification text, sound, and vibration.
 
 ## API
 
-`GET /healthz` is unauthenticated. The app-facing `/v1/register`,
-`/v1/friends`, `/v1/send`, and `/v1/photo` routes require
-`X-Yo-Key: $YO_SERVER_KEY`.
+`GET /healthz` and the `/install` pages are unauthenticated — an invitee has no credential by
+definition. `POST /v1/signup` and `POST /v1/login` are public because they *mint* credentials;
+both are rate limited per caller IP. Everything else needs
+`Authorization: Bearer <token>` (`X-Yo-Token: <token>` is accepted too).
 
-Register or rotate a device token:
+Create an account. Usernames are canonically uppercase, 2–32 of `A-Z`, `0-9`, `_`; passwords are
+8–256 characters, stored as PBKDF2-HMAC-SHA256:
+
+```sh
+curl -X POST http://127.0.0.1:8790/v1/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"me","password":"correct horse battery"}'
+# {"token":"...","username":"ME"}
+export YO_TOKEN='the-token-printed-above'
+```
+
+`POST /v1/login` takes the same body and returns a fresh token without revoking existing ones, so
+each device holds its own. `DELETE /v1/session` revokes just the token presented.
+
+Register or rotate this device's FCM token. The account comes from the bearer token, so a caller
+can only ever claim their own:
 
 ```sh
 curl -X POST http://127.0.0.1:8790/v1/register \
-  -H "X-Yo-Key: $YO_SERVER_KEY" \
+  -H "Authorization: Bearer $YO_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"me","fcm_token":"token"}'
+  -d '{"fcm_token":"token"}'
 ```
 
-List every registered username except the requester:
+Friends are explicit — the list holds only the people you added, never every registered device:
 
 ```sh
-curl 'http://127.0.0.1:8790/v1/friends?username=me' \
-  -H "X-Yo-Key: $YO_SERVER_KEY"
+curl http://127.0.0.1:8790/v1/friends -H "Authorization: Bearer $YO_TOKEN"
+
+curl -X POST http://127.0.0.1:8790/v1/friends \
+  -H "Authorization: Bearer $YO_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"friend"}'                       # 404 if no such account
+
+curl -X DELETE 'http://127.0.0.1:8790/v1/friends?username=friend' \
+  -H "Authorization: Bearer $YO_TOKEN"
 ```
 
-Send a Yo:
+Blocking is one-directional and also drops the person from your friends. A blocked sender receives
+an ordinary `{"delivered":true}` and no push is sent, so a block never announces itself:
+
+```sh
+curl -X POST http://127.0.0.1:8790/v1/block \
+  -H "Authorization: Bearer $YO_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"nuisance"}'
+
+curl -X DELETE 'http://127.0.0.1:8790/v1/block?username=nuisance' \
+  -H "Authorization: Bearer $YO_TOKEN"
+curl http://127.0.0.1:8790/v1/blocked -H "Authorization: Bearer $YO_TOKEN"
+```
+
+Send a Yo. There is no `sender` field: the server reads it from the token, so sending as somebody
+else is not expressible. Sends are rate limited per account.
 
 ```sh
 curl -X POST http://127.0.0.1:8790/v1/send \
-  -H "X-Yo-Key: $YO_SERVER_KEY" \
+  -H "Authorization: Bearer $YO_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"sender":"me","recipient":"friend"}'
+  -d '{"recipient":"friend"}'
 ```
 
 ## Photo attachment
@@ -87,10 +126,13 @@ Upload a base64-encoded photo for a message:
 
 ```sh
 curl -X POST http://127.0.0.1:8790/v1/photo \
-  -H "X-Yo-Key: $YO_SERVER_KEY" \
+  -H "Authorization: Bearer $YO_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"message_id":"message-id","mime_type":"image/jpeg","data":"base64-data"}'
+  -d '{"message_id":"id","mime_type":"image/jpeg","data":"base64","recipient":"friend"}'
 ```
+
+`message_id` is chosen by the caller, so uploads record an owner: only the uploader may overwrite
+an id, and only the uploader and the named `recipient` may read it back. Everyone else gets 404.
 
 Photo upload request bodies are capped at 2 MB, and the base64 `data` payload
 is capped at approximately 1.4 MB.
@@ -100,8 +142,8 @@ The approximately 1.4 MB cap is measured in actual UTF-8-encoded bytes of the
 Fetch the stored photo by message ID:
 
 ```sh
-curl 'http://127.0.0.1:8790/v1/photo?message_id=message-id' \
-  -H "X-Yo-Key: $YO_SERVER_KEY"
+curl 'http://127.0.0.1:8790/v1/photo?message_id=id' \
+  -H "Authorization: Bearer $YO_TOKEN"
 ```
 
 ## Broadcast API (third-party clients)
@@ -112,6 +154,9 @@ usernames:
 ```sh
 python3 register_client.py --client-id fedex --subscribe alice --subscribe bob
 ```
+
+Subscription usernames are normalised to uppercase to match how accounts are stored, so
+`--subscribe alice` and `--subscribe ALICE` are the same person.
 
 The command prints the raw client key once. Store it securely and send it with
 the client ID in the `X-Yo-Client-Key` and `X-Yo-Client-Id` headers:

@@ -15,6 +15,7 @@ import javax.inject.Inject
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -137,11 +138,18 @@ internal fun scaleToLongEdge(
     return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
 }
 
-class BitmapPhotoEncoder @Inject constructor(
-    @ApplicationContext private val context: Context,
+class BitmapPhotoEncoder(
+    private val context: Context,
+    private val ioDispatcher: CoroutineDispatcher,
 ) : PhotoEncoder {
+
+    // Dagger ignores Kotlin default arguments, so the injectable constructor is explicit rather
+    // than a defaulted parameter. The two-arg form above stays available to tests.
+    @Inject
+    constructor(@ApplicationContext context: Context) : this(context, Dispatchers.IO)
+
     override suspend fun encodeForUpload(photoUri: String): PhotoPayload? =
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             try {
                 val decoded =
                     decodeSampledBitmap(

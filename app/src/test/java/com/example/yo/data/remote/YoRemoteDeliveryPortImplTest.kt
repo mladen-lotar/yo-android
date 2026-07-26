@@ -3,6 +3,7 @@ package com.example.yo.data.remote
 import com.example.yo.domain.model.YoMessage
 import com.example.yo.domain.photo.PhotoEncoder
 import com.example.yo.domain.photo.PhotoPayload
+import com.example.yo.testing.StubYoBackendApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -29,10 +30,10 @@ class YoRemoteDeliveryPortImplTest {
         val delivered = deliveryPort.deliver(message)
 
         assertFalse(delivered)
-        assertEquals(listOf(SendCall("me", "Ada")), backendApi.sends)
+        assertEquals(listOf(SendCall("Ada")), backendApi.sends)
         assertEquals(listOf("content://photos/message-1"), photoEncoder.encodedUris)
         assertEquals(
-            listOf(UploadCall("message-1", "encoded-photo", "image/jpeg")),
+            listOf(UploadCall("message-1", "encoded-photo", "image/jpeg", "Ada")),
             backendApi.uploads,
         )
     }
@@ -53,7 +54,7 @@ class YoRemoteDeliveryPortImplTest {
             )
 
         assertTrue(delivered)
-        assertEquals(listOf(SendCall("me", "Lin")), backendApi.sends)
+        assertEquals(listOf(SendCall("Lin")), backendApi.sends)
         assertTrue(photoEncoder.encodedUris.isEmpty())
         assertTrue(backendApi.uploads.isEmpty())
     }
@@ -100,7 +101,7 @@ class YoRemoteDeliveryPortImplTest {
 
         assertTrue(delivered)
         assertEquals(
-            listOf(UploadCall("message-4", "encoded-photo", "image/jpeg")),
+            listOf(UploadCall("message-4", "encoded-photo", "image/jpeg", "Katherine")),
             backendApi.uploads,
         )
     }
@@ -122,7 +123,7 @@ class YoRemoteDeliveryPortImplTest {
             )
 
         assertTrue(delivered)
-        assertEquals(listOf(SendCall("me", "Margaret")), backendApi.sends)
+        assertEquals(listOf(SendCall("Margaret")), backendApi.sends)
         assertTrue(backendApi.uploads.isEmpty())
     }
 
@@ -182,22 +183,12 @@ class YoRemoteDeliveryPortImplTest {
     private class FakeYoBackendApi(
         private val sendResult: Boolean = true,
         private val uploadFailure: Throwable? = null,
-    ) : YoBackendApi {
+    ) : StubYoBackendApi() {
         val sends = mutableListOf<SendCall>()
         val uploads = mutableListOf<UploadCall>()
 
-        override suspend fun register(
-            username: String,
-            fcmToken: String,
-        ): Boolean = true
-
-        override suspend fun fetchFriends(): List<String> = emptyList()
-
-        override suspend fun sendYo(
-            sender: String,
-            recipient: String,
-        ): Boolean {
-            sends += SendCall(sender, recipient)
+        override suspend fun sendYo(recipient: String): Boolean {
+            sends += SendCall(recipient)
             return sendResult
         }
 
@@ -205,8 +196,9 @@ class YoRemoteDeliveryPortImplTest {
             messageId: String,
             base64Data: String,
             mimeType: String,
+            recipient: String?,
         ): Boolean {
-            uploads += UploadCall(messageId, base64Data, mimeType)
+            uploads += UploadCall(messageId, base64Data, mimeType, recipient)
             uploadFailure?.let { throw it }
             return true
         }
@@ -226,7 +218,6 @@ class YoRemoteDeliveryPortImplTest {
     }
 
     private data class SendCall(
-        val sender: String,
         val recipient: String,
     )
 
@@ -234,5 +225,6 @@ class YoRemoteDeliveryPortImplTest {
         val messageId: String,
         val base64Data: String,
         val mimeType: String,
+        val recipient: String?,
     )
 }

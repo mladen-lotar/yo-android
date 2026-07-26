@@ -1,6 +1,9 @@
 package com.example.yo.data.remote
 
-import com.example.yo.domain.model.YoIdentity
+import com.example.yo.domain.model.AuthFailure
+import com.example.yo.domain.model.AuthResult
+import com.example.yo.domain.model.YoSession
+import com.example.yo.domain.repository.SessionStore
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -10,48 +13,103 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
+/** Why an "add friend" attempt did not work, so the sheet can say something specific. */
+enum class AddFriendOutcome {
+    Added,
+    NoSuchUser,
+    Rejected,
+    Unreachable,
+}
+
 interface YoBackendApi {
-    suspend fun register(
-        username: String,
-        fcmToken: String,
-    ): Boolean
+    suspend fun signUp(username: String, password: String): AuthResult
+
+    suspend fun logIn(username: String, password: String): AuthResult
+
+    suspend fun logOut(): Boolean
+
+    suspend fun register(fcmToken: String): Boolean
 
     suspend fun fetchFriends(): List<String>
 
-    suspend fun sendYo(
-        sender: String,
-        recipient: String,
-    ): Boolean
+    suspend fun addFriend(username: String): AddFriendOutcome
+
+    suspend fun removeFriend(username: String): Boolean
+
+    suspend fun block(username: String): Boolean
+
+    suspend fun sendYo(recipient: String): Boolean
 
     suspend fun uploadPhoto(
         messageId: String,
         base64Data: String,
         mimeType: String,
+        recipient: String?,
     ): Boolean
 }
 
 class HttpYoBackendApi(
     baseUrl: String,
-    private val sharedKey: String,
+    private val sessionStore: SessionStore,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : YoBackendApi {
     private val baseUrl = baseUrl.trimEnd('/')
 
-    override suspend fun register(
+    override suspend fun signUp(username: String, password: String): AuthResult =
+        authenticate("/v1/signup", username, password)
+
+    override suspend fun logIn(username: String, password: String): AuthResult =
+        authenticate("/v1/login", username, password)
+
+    private suspend fun authenticate(
+        path: String,
         username: String,
-        fcmToken: String,
-    ): Boolean {
+        password: String,
+    ): AuthResult {
         val body =
             JSONObject()
                 .put("username", username)
-                .put("fcm_token", fcmToken)
+                .put("password", password)
                 .toString()
+        val response =
+            try {
+                execute(method = "POST", path = path, body = body)
+            } catch (error: IOException) {
+                return AuthResult.Failure(AuthFailure.Unreachable)
+            }
+        if (response.isSuccessful) {
+            val payload = JSONObject(response.body)
+            return AuthResult.Success(
+                YoSession(
+                    username = payload.getString("username"),
+                    token = payload.getString("token"),
+                ),
+            )
+        }
+        return AuthResult.Failure(
+            when (response.statusCode) {
+                HttpURLConnection.HTTP_CONFLICT -> AuthFailure.UsernameTaken
+                HttpURLConnection.HTTP_UNAUTHORIZED -> AuthFailure.InvalidCredentials
+                HttpURLConnection.HTTP_BAD_REQUEST -> AuthFailure.Rejected
+                TOO_MANY_REQUESTS -> AuthFailure.RateLimited
+                else -> AuthFailure.Unreachable
+            },
+        )
+    }
+
+    override suspend fun logOut(): Boolean =
+        runCatching { execute(method = "DELETE", path = "/v1/session").isSuccessful }
+            .getOrDefault(false)
+
+    override suspend fun register(fcmToken: String): Boolean {
+        // The username is no longer sent: the server takes it from the token, so a device can
+        // only ever claim its own account.
+        val body = JSONObject().put("fcm_token", fcmToken).toString()
         return execute(method = "POST", path = "/v1/register", body = body).isSuccessful
     }
 
     override suspend fun fetchFriends(): List<String> {
-        val username = URLEncoder.encode(YoIdentity.CURRENT_USERNAME, Charsets.UTF_8.name())
-        val response = execute(method = "GET", path = "/v1/friends?username=$username")
+        val response = execute(method = "GET", path = "/v1/friends")
         if (!response.isSuccessful) {
             throw IOException("Backend returned HTTP ${response.statusCode}")
         }
@@ -60,15 +118,39 @@ class HttpYoBackendApi(
         return List(friends.length()) { index -> friends.getString(index) }
     }
 
-    override suspend fun sendYo(
-        sender: String,
-        recipient: String,
-    ): Boolean {
-        val body =
-            JSONObject()
-                .put("sender", sender)
-                .put("recipient", recipient)
-                .toString()
+    override suspend fun addFriend(username: String): AddFriendOutcome {
+        val body = JSONObject().put("username", username).toString()
+        val response =
+            try {
+                execute(method = "POST", path = "/v1/friends", body = body)
+            } catch (error: IOException) {
+                return AddFriendOutcome.Unreachable
+            }
+        return when {
+            response.isSuccessful -> AddFriendOutcome.Added
+            response.statusCode == HttpURLConnection.HTTP_NOT_FOUND -> AddFriendOutcome.NoSuchUser
+            response.statusCode == HttpURLConnection.HTTP_BAD_REQUEST -> AddFriendOutcome.Rejected
+            else -> AddFriendOutcome.Unreachable
+        }
+    }
+
+    override suspend fun removeFriend(username: String): Boolean =
+        runCatching {
+            execute(method = "DELETE", path = "/v1/friends?username=${encode(username)}")
+                .isSuccessful
+        }.getOrDefault(false)
+
+    override suspend fun block(username: String): Boolean {
+        val body = JSONObject().put("username", username).toString()
+        return runCatching {
+            execute(method = "POST", path = "/v1/block", body = body).isSuccessful
+        }.getOrDefault(false)
+    }
+
+    override suspend fun sendYo(recipient: String): Boolean {
+        // No sender field: spoofing another user is impossible because the server reads the
+        // sender off the bearer token.
+        val body = JSONObject().put("recipient", recipient).toString()
         val response = execute(method = "POST", path = "/v1/send", body = body)
         return response.isSuccessful && JSONObject(response.body).optBoolean("delivered", false)
     }
@@ -77,16 +159,20 @@ class HttpYoBackendApi(
         messageId: String,
         base64Data: String,
         mimeType: String,
+        recipient: String?,
     ): Boolean {
         val body =
             JSONObject()
                 .put("message_id", messageId)
                 .put("mime_type", mimeType)
                 .put("data", base64Data)
+                .apply { if (recipient != null) put("recipient", recipient) }
                 .toString()
         val response = execute(method = "POST", path = "/v1/photo", body = body)
         return response.isSuccessful && JSONObject(response.body).optBoolean("stored", false)
     }
+
+    private fun encode(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())
 
     private suspend fun execute(
         method: String,
@@ -100,7 +186,9 @@ class HttpYoBackendApi(
                     connectTimeout = TIMEOUT_MILLIS
                     readTimeout = TIMEOUT_MILLIS
                     setRequestProperty("Accept", "application/json")
-                    setRequestProperty("X-Yo-Key", sharedKey)
+                    sessionStore.current()?.let { session ->
+                        setRequestProperty("Authorization", "Bearer ${session.token}")
+                    }
                     if (body != null) {
                         doOutput = true
                         setRequestProperty("Content-Type", "application/json; charset=utf-8")
@@ -141,5 +229,8 @@ class HttpYoBackendApi(
 
     private companion object {
         const val TIMEOUT_MILLIS = 10_000
+
+        // HttpURLConnection has no constant for 429.
+        const val TOO_MANY_REQUESTS = 429
     }
 }
