@@ -3,7 +3,9 @@
 Status: consolidated 2026-07-25 from GitHub issues #1–#7 and #11, then reconciled against the
 historical record of the original app. Last revised 2026-07-26, when Google sign-in (FR10) was
 added on top of the accounts work that closed gaps G3–G7.
-Repo: `mladen-lotar/yo-android` · Package: `com.example.yo` · Baseline commit: `e401a0c`
+Repo: `mladen-lotar/yo-android` · Package: `hr.theshop.yo` (renamed from `com.example.yo`
+2026-07-27 for the Play release) · Baseline commit: `e401a0c`
+Release process and Play requirements: **[RELEASE.md](RELEASE.md)**.
 
 This document is the single source of truth for *what this app is meant to be*. It exists because
 the specification previously lived only in closed GitHub issues, so a reader of the checkout saw a
@@ -549,6 +551,36 @@ established. A registered-but-deviceless account now answers `recipient_unregist
 This discloses nothing new, which is why it does not worsen G9: `_handle_add_friend` and
 `_handle_block` already answer `no_such_user` for names that do not exist, so any authenticated
 caller could already enumerate accounts. The conflation bought no privacy, only a wrong message.
+
+**G19 — the FCM token APIs the app is built on are deprecated.** firebase-messaging 25.x marks
+`FirebaseMessaging.getToken()`, `deleteToken()`, `send()` and
+`FirebaseMessagingService.onNewToken()` deprecated in favour of `register()` / `unregister()` and
+`onRegistered()` / `onUnregistered()`. The replacement is not a rename: `register()` returns no
+token and delivers it asynchronously to the service instead, so registration stops being something
+the app can ask for and retry, and becomes something it can only wait for. That would rewrite the
+retry, the backoff and the `NOT RECEIVING YOS` state added for G17. Deprecated is not removed, and
+the current path is the one proven end-to-end on a handset, so it is suppressed with a comment for
+this release and migrated deliberately afterwards, together.
+
+**G20 — "ATTACH LOCATION" attaches nothing the recipient can see.** `YoMessage` carries latitude
+and longitude, and `MainViewModel.sendYo` fills them in from a real position fix, but
+`YoRemoteDeliveryPortImpl.deliver` sends only `recipient` (and the photo). The coordinates are
+written to local Room history and never transmitted; the same is true of `link` and `hashtag`. So
+the feature is honest about the permission - nothing leaves the device, which is what the privacy
+policy and the data-safety form say - but dishonest about the product: the person receiving the Yo
+gets no location. Either wire it into the send payload, or remove the feature and its two location
+permissions. Shipping a button that implies a transmission that does not happen is the kind of
+thing a Play reviewer asks about, and asking for `ACCESS_FINE_LOCATION` for a write-only-to-self
+feature is a weak justification.
+
+**G21 — no Cloud project owns `hr.theshop.yo`.** The package rename invalidates both Google
+integrations at once: `google-services.json` keys the FCM app on the package name, and an Android
+OAuth client is registered as a (package, SHA-1) pair. Neither matches any more. The fix is the
+same project that G16 already called for - one project owning both the FCM app and the OAuth
+clients - now with `hr.theshop.yo` and with **both** signing fingerprints registered: the new
+upload key (`22:02:ED:E8:…`) as well as the debug key (`BC:E5:5B:00:…`). Registering only the
+debug key is the failure that works perfectly in development and breaks for every real user.
+Blocked on `gcloud auth login` / `firebase login`; both CLI tokens are expired.
 
 ---
 

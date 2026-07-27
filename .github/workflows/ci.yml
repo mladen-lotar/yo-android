@@ -10,24 +10,28 @@ permissions:
 
 jobs:
   android:
-    name: Android unit tests + debug APK
+    name: Android unit tests + lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # AGP 8.2.0 requires JDK 17. The ubuntu-latest image already provides the
-      # Android SDK (ANDROID_HOME=/usr/local/lib/android/sdk, platform android-34,
-      # build-tools 34.0.0), so no sdk.dir / local.properties is needed here.
+      # Java 21, not 17: Robolectric refuses to create a sandbox for Android SDK 36 on anything
+      # lower ("Android SDK 36 requires Java 21"). The app itself still compiles to 17 bytecode -
+      # compileOptions decides that, not the JVM Gradle happens to run on.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
 
       - uses: gradle/actions/setup-gradle@v4
 
-      # Robolectric 4.11.1 fetches its android-all-instrumented jars at test
-      # runtime into ~/.m2, outside anything setup-gradle caches. Without this the
-      # suite re-downloads ~200MB every run and goes red on any Maven hiccup.
+      # Robolectric fetches its android-all-instrumented jars at test runtime into ~/.m2, outside
+      # anything setup-gradle caches. Without this the suite re-downloads them every run and goes
+      # red on any Maven hiccup.
       - name: Cache Robolectric android-all jars
         uses: actions/cache@v4
         with:
@@ -39,17 +43,22 @@ jobs:
       - name: Unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon
 
-      - name: Assemble debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon
+      # lint rather than assembleDebug. Producing an APK now requires real deployment
+      # configuration - backend URL, invite URL, privacy URL, OAuth client id - and CI has no
+      # business holding those. Lint still merges the manifest, links resources and compiles
+      # everything, so it covers what assembleDebug covered here, and adds static analysis.
+      - name: Lint
+        run: ./gradlew :app:lintDebug --no-daemon
 
-      - name: Upload test report
+      - name: Upload reports
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: android-test-report
+          name: android-reports
           path: |
             app/build/reports/tests/testDebugUnitTest
             app/build/test-results/testDebugUnitTest
+            app/build/reports/lint-results-debug.html
           if-no-files-found: ignore
           retention-days: 14
 
