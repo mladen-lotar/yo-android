@@ -38,7 +38,7 @@ class BuildInviteMessageUseCaseTest {
     }
 
     @Test
-    fun `handles blank and whitespace-only contact names without producing "Hey ,"`() {
+    fun `handles blank and whitespace-only contact names without producing a bare Hey comma`() {
         for (name in listOf("", "   ", "\n")) {
             val message = buildInviteMessage(contact(name), url, "me")
             assertFalse("name=[$name] produced a dangling greeting", message.contains("Hey ,"))
@@ -77,7 +77,7 @@ class BuildInviteMessageUseCaseTest {
     }
 
     @Test
-    fun `single-letter names are not greeted, since "Hey A," reads like a bug`() {
+    fun `single-letter names are not greeted, since Hey A reads like a bug`() {
         assertFalse(buildInviteMessage(contact("A"), url, "me").startsWith("Hey"))
     }
 

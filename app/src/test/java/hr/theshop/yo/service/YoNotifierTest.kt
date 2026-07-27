@@ -38,7 +38,7 @@ class YoNotifierTest {
     }
 
     @Test
-    fun `notification reads "Yo" over "From USERNAME" with the sender uppercased`() {
+    fun `notification reads Yo over From USERNAME with the sender uppercased`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val notificationManager = context.getSystemService(NotificationManager::class.java)
 
@@ -81,6 +81,10 @@ class YoNotifierTest {
         YoNotifier.postYoNotification(context, "Ada")
 
         val notification = shadowOf(notificationManager).allNotifications.single()
-        assertEquals(YoNotifier.yoSoundUri(context), notification.sound)
+        // Notification.sound is deprecated in favour of the channel's sound, but on API 24-25
+        // there are no channels - which is exactly the range this assertion exists to cover.
+        @Suppress("DEPRECATION")
+        val sound = notification.sound
+        assertEquals(YoNotifier.yoSoundUri(context), sound)
     }
 }

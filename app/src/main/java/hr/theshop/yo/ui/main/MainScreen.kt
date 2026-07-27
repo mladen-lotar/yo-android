@@ -17,7 +17,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -139,7 +145,16 @@ fun MainScreen(
             .fillMaxSize()
             .background(YoPalette.Amethyst),
     ) {
-        LazyColumn(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            // targetSdk 35+ puts every app edge-to-edge whether it asks or not, so the list now
+            // draws underneath the status and navigation bars. Vertical insets only: the bands are
+            // full-bleed by design and horizontal padding would inset their colour from the edge.
+            contentPadding =
+                WindowInsets.systemBars
+                    .only(WindowInsetsSides.Vertical)
+                    .asPaddingValues(),
+        ) {
             val targets = friends.map { SendTarget.Friend(it) } +
                 groups.map { SendTarget.YoGroup(it) }
 
@@ -219,6 +234,12 @@ fun MainScreen(
             onClick = { sheet = Sheet.Menu },
             modifier = Modifier
                 .align(Alignment.BottomEnd)
+                // Without this the button sits under the navigation bar, which swallows the
+                // touches: on a 2340px screen its 144px circle ended at y=2304 with the bar
+                // covering everything below ~2190, leaving a ~30px strip that actually responded.
+                // The menu is the only route to PRIVACY and DELETE ACCOUNT, both of which Play
+                // requires to be reachable.
+                .windowInsetsPadding(WindowInsets.systemBars.only(WindowInsetsSides.Bottom))
                 .padding(MENU_BUTTON_INSET),
         )
     }

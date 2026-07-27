@@ -573,7 +573,30 @@ permissions. Shipping a button that implies a transmission that does not happen 
 thing a Play reviewer asks about, and asking for `ACCESS_FINE_LOCATION` for a write-only-to-self
 feature is a weak justification.
 
-**G21 — no Cloud project owns `hr.theshop.yo`. — FCM HALF RESOLVED 2026-07-27.** A Firebase
+**G22 — targetSdk 36 forced edge-to-edge and the menu button fell under the navigation bar. —
+FOUND AND FIXED ON DEVICE 2026-07-27.** Android 15 makes edge-to-edge mandatory for targetSdk 35+,
+so raising the target from 34 changed where the app draws without changing a line of layout code.
+`MainScreen` applied no window insets at all (`AuthScreen` already called `systemBarsPadding`), so
+the list drew under the status bar and the 144px menu FAB ended at y=2304 on a 2340px screen with
+the navigation bar covering everything below roughly y=2190. Measured on an S23: only a ~30px strip
+of the button responded to touch. That button is the sole route to PRIVACY and DELETE ACCOUNT, both
+of which Play requires to be reachable, so this was a release blocker that no unit test could see -
+it needed a real handset. Fixed with vertical `systemBars` content padding on the list and a bottom
+`windowInsetsPadding` on the button; the FAB now occupies y=2016-2160, clear of the bar, and a
+centre tap opens the menu. Horizontal insets are deliberately not applied: the bands are full-bleed
+and padding them would inset their colour from the screen edge.
+
+**G21 — no Cloud project owns `hr.theshop.yo`. — RESOLVED 2026-07-27.** FCM: a Firebase Android app
+for the renamed package in `yo-theshop`. Google sign-in: `yo-theshop` still cannot host it (no
+billing → no Firebase Auth → Firebase never auto-creates the Android OAuth client), so the package
+was also registered in **`blocksurge-theshop`**, which has Google sign-in enabled; adding the two
+SHA-1s there made Firebase auto-create **two `client_type: 1` Android clients**, one per
+fingerprint, alongside the existing web client `973904690282-a4dnbf8b…` the app and backend already
+share. Proven on an S23 with the **release-signed** build: the Credential Manager picker opened -
+no `cmsh:[28444]` - sign-in completed, and the home screen showed the account's friend band.
+This leaves G16 standing: the OAuth clients still live in a borrowed project. Original text follows.
+
+**G21 (original) — no Cloud project owns `hr.theshop.yo`. — FCM HALF RESOLVED 2026-07-27.** A Firebase
 Android app for `hr.theshop.yo` now exists in `yo-theshop`
 (`1:747034506241:android:e5b34b298d59ea5e48bc00`) with **both** SHA-1 fingerprints registered —
 the debug key `BC:E5:5B:00:…` and the new upload key `22:02:ED:E8:…` — and a real
