@@ -118,6 +118,8 @@ fun MainScreen(
     val contactQuery by viewModel.contactQuery.collectAsState()
     val contactsFilteredToNothing by viewModel.contactsFilteredToNothing.collectAsState()
     val addFriendOutcome by viewModel.addFriendOutcome.collectAsState()
+    val deletingAccount by viewModel.deletingAccount.collectAsState()
+    val deleteAccountFailed by viewModel.deleteAccountFailed.collectAsState()
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
@@ -262,6 +264,17 @@ fun MainScreen(
                 sheet = null
                 viewModel.logOut()
             },
+            onDeleteAccount = { sheet = Sheet.DeleteAccount },
+        )
+        Sheet.DeleteAccount -> DeleteAccountSheet(
+            username = viewModel.username,
+            deleting = deletingAccount,
+            failed = deleteAccountFailed,
+            onDismiss = {
+                viewModel.clearDeleteAccountFailure()
+                sheet = null
+            },
+            onConfirm = viewModel::deleteAccount,
         )
         Sheet.AddFriend -> AddFriendSheet(
             outcome = addFriendOutcome,
@@ -297,7 +310,7 @@ fun MainScreen(
     }
 }
 
-private enum class Sheet { Menu, History, CreateGroup, Invite, AddFriend }
+private enum class Sheet { Menu, History, CreateGroup, Invite, AddFriend, DeleteAccount }
 
 /** A send target — a person or a group. Both render as an identical colour band. */
 private sealed interface SendTarget {
@@ -442,6 +455,7 @@ private fun MenuSheet(
     onInvite: () -> Unit,
     onAddFriend: () -> Unit,
     onLogOut: () -> Unit,
+    onDeleteAccount: () -> Unit,
 ) {
     YoSheet(onDismiss = onDismiss) {
         Column(modifier = Modifier.fillMaxWidth()) {
@@ -478,6 +492,78 @@ private fun MenuSheet(
                 label = if (username.isEmpty()) "LOG OUT" else "LOG OUT $username",
                 onClick = onLogOut,
                 onLongClick = onLogOut,
+                clickLabel = "Log out",
+            )
+            // Alizarin is the palette's only red and the doc reserves it for the menu button, so
+            // it is the one colour here that reads as "this one is different". Deleting an account
+            // is the only irreversible thing the app can do.
+            Band(
+                color = YoPalette.Alizarin,
+                label = "DELETE ACCOUNT",
+                onClick = onDeleteAccount,
+                onLongClick = onDeleteAccount,
+                clickLabel = "Delete account",
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
+
+/**
+ * The confirmation Google Play's deletion requirement implies: the policy asks for deletion to be
+ * reachable in the app, not for it to be one tap away from a menu. The account name is spelled out
+ * because it is the thing being destroyed, and the consequences are listed rather than summarised
+ * as "this cannot be undone" - a user who has not been told their friends lose them too has not
+ * really been told.
+ */
+@Composable
+private fun DeleteAccountSheet(
+    username: String,
+    deleting: Boolean,
+    failed: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    YoSheet(onDismiss = onDismiss) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = if (username.isEmpty()) "DELETE ACCOUNT" else "DELETE $username",
+                style = YoLabel,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp, bottom = 12.dp),
+            )
+            Text(
+                text =
+                    "THIS ERASES YOUR ACCOUNT, YOUR FRIENDS, YOUR HISTORY AND YOUR PHOTOS. " +
+                        "YOU DISAPPEAR FROM OTHER PEOPLE'S LISTS. IT CANNOT BE UNDONE.",
+                style = YoBody,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 16.dp),
+            )
+            if (failed) {
+                Text(
+                    text = "COULD NOT DELETE - NOTHING WAS CHANGED. TRY AGAIN.",
+                    style = YoLabel,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp),
+                )
+            }
+            Band(
+                color = YoPalette.Alizarin,
+                label = if (deleting) "DELETING..." else "DELETE FOREVER",
+                onClick = { if (!deleting) onConfirm() },
+                onLongClick = { if (!deleting) onConfirm() },
+                clickLabel = "Delete account permanently",
+            )
+            Band(
+                color = YoPalette.colorForIndex(0),
+                label = "KEEP MY ACCOUNT",
+                onClick = onDismiss,
+                onLongClick = onDismiss,
+                clickLabel = "Keep my account",
             )
             Spacer(modifier = Modifier.height(24.dp))
         }

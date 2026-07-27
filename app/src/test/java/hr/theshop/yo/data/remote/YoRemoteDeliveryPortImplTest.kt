@@ -184,6 +184,8 @@ class YoRemoteDeliveryPortImplTest {
         private val sendResult: Boolean = true,
         private val uploadFailure: Throwable? = null,
     ) : StubYoBackendApi() {
+        override suspend fun deleteAccount(): Boolean = true
+
         val sends = mutableListOf<SendCall>()
         val uploads = mutableListOf<UploadCall>()
 

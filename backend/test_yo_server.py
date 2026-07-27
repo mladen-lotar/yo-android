@@ -1490,5 +1490,154 @@ class InstallPageTest(unittest.TestCase):
         self.assertIn(b"unauthorized", body)
 
 
+class DeleteAccountTest(YoServerTestCase):
+    """DELETE /v1/account - the in-app deletion Google Play requires."""
+
+    def test_deleting_an_account_reports_what_it_deleted(self):
+        token = self.signup("ALICE")
+
+        status, body = self.request("DELETE", "/v1/account", token=token)
+
+        self.assertEqual(200, status, body)
+        self.assertEqual({"deleted": True, "username": "ALICE"}, body)
+        self.assertFalse(self.server.database.account_exists("ALICE"))
+
+    def test_deletion_requires_a_credential(self):
+        self.signup("ALICE")
+
+        status, body = self.request("DELETE", "/v1/account", token=None)
+
+        self.assertEqual(401, status)
+        self.assertTrue(self.server.database.account_exists("ALICE"))
+
+    def test_the_token_stops_working_afterwards(self):
+        token = self.signup("ALICE")
+        self.request("DELETE", "/v1/account", token=token)
+
+        status, _ = self.request("GET", "/v1/friends", token=token)
+
+        self.assertEqual(401, status)
+
+    def test_every_device_of_the_account_is_forgotten(self):
+        """Sessions on other devices must die too, or the account is only half-deleted."""
+        first = self.signup("ALICE")
+        status, body = self.request(
+            "POST",
+            "/v1/login",
+            {"username": "ALICE", "password": TEST_PASSWORD},
+            token=None,
+        )
+        self.assertEqual(200, status, body)
+        second = body["token"]
+
+        self.request("DELETE", "/v1/account", token=first)
+
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=second)[0])
+
+    def test_the_username_can_be_claimed_again(self):
+        token = self.signup("ALICE")
+        self.request("DELETE", "/v1/account", token=token)
+
+        status, body = self.request(
+            "POST",
+            "/v1/signup",
+            {"username": "ALICE", "password": TEST_PASSWORD},
+            token=None,
+        )
+
+        self.assertEqual(201, status, body)
+
+    def test_a_deleted_user_disappears_from_other_peoples_friend_lists(self):
+        """The half-deletion that matters most: a name left in someone else's list is tappable,
+        answers recipient_not_found, and cannot be removed by anyone."""
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request("POST", "/v1/friends", {"username": "BOB"}, token=alice)
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        status, body = self.request("GET", "/v1/friends", token=alice)
+        self.assertEqual(200, status)
+        self.assertEqual([], body["friends"])
+
+    def test_blocks_are_cleared_in_both_directions(self):
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request("POST", "/v1/block", {"username": "BOB"}, token=alice)
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        self.assertFalse(self.server.database.is_blocked("ALICE", "BOB"))
+        self.assertEqual([], self.server.database.list_blocked("ALICE"))
+
+    def test_the_registered_device_is_removed(self):
+        alice = self.signup_with_device("ALICE")
+        bob = self.signup_with_device("BOB")
+        self.request("DELETE", "/v1/account", token=bob)
+
+        status, body = self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice)
+
+        # Not "unregistered": there is no account behind the name any more.
+        self.assertEqual(404, status)
+        self.assertEqual("recipient_not_found", body["reason"])
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_photos_the_user_uploaded_are_deleted(self):
+        alice = self.signup("ALICE")
+        self.request(
+            "POST",
+            "/v1/photo",
+            {"message_id": "message-1", "mime_type": "image/jpeg", "data": "d"},
+            token=alice,
+        )
+
+        self.request("DELETE", "/v1/account", token=alice)
+
+        self.assertIsNone(self.server.database.get_photo("message-1"))
+
+    def test_photos_received_from_someone_else_survive(self):
+        """They are the sender's data, and the sender did not ask to be forgotten."""
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request(
+            "POST",
+            "/v1/photo",
+            {
+                "message_id": "message-1",
+                "mime_type": "image/jpeg",
+                "data": "d",
+                "recipient": "BOB",
+            },
+            token=alice,
+        )
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        self.assertIsNotNone(self.server.database.get_photo("message-1"))
+
+    def test_a_deleted_google_account_is_unlinked_not_orphaned(self):
+        """Otherwise the identity still points at a username that no longer exists, and the
+        person can never sign in again with the same Google account."""
+        self.server.google_verifier = StubGoogleVerifier()
+        status, body = self.request(
+            "POST",
+            "/v1/google",
+            {"id_token": "an.id.token", "username": "ALICE"},
+            token=None,
+        )
+        self.assertEqual(201, status, body)
+
+        self.request("DELETE", "/v1/account", token=body["token"])
+
+        status, body = self.request(
+            "POST",
+            "/v1/google",
+            {"id_token": "an.id.token"},
+            token=None,
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("username_required", body["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

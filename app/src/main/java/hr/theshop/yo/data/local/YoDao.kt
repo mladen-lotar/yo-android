@@ -12,4 +12,7 @@ interface YoDao {
 
     @Query("SELECT * FROM yo_messages ORDER BY timestamp DESC")
     fun observeAll(): Flow<List<YoEntity>>
+
+    @Query("DELETE FROM yo_messages")
+    suspend fun deleteAll()
 }

@@ -36,6 +36,9 @@ interface YoBackendApi {
 
     suspend fun logOut(): Boolean
 
+    /** Erases the account server-side. Required by Google Play for any app that creates one. */
+    suspend fun deleteAccount(): Boolean
+
     suspend fun register(fcmToken: String): Boolean
 
     suspend fun fetchFriends(): List<String>
@@ -152,6 +155,10 @@ class HttpYoBackendApi(
 
     override suspend fun logOut(): Boolean =
         runCatching { execute(method = "DELETE", path = "/v1/session").isSuccessful }
+            .getOrDefault(false)
+
+    override suspend fun deleteAccount(): Boolean =
+        runCatching { execute(method = "DELETE", path = "/v1/account").isSuccessful }
             .getOrDefault(false)
 
     override suspend fun register(fcmToken: String): Boolean {

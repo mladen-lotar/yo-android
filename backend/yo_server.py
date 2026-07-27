@@ -215,6 +215,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/block":
                 self._handle_unblock(username, parsed.query)
                 return
+            if parsed.path == "/v1/account":
+                self._handle_delete_account(username)
+                return
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except BadRequestError as error:
             self._write_json(
@@ -454,6 +457,24 @@ class YoRequestHandler(BaseHTTPRequestHandler):
     def _handle_logout(self) -> None:
         self.server.database.delete_token(yo_auth.hash_token(self._bearer_token()))
         self._write_json(HTTPStatus.OK, {"ended": True})
+
+    def _handle_delete_account(self, username: str) -> None:
+        """Erase the caller's account. Required by Google Play for any app with sign-up.
+
+        The bearer token is the only authorisation asked for. A password would be a second
+        factor for exactly one class of account and none at all for the other: accounts created
+        through Google sign-in have no password, so requiring one would make them undeletable -
+        the opposite of what the policy is for. The destructive confirmation lives in the app.
+
+        Deleting is idempotent from the caller's side: a second attempt with a now-invalid token
+        gets 401, which is indistinguishable from success and gives an interrupted client
+        nothing dangerous to retry into.
+        """
+        deleted = self.server.database.delete_account(username)
+        if not deleted:
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "no_such_user"})
+            return
+        self._write_json(HTTPStatus.OK, {"deleted": True, "username": username})
 
     def _authorize_client(self) -> Optional[str]:
         client_id = self.headers.get("X-Yo-Client-Id", "")

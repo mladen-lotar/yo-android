@@ -23,6 +23,10 @@ class SharedPreferencesDeviceRegistrationStore @Inject constructor(
             .apply()
     }
 
+    override fun clear() {
+        preferences.edit().clear().apply()
+    }
+
     private companion object {
         const val PREFERENCES_NAME = "yo_device_registration"
         const val KEY_USERNAME = "username"

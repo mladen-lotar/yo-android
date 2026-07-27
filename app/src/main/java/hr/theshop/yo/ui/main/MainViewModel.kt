@@ -11,6 +11,7 @@ import hr.theshop.yo.data.remote.AddFriendOutcome
 import hr.theshop.yo.data.remote.YoBackendApi
 import hr.theshop.yo.domain.model.YoMessage
 import hr.theshop.yo.domain.repository.ContactsRepository
+import hr.theshop.yo.domain.repository.DeviceRegistrationStore
 import hr.theshop.yo.domain.repository.GroupRepository
 import hr.theshop.yo.domain.repository.SessionStore
 import hr.theshop.yo.domain.repository.YoRepository
@@ -37,12 +38,13 @@ class MainViewModel @Inject constructor(
     private val fetchFriendsUseCase: FetchFriendsUseCase,
     private val registerDeviceUseCase: RegisterDeviceUseCase,
     private val groupRepository: GroupRepository,
-    repository: YoRepository,
+    private val yoRepository: YoRepository,
     private val locationProvider: OneShotLocationProvider,
     private val contactsRepository: ContactsRepository,
     private val buildInviteMessage: BuildInviteMessageUseCase,
     private val filterContacts: FilterContactsUseCase,
     private val sessionStore: SessionStore,
+    private val deviceRegistrationStore: DeviceRegistrationStore,
     private val backendApi: YoBackendApi,
     @param:InviteUrl private val inviteUrl: String,
 ) : ViewModel() {
@@ -55,6 +57,12 @@ class MainViewModel @Inject constructor(
 
     private val _addFriendOutcome = MutableStateFlow<AddFriendOutcome?>(null)
     val addFriendOutcome: StateFlow<AddFriendOutcome?> = _addFriendOutcome.asStateFlow()
+
+    private val _deletingAccount = MutableStateFlow(false)
+    val deletingAccount: StateFlow<Boolean> = _deletingAccount.asStateFlow()
+
+    private val _deleteAccountFailed = MutableStateFlow(false)
+    val deleteAccountFailed: StateFlow<Boolean> = _deleteAccountFailed.asStateFlow()
 
     private val _friendsLoadFailed = MutableStateFlow(false)
     val friendsLoadFailed: StateFlow<Boolean> = _friendsLoadFailed.asStateFlow()
@@ -126,7 +134,7 @@ class MainViewModel @Inject constructor(
             initialValue = emptyList(),
         )
 
-    val history: StateFlow<List<YoMessage>> = repository.observeHistory()
+    val history: StateFlow<List<YoMessage>> = yoRepository.observeHistory()
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5_000),
@@ -220,6 +228,47 @@ class MainViewModel @Inject constructor(
             backendApi.logOut()
             sessionStore.clear()
         }
+    }
+
+    /**
+     * Deletes the account, which Google Play requires any app that creates one to offer.
+     *
+     * The server call comes first and its result is respected: clearing the session locally on a
+     * failed request would sign the user out of an account that still exists, look like success,
+     * and leave them no way back to the thing they asked to delete.
+     *
+     * On success everything this device holds goes too. Yo history and groups are not scoped to
+     * an account, so leaving them would show the deleted account's messages to whoever signs in
+     * next on the same phone.
+     */
+    fun deleteAccount() {
+        // Claimed here rather than inside the coroutine: two taps in the same frame both reach
+        // launch{} before either body runs, so a guard set inside the coroutine lets both through
+        // and the account is deleted twice.
+        if (_deletingAccount.value) return
+        _deletingAccount.value = true
+        _deleteAccountFailed.value = false
+        viewModelScope.launch {
+            try {
+                val deleted = runCatching { backendApi.deleteAccount() }.getOrDefault(false)
+                if (!deleted) {
+                    _deleteAccountFailed.value = true
+                    return@launch
+                }
+                runCatching {
+                    yoRepository.clear()
+                    groupRepository.clear()
+                    deviceRegistrationStore.clear()
+                }
+                sessionStore.clear()
+            } finally {
+                _deletingAccount.value = false
+            }
+        }
+    }
+
+    fun clearDeleteAccountFailure() {
+        _deleteAccountFailed.value = false
     }
 
     fun sendYo(

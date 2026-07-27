@@ -34,6 +34,8 @@ class GroupRepositoryImpl @Inject constructor(
 
     override suspend fun getGroup(groupId: String): Group? =
         groupDao.getGroupWithMembers(groupId)?.toDomain()
+
+    override suspend fun clear() = groupDao.deleteAll()
 }
 
 private fun Group.toEntity() =

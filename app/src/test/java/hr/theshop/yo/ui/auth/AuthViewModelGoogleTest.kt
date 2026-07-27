@@ -263,6 +263,8 @@ class AuthViewModelGoogleTest {
         var result: GoogleAuthResult,
         private val gate: CompletableDeferred<Unit>? = null,
     ) : StubYoBackendApi() {
+        override suspend fun deleteAccount(): Boolean = true
+
         val googleCalls = mutableListOf<Pair<String, String?>>()
 
         override suspend fun signInWithGoogle(

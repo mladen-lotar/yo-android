@@ -153,6 +153,45 @@ class YoDatabase:
             )
         return cursor.rowcount == 1
 
+    def delete_account(self, username: str) -> bool:
+        """Erase an account and everything keyed to it. Returns False if it did not exist.
+
+        Google Play requires an app that creates accounts to be able to delete them, and a
+        deletion that leaves rows behind is not a deletion. Every table that names a user is
+        cleared here, in one transaction, so a partial failure cannot leave an account that is
+        half-gone - unreachable but still holding its username.
+
+        `friendships` and `blocks` are cleared in BOTH directions. Clearing only the rows this
+        user owns would leave them in other people's friend lists: a name that can be tapped,
+        that answers `recipient_not_found`, and that cannot be removed by its owner because the
+        account behind it no longer exists.
+
+        Photos this user *received* are not touched. They belong to whoever sent them, and are
+        removed when that sender deletes their own account.
+        """
+        with self._connect() as connection:
+            existed = connection.execute(
+                "SELECT 1 FROM accounts WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if existed is None:
+                return False
+            connection.execute("DELETE FROM accounts WHERE username = ?", (username,))
+            connection.execute("DELETE FROM tokens WHERE username = ?", (username,))
+            connection.execute("DELETE FROM identities WHERE username = ?", (username,))
+            connection.execute("DELETE FROM devices WHERE username = ?", (username,))
+            connection.execute("DELETE FROM subscriptions WHERE username = ?", (username,))
+            connection.execute("DELETE FROM photos WHERE owner = ?", (username,))
+            connection.execute(
+                "DELETE FROM friendships WHERE owner = ? OR friend = ?",
+                (username, username),
+            )
+            connection.execute(
+                "DELETE FROM blocks WHERE owner = ? OR blocked = ?",
+                (username, username),
+            )
+        return True
+
     def get_password_hash(self, username: str) -> Optional[str]:
         with self._connect() as connection:
             row = connection.execute(

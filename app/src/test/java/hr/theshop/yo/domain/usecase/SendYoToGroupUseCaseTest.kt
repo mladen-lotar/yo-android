@@ -99,6 +99,8 @@ class SendYoToGroupUseCaseTest {
     private class FakeGroupRepository(
         private val groups: List<Group> = emptyList(),
     ) : GroupRepository {
+        override suspend fun clear() = Unit
+
         override suspend fun createGroup(
             name: String,
             memberUsernames: List<String>,
@@ -111,6 +113,10 @@ class SendYoToGroupUseCaseTest {
     }
 
     private class FakeYoRepository : YoRepository {
+        override suspend fun clear() {
+            savedMessages.clear()
+        }
+
         val savedMessages = mutableListOf<YoMessage>()
         var saveCallCount = 0
 

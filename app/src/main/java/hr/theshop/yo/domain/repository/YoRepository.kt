@@ -10,4 +10,7 @@ interface YoRepository {
     suspend fun saveSent(message: YoMessage)
 
     fun observeHistory(): Flow<List<YoMessage>>
+
+    /** Forgets every stored Yo. Used when an account is deleted. */
+    suspend fun clear()
 }

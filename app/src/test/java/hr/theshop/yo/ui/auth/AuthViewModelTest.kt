@@ -234,6 +234,8 @@ class AuthViewModelTest {
         private val result: AuthResult = AuthResult.Success(SESSION),
         private val gate: CompletableDeferred<Unit>? = null,
     ) : StubYoBackendApi() {
+        override suspend fun deleteAccount(): Boolean = true
+
         val signUpCalls = mutableListOf<Pair<String, String>>()
         val logInCalls = mutableListOf<Pair<String, String>>()
 

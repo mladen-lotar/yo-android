@@ -9,4 +9,7 @@ interface GroupRepository {
     fun observeGroups(): Flow<List<Group>>
 
     suspend fun getGroup(groupId: String): Group?
+
+    /** Forgets every stored group. Used when an account is deleted. */
+    suspend fun clear()
 }

@@ -25,6 +25,7 @@ import hr.theshop.yo.domain.usecase.SendYoToGroupUseCase
 import hr.theshop.yo.domain.usecase.SendYoUseCase
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -599,6 +600,81 @@ class MainViewModelTest {
         assertEquals("", viewModel.username)
     }
 
+    @Test
+    fun `deleting the account clears the session`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val sessionStore = FakeSessionStore()
+        val viewModel = createViewModel(backendApi = backendApi, sessionStore = sessionStore)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.deleteAccount()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, backendApi.deleteAccountCalls)
+        assertNull(sessionStore.current())
+        assertFalse(viewModel.deleteAccountFailed.value)
+    }
+
+    @Test
+    fun `a refused deletion leaves the user signed in`() = runTest {
+        // Signing out here would look like success and strand the user outside an account that
+        // still exists.
+        val backendApi = FakeYoBackendApi(deleteAccountSucceeds = false)
+        val sessionStore = FakeSessionStore()
+        val viewModel = createViewModel(backendApi = backendApi, sessionStore = sessionStore)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.deleteAccount()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertNotNull(sessionStore.current())
+        assertTrue(viewModel.deleteAccountFailed.value)
+    }
+
+    @Test
+    fun `deleting the account erases what this device stored`() = runTest {
+        // History and groups are not scoped to an account, so anything left behind would be shown
+        // to whoever signs in next on this phone.
+        val repository = FakeYoRepository()
+        val groupRepository = FakeGroupRepository()
+        val registrationStore = FakeDeviceRegistrationStore()
+        val viewModel =
+            createViewModel(
+                repository = repository,
+                groupRepository = groupRepository,
+                registrationStore = registrationStore,
+            )
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.sendYo(recipient = "ANA")
+        groupRepository.createGroup(name = "CREW", memberUsernames = listOf("ANA"))
+        dispatcher.scheduler.advanceUntilIdle()
+        // Asserted through the repository, not viewModel.history: that is a WhileSubscribed
+        // StateFlow, so its .value stays at the initial value while nothing is collecting it.
+        assertTrue(repository.observeHistory().first().isNotEmpty())
+
+        viewModel.deleteAccount()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(emptyList<YoMessage>(), repository.observeHistory().first())
+        assertEquals(emptyList<Group>(), groupRepository.observeGroups().first())
+        // Otherwise the next account to sign in here looks already-registered, never posts its
+        // own token, and silently receives nothing.
+        assertTrue(registrationStore.cleared)
+    }
+
+    @Test
+    fun `a second tap while deleting does not delete twice`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.deleteAccount()
+        viewModel.deleteAccount()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, backendApi.deleteAccountCalls)
+    }
+
     private fun createViewModel(
         repository: FakeYoRepository = FakeYoRepository(),
         groupRepository: FakeGroupRepository = FakeGroupRepository(),
@@ -609,6 +685,7 @@ class MainViewModelTest {
         backendApi: FakeYoBackendApi = FakeYoBackendApi(friends, friendsFailure),
         sessionStore: FakeSessionStore = FakeSessionStore(),
         tokenProvider: FcmTokenProvider = FakeFcmTokenProvider(),
+        registrationStore: FakeDeviceRegistrationStore = FakeDeviceRegistrationStore(),
     ): MainViewModel {
         val sendYoUseCase = SendYoUseCase(repository)
         return MainViewModel(
@@ -623,16 +700,17 @@ class MainViewModelTest {
                 RegisterDeviceUseCase(
                     backendApi = backendApi,
                     tokenProvider = tokenProvider,
-                    registrationStore = FakeDeviceRegistrationStore(),
+                    registrationStore = registrationStore,
                     sessionStore = sessionStore,
                 ),
-            repository = repository,
+            yoRepository = repository,
             groupRepository = groupRepository,
             locationProvider = locationProvider,
             contactsRepository = contactsRepository,
             buildInviteMessage = BuildInviteMessageUseCase(),
             filterContacts = FilterContactsUseCase(),
             sessionStore = sessionStore,
+            deviceRegistrationStore = registrationStore,
             backendApi = backendApi,
             inviteUrl = INVITE_URL,
         )
@@ -660,6 +738,10 @@ class MainViewModelTest {
         }
 
         override fun observeHistory(): Flow<List<YoMessage>> = state
+
+        override suspend fun clear() {
+            state.value = emptyList()
+        }
     }
 
     private class FakeOneShotLocationProvider(
@@ -692,13 +774,26 @@ class MainViewModelTest {
 
         override suspend fun getGroup(groupId: String): Group? =
             state.value.firstOrNull { group -> group.id == groupId }
+
+        override suspend fun clear() {
+            state.value = emptyList()
+        }
     }
 
     private class FakeYoBackendApi(
         friends: List<String> = emptyList(),
         private val friendsFailure: Throwable? = null,
         private val addOutcome: AddFriendOutcome = AddFriendOutcome.Added,
+        private val deleteAccountSucceeds: Boolean = true,
     ) : StubYoBackendApi() {
+        var deleteAccountCalls = 0
+            private set
+
+        override suspend fun deleteAccount(): Boolean {
+            deleteAccountCalls++
+            return deleteAccountSucceeds
+        }
+
         /** Mutable, so a re-fetch after an add or a remove genuinely sees a different list. */
         private val stored = friends.toMutableList()
 
@@ -765,8 +860,15 @@ class MainViewModelTest {
     }
 
     private class FakeDeviceRegistrationStore : DeviceRegistrationStore {
+        var cleared = false
+            private set
+
         override fun isRegistered(registration: DeviceRegistration): Boolean = false
 
         override fun markRegistered(registration: DeviceRegistration) = Unit
+
+        override fun clear() {
+            cleared = true
+        }
     }
 }

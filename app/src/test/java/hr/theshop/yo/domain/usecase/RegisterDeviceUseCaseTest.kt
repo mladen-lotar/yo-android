@@ -213,6 +213,8 @@ class RegisterDeviceUseCaseTest {
     private class FakeYoBackendApi(
         private val registerFailure: Throwable? = null,
     ) : StubYoBackendApi() {
+        override suspend fun deleteAccount(): Boolean = true
+
         val registrations = mutableListOf<DeviceRegistration>()
 
         override suspend fun register(fcmToken: String): Boolean {
@@ -243,6 +245,10 @@ class RegisterDeviceUseCaseTest {
     private class FakeDeviceRegistrationStore(
         initialRegistrations: Set<DeviceRegistration> = emptySet(),
     ) : DeviceRegistrationStore {
+        override fun clear() {
+            registrations.clear()
+        }
+
         private val registrations = initialRegistrations.toMutableSet()
         val markedRegistrations = mutableListOf<DeviceRegistration>()
 

@@ -20,6 +20,8 @@ class YoRepositoryImpl @Inject constructor(
 
     override fun observeHistory(): Flow<List<YoMessage>> =
         yoDao.observeAll().map { entities -> entities.map(YoEntity::toDomain) }
+
+    override suspend fun clear() = yoDao.deleteAll()
 }
 
 private fun YoMessage.toEntity() =

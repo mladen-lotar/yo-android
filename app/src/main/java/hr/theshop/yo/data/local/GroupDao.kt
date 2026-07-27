@@ -32,6 +32,11 @@ interface GroupDao {
     @Transaction
     @Query("SELECT * FROM groups WHERE id = :groupId")
     suspend fun getGroupWithMembers(groupId: String): GroupWithMembers?
+
+    // group_members is declared ON DELETE CASCADE, and Room enables foreign key enforcement,
+    // so removing the groups takes their membership rows with them.
+    @Query("DELETE FROM groups")
+    suspend fun deleteAll()
 }
 
 data class GroupWithMembers(

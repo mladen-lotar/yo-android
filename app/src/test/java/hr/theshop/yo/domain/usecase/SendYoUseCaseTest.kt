@@ -44,6 +44,10 @@ class SendYoUseCaseTest {
     }
 
     private class FakeYoRepository : YoRepository {
+        override suspend fun clear() {
+            savedMessages.clear()
+        }
+
         val savedMessages = mutableListOf<YoMessage>()
         var saveCallCount = 0
 

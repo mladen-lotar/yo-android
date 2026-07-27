@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.asStateFlow
  * every future interface change a multi-file edit.
  */
 open class StubYoBackendApi : YoBackendApi {
+    override suspend fun deleteAccount(): Boolean = true
+
     override suspend fun signUp(username: String, password: String): AuthResult =
         AuthResult.Failure(AuthFailure.Unreachable)
 
