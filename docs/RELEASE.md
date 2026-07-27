@@ -20,7 +20,7 @@ decisions behind the parts that are not obvious. Written 27 July 2026.
 | Content rating questionnaire | Outstanding - Console only |
 | Backend on real hosting | **Outstanding** - see section 8 |
 | FCM for `hr.theshop.yo` | Done - app + both SHA-1s in `yo-theshop` |
-| Google sign-in for `hr.theshop.yo` | Done - Android OAuth clients in `blocksurge-theshop`, proven on device |
+| Google sign-in for `hr.theshop.yo` | Done - all clients in `yo-theshop` (G16 closed); not yet re-verified on device |
 | Closed testing, 12 testers x 14 days | **Unknown** - see section 9 |
 
 ## 2. Toolchain
@@ -338,17 +338,41 @@ What the move needs:
 2. **Push: done** (27 Jul 2026). `yo-theshop` now has a Firebase Android app for `hr.theshop.yo`
    (`1:747034506241:android:e5b34b298d59ea5e48bc00`) with both SHA-1s from section 4 registered,
    and `app/google-services.json` is fetched from it. It stays gitignored.
-3. **Google sign-in: done** (27 Jul 2026). `yo-theshop` cannot host it - no billing means no
-   Firebase Auth, and Firebase only auto-creates the Android OAuth client when Google sign-in is
-   enabled. So `hr.theshop.yo` was also registered in **`blocksurge-theshop`**, which has it
-   enabled; adding both SHA-1s there auto-created two Android clients, one per fingerprint,
-   alongside the web client the app and backend already share. Proven on device with the
-   release-signed build.
+3. **Google sign-in: moved home, G16 CLOSED** (27 Jul 2026). Everything now lives in
+   `yo-theshop`: the `google.com` provider is enabled, the web client is
+   `747034506241-1ibqvftch4s7htnmfkspteiqs5h2jv9d`, and both Android clients
+   (`...-0102hfni...` and `...-9gdal4ib...`) were auto-created from the two SHA-1s in section 4.
+   `local.properties` `yoGoogleClientId` and the backend's `YO_GOOGLE_CLIENT_ID` both point at
+   the new web client. `blocksurge-theshop` is no longer involved; only `hr.theshop.blocksurge`
+   remains there, untouched. **Not yet re-verified on a handset** - no device was attached when
+   the cutover finished.
 
-   This leaves **G16** standing: the OAuth clients live in a borrowed project. To close it, put
-   `yo-theshop` on billing and repeat the same registration there. Historic detail follows.
+   Four things made this harder than "repeat the registration", and all four are worth knowing:
 
-4. **Google sign-in: the original blocked state** (G21). The project returns only a web OAuth client; Firebase
+   - **Billing was never the real gate.** `identityPlatform:initializeAuth` returns
+     `BILLING_NOT_ENABLED`, but that is the *Identity Platform upgrade*. Classic Firebase Auth is
+     free on Spark. What no API can do is create the Auth config singleton: `POST
+     defaultSupportedIdpConfigs` and `PATCH .../config` both answer `CONFIGURATION_NOT_FOUND`
+     until it exists. One console click (Authentication -> Get started) creates it for free.
+   - **Android OAuth clients are globally unique on (package name, SHA-1).** While
+     `blocksurge-theshop` held `hr.theshop.yo` + a fingerprint, `yo-theshop` could not mint its
+     own: `409 ALREADY_EXISTS - Oauth client already exists in a different project`. So deleting
+     from the borrowed project is a **precondition**, not the cleanup step it looks like.
+   - **Nothing releases those clients except deleting them by hand.** Removing the SHA-1 from the
+     Firebase app does not delete the client. Neither does `androidApps/...:remove` - the app went
+     to `state: DELETED` and the 409 was unchanged. The IAP API returns `NOT_FOUND` because they
+     are not IAP-brand clients, and no other Google API deletes an OAuth client. Cloud Console ->
+     APIs & Services -> Credentials is the only route.
+   - **Error ordering is not a dependency graph.** The create endpoint validates the request body
+     before it looks up the parent, so an empty body yields `client_id cannot be empty` and looks
+     like proof that the call would otherwise succeed. It is not; a complete body reveals the real
+     `CONFIGURATION_NOT_FOUND` underneath.
+
+   Still open, and unrelated to G16: the OAuth consent screen is `orgInternalOnly: true`, so only
+   `the-shop.hr` accounts can complete sign-in. Console-only to change, and it blocks every real
+   Play user until it does.
+
+4. **Google sign-in: the original blocked state** (G21, historic). The project returns only a web OAuth client; Firebase
    auto-creates the Android one only when Google sign-in is enabled, which needs Firebase Auth,
    which needs billing on `yo-theshop`. Pick one:
    - put `yo-theshop` on billing, enable Google sign-in, let Firebase create both clients, then
@@ -362,8 +386,13 @@ What the move needs:
 
    Until it is done, `CONTINUE WITH GOOGLE` fails with `cmsh:[28444]` on the renamed package.
    Username and password sign-in is unaffected.
-4. Move the backend (section 8) and repoint `yoBackendUrl`.
-5. `./gradlew :app:testDebugUnitTest` and `python3 -m unittest discover` in `backend/`.
-6. `./gradlew :app:bundleRelease`, upload the `.aab` and `mapping.txt`.
-7. Fill in the data safety form (section 6) and the content rating questionnaire.
-8. Capture screenshots (section 7).
+5. Re-verify `GOOGLE SIGN-IN` on a handset against the `yo-theshop` clients (section 9.3).
+6. Flip the OAuth consent screen off `orgInternalOnly`, or no account outside `the-shop.hr` can
+   sign in. Console only.
+7. Move the backend (section 8) and repoint `yoBackendUrl`. Until that happens `/privacy` and
+   `/delete-account` return **401 in production** - both routes exist only on this branch, while
+   the launchd job runs `yo_server.py` straight out of the main checkout. Two Play-required URLs
+   are dead until the deploy, however Done the code column says.
+8. `./gradlew :app:testDebugUnitTest` and `python3 -m unittest discover` in `backend/`.
+9. `./gradlew :app:bundleRelease`, upload the `.aab` and `mapping.txt`.
+10. Fill in the data safety form (section 6) and the content rating questionnaire.

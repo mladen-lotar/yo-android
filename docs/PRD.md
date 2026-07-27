@@ -497,7 +497,18 @@ is not exposed. The only programmatic route is Firebase auto-creating the pair w
 + SHA-1 is registered in a project that already has Google enabled as a sign-in provider, and that
 needs the project on billing (G15). See §7.1 for what was done instead and the cleanup it implies.
 
-**G16 — the working OAuth clients live in the wrong project.** Because `yo-theshop` has no billing
+**G16 — RESOLVED 27 Jul 2026.** All OAuth clients now live in `yo-theshop`: the `google.com`
+provider is enabled there, and both Android clients were auto-created from the release and debug
+SHA-1s. `yoGoogleClientId` and `YO_GOOGLE_CLIENT_ID` point at `yo-theshop`'s web client, and
+`blocksurge-theshop` retains only `hr.theshop.blocksurge`. Billing was never actually required —
+that was the *Identity Platform* upgrade, not Firebase Auth. What did block it: Android OAuth
+clients are globally unique on (package name, SHA-1), so blocksurge's had to be deleted **first**,
+and nothing but a hand delete in Cloud Console releases them — not removing the SHA-1, not
+`androidApps:remove`, not the IAP API. See `RELEASE.md` §9.3. Not yet re-verified on a handset.
+The consent screen is still `orgInternalOnly`, which is a separate blocker for outside users.
+Original text follows.
+
+**G16 (historic) — the working OAuth clients live in the wrong project.** Because `yo-theshop` has no billing
 and Firebase Auth would not initialize there, the Android app was registered in
 `blocksurge-theshop` (which is billed and already had Google sign-in enabled), and Firebase
 auto-created both clients there. Yo therefore borrows an unrelated project's OAuth identity. It
