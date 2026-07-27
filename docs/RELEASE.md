@@ -94,8 +94,8 @@ models" failure mode does not apply here.
 
 ### Verified on 27 July 2026
 
-The release pipeline was built and checked end to end, using a throwaway `google-services.json`
-(the real Cloud project does not exist yet - G21) which was deleted immediately afterwards:
+The release pipeline was built and checked end to end, and then rebuilt against the real
+`google-services.json` once the Firebase app existed (section 9, step 2):
 
 ```
 app-release.aab   4.7 MB    signer certificate expires 2053-12-12
@@ -104,9 +104,9 @@ package: hr.theshop.yo   versionCode 1   targetSdkVersion 36   compileSdkVersion
 ```
 
 The APK's signing fingerprint matches the upload keystore exactly, and R8 ran without breaking the
-build. What is *not* verified is that the minified app runs correctly - that needs an install on a
-device, which needs the real Firebase project first. **Smoke-test the release build on a handset
-before uploading**; R8 failures show up at runtime, not at build time.
+build. What is *not* verified is that the minified app **runs** correctly. **Smoke-test the release
+build on a handset before uploading** - R8 failures surface at runtime, not at build time, and
+nothing here has been installed on a device.
 
 ### Permissions the merged manifest adds
 
