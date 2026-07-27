@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import threading
 import time
@@ -193,6 +194,11 @@ of anything to anyone.</p>
       it to.</li>
   <li><strong>Your IP address, briefly</strong>, to rate-limit sign-ups and sending. It is not
       retained as a log of who you are.</li>
+  <li><strong>Your location, only when you attach it.</strong> Turning on "attach location" for a
+      Yo takes a single position fix and sends it with that Yo, so the person receiving it can
+      open a map. It is passed straight through to the notification and is never written to our
+      database. There is no continuous tracking and no access while the app is in the background:
+      one fix, when you ask for it, for one message.</li>
 </ul>
 
 <h2>What stays on your phone</h2>
@@ -201,17 +207,18 @@ of anything to anyone.</p>
       to show an invite list. Only a name and a local id are ever held, never a phone number or
       an email address, and none of it is sent to us or to anyone else. Invitations are sent by
       whichever messaging app you pick, and Yo never learns who you chose.</li>
-  <li><strong>Your location.</strong> If you turn on "attach location" the app takes a single
-      position fix and records it in your own history on this device. It is not transmitted to
-      our server.</li>
   <li><strong>Your Yo history and groups.</strong> Stored locally and erased when you delete your
-      account or uninstall the app.</li>
+      account or uninstall the app. Links and hashtags you attach are kept here and nowhere
+      else.</li>
 </ul>
 
 <h2>Who else sees it</h2>
-<p>Google, in two narrow roles: Firebase Cloud Messaging carries the notification to your device,
-and Google verifies the sign-in token if you choose "continue with Google". Nothing is shared
-with anyone else, and nothing is sold.</p>
+<p>The person you send a Yo to, which is the point of sending it. If you attached a location, they
+see it.</p>
+<p>Google, in two narrow roles: Firebase Cloud Messaging carries the notification to your device -
+including an attached location, since that travels inside the notification - and Google verifies
+the sign-in token if you choose "continue with Google". Nothing is shared with anyone else, and
+nothing is sold.</p>
 
 <h2>How long we keep it</h2>
 <p>Until you delete your account. Then it is gone, in full and immediately.</p>
@@ -684,8 +691,37 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             {"blocked": self.server.database.list_blocked(username)},
         )
 
+    def _optional_coordinates(
+        self,
+        body: Dict[str, Any],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """The attached location, or (None, None) when the sender did not share one.
+
+        Rejected rather than silently dropped when malformed: a Yo whose location quietly
+        vanished looks to the sender exactly like one that arrived, and they have no way to tell
+        that the recipient never got the pin.
+        """
+        latitude = body.get("latitude")
+        longitude = body.get("longitude")
+        if latitude is None and longitude is None:
+            return None, None
+        if latitude is None or longitude is None:
+            raise BadRequestError("latitude and longitude must be sent together")
+        for name, value in (("latitude", latitude), ("longitude", longitude)):
+            # bool is a subclass of int, so True would otherwise pass as the coordinate 1.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise BadRequestError(f"{name} must be a number")
+            if not math.isfinite(value):
+                raise BadRequestError(f"{name} must be a finite number")
+        if not -90 <= latitude <= 90:
+            raise BadRequestError("latitude must be between -90 and 90")
+        if not -180 <= longitude <= 180:
+            raise BadRequestError("longitude must be between -180 and 180")
+        return float(latitude), float(longitude)
+
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
         recipient = self._target_username(body, key="recipient")
+        latitude, longitude = self._optional_coordinates(body)
         if not self.server.send_limiter.allow(sender):
             self._write_json(
                 HTTPStatus.TOO_MANY_REQUESTS,
@@ -717,7 +753,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            delivered = bool(self.server.fcm_client.send_yo(fcm_token, sender))
+            delivered = bool(
+                self.server.fcm_client.send_yo(
+                    fcm_token,
+                    sender,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
         except FCMNotConfiguredError:
             self._write_json(
                 HTTPStatus.OK,

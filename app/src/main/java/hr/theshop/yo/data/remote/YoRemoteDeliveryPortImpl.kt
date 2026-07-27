@@ -12,7 +12,12 @@ class YoRemoteDeliveryPortImpl @Inject constructor(
 ) : YoRemoteDeliveryPort {
     override suspend fun deliver(message: YoMessage): Boolean {
         // No sender argument: the backend derives it from this device's token.
-        val sent = backendApi.sendYo(recipient = message.recipient)
+        val sent =
+            backendApi.sendYo(
+                recipient = message.recipient,
+                latitude = message.latitude,
+                longitude = message.longitude,
+            )
         message.photoUri?.let { uri ->
             runCatchingIgnoringCancellation { photoEncoder.encodeForUpload(uri) }
                 .getOrNull()

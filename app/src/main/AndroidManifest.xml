@@ -13,6 +13,26 @@
         android:name="android.hardware.camera"
         android:required="false" />
 
+    <!--
+        Package visibility, mandatory from API 30: without this, resolveActivity() reports that no
+        application handles geo: even when Google Maps is installed, so every shared location would
+        silently fall back to the browser.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+
+            <data android:scheme="geo" />
+        </intent>
+
+        <!--
+            Named explicitly because a shared location is sent to Google Maps by package rather
+            than left to a chooser: on a real handset six applications claim geo:, and "open with"
+            is not an answer to "here is where I am".
+        -->
+        <package android:name="com.google.android.apps.maps" />
+    </queries>
+
     <application
         android:name=".YoApplication"
         android:allowBackup="false"

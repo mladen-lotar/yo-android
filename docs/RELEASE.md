@@ -135,6 +135,46 @@ Horizontal insets are deliberately omitted so the bands stay full-bleed.
 **If you raise targetSdk again, re-check the layout on a device with 3-button navigation.** This
 class of bug is invisible to unit tests, to lint, and to a build that succeeds.
 
+### 4b. Location sharing, verified on the same handset (27 July 2026)
+
+Closing G20 was validated on the S23 against a scratch backend on `127.0.0.1:8799`, reached with
+`adb reverse tcp:8799 tcp:8799` and a debug build. Production was deliberately not touched: it runs
+the old code from a separate process and its own database. **Push was real FCM throughout** - only
+the API server was local, so nothing about the delivery path was simulated.
+
+| Step | Result |
+|---|---|
+| Inbound Yo with coordinates | Notification body `From ADA  ·  TAP TO OPEN MAP`, and a `contentIntent` where there had never been one before |
+| Tapping it | Google Maps opened directly on a pin labelled `ADA` at the sent coordinates |
+| `ATTACH LOCATION` in the app | Toggle read `LOCATION ON`; `POST /v1/send` carried the fix |
+| The resulting push | `From MLADEN  ·  TAP TO OPEN MAP`, pin labelled `MLADEN` on the handset's own GPS position, with the blue "you are here" dot sitting on it |
+| History row | Tapping a row with coordinates opens the same pin |
+
+**This found a second device-only bug.** The first implementation used a bare `ACTION_VIEW` on the
+`geo:` URI and let the system resolve it. On this handset six applications claim that scheme -
+Google Maps, Waze, Uber, Bolt, myAudi and Zoom - so tapping a shared location produced an
+**"Open with" chooser**, not a map. For a message whose whole content is "here is where I am", a
+disambiguation dialog is a failure. `MapIntentFactory` now asks for Google Maps by name when it is
+installed, falls back to an unpackaged `geo:` intent when it is not, and to a browser URL when the
+device has no map application at all. A `<package>` entry in `<queries>` makes Maps visible to
+`resolveActivity` under API 30+ package visibility.
+
+Two other things worth keeping:
+
+- **Run the backend on the venv interpreter.** `~/.local/share/yo-backend-venv/bin/python`, not the
+  system `python3` - google-auth lives only in the venv, and without it every send fails with
+  `fcm_delivery_failed` from `FCMDeliveryError: google-auth is required`. The prod service already
+  runs there; a scratch server started with plain `python3` looks broken in a way that has nothing
+  to do with the code under test.
+- **Driving the sign-in form over adb needs TAB.** Tapping the second field does not move focus in
+  these Compose text fields, so `input text` appends to the first one; `input keyevent 61` follows
+  the declared `ImeAction.Next` and lands in the password field.
+
+**The feature needs section 8 done before it works in production.** The shipped release build points
+at `https://yo.the-shop.io`, which still runs the old server. That server ignores the extra
+`latitude`/`longitude` fields rather than rejecting them, so sends keep working - they simply arrive
+without a location, exactly as before. Deploying the new backend is what switches it on.
+
 ### Permissions the merged manifest adds
 
 `AndroidManifest.xml` declares seven permissions; the built APK carries ten. Libraries merge in:
@@ -194,19 +234,34 @@ narrower than a reviewer would guess, and both are load-bearing:
 | User IDs | Yes | No | App functionality | FCM registration token; Google subject id |
 | Photos | Yes | No | App functionality | Only those attached to a Yo; scoped to sender and recipient |
 | Contacts | **No** | No | - | Read on device for the invite list. Only display name plus a local id, never a phone number or email, and never transmitted |
-| Location | **No** | No | - | A single fix is taken when the user turns on "attach location" and is written to local history only. `YoRemoteDeliveryPortImpl` sends nothing but the recipient. See G20 |
+| Precise location | Yes | **Yes** | App functionality | Optional. A single fix, only when the user turns on "attach location" for that Yo, relayed to the chosen recipient so they can open it on a map. Never continuous, never in the background |
 | App interactions / analytics | No | No | - | There is no analytics SDK |
 | Crash logs | No | No | - | No crash reporter is integrated |
 
 Also declare: data is encrypted in transit (HTTPS); users can request deletion (in-app and at
 `/delete-account`); the app is not directed at children.
 
-**Before submitting the form, resolve G20.** "ATTACH LOCATION" implies the recipient receives a
-location, and they do not - nothing transmits it. Either wire it into the payload (then location
-*is* collected and the answer above changes, and precise location additionally needs a prominent
-in-app disclosure), or remove the feature and the two location permissions. Declaring "not
-collected" is accurate today, but shipping a button that implies otherwise invites a reviewer to
-disagree.
+**The location row changed when G20 was fixed (2026-07-27) and it is the one row on this form that
+is easy to get wrong.** Until then "attach location" took a fix, wrote it to local history and
+transmitted nothing, so the honest answer was "not collected". The coordinates now genuinely travel
+to the recipient, so location must be declared **collected and shared**, and the sharing must be
+described as user-initiated and optional.
+
+Two things a reviewer will look for, and where they stand:
+
+- **Data sharing.** "Shared" here means transferred to another user, not sold or handed to a third
+  party for their own purposes. That is what the form's *App functionality* purpose covers; do not
+  tick advertising or analytics.
+- **Prominent disclosure.** Play requires one where the collection would not be obvious from
+  context. Here the user turns on a control labelled "ATTACH LOCATION" for a single message and
+  then answers the system permission prompt, so the collection is in-context and foreground-only -
+  no background access, no continuous tracking, and the manifest deliberately does not declare
+  `ACCESS_BACKGROUND_LOCATION`. If a reviewer disagrees, the cheapest answer is a one-line
+  explanation on the attach sheet rather than a code change.
+
+Precise location is declared because the manifest requests `ACCESS_FINE_LOCATION`. Dropping to
+coarse only would let this be declared as approximate, at the cost of a pin that can be a city
+block out - which for "come and find me" is the whole feature.
 
 ## 7. Store listing
 

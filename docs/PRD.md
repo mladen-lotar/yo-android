@@ -562,16 +562,36 @@ retry, the backoff and the `NOT RECEIVING YOS` state added for G17. Deprecated i
 the current path is the one proven end-to-end on a handset, so it is suppressed with a comment for
 this release and migrated deliberately afterwards, together.
 
-**G20 — "ATTACH LOCATION" attaches nothing the recipient can see.** `YoMessage` carries latitude
-and longitude, and `MainViewModel.sendYo` fills them in from a real position fix, but
-`YoRemoteDeliveryPortImpl.deliver` sends only `recipient` (and the photo). The coordinates are
-written to local Room history and never transmitted; the same is true of `link` and `hashtag`. So
-the feature is honest about the permission - nothing leaves the device, which is what the privacy
-policy and the data-safety form say - but dishonest about the product: the person receiving the Yo
-gets no location. Either wire it into the send payload, or remove the feature and its two location
-permissions. Shipping a button that implies a transmission that does not happen is the kind of
-thing a Play reviewer asks about, and asking for `ACCESS_FINE_LOCATION` for a write-only-to-self
-feature is a weak justification.
+**G20 — "ATTACH LOCATION" attached nothing the recipient could see. — RESOLVED 2026-07-27,
+verified on device.** `YoMessage` carried latitude and longitude and `MainViewModel.sendYo` filled
+them from a real position fix, but `YoRemoteDeliveryPortImpl.deliver` sent only `recipient` (and
+the photo): the coordinates were written to local Room history and never transmitted. The feature
+was honest about the permission and dishonest about the product - the person receiving the Yo got
+no location, while the sender was shown one attached.
+
+The pair now travels `deliver` → `POST /v1/send` → FCM data payload → the recipient's notification,
+whose tap target opens a map pinned on the sender. Three things about the fix are worth keeping:
+
+- The notification previously had **no `contentIntent` at all**, so it was inert. Received Yos are
+  never written to this device's Room history - `saveSent` is the only writer - which makes the
+  notification the recipient's *only* surface for a shared location. Its body says
+  `TAP TO OPEN MAP` for that reason; a body identical to a plain Yo gives no reason to tap, and the
+  location is gone as soon as the shade is swiped.
+- Coordinates are formatted with `Locale.ROOT` on both ends. The default locale on a Croatian
+  handset renders 45.815 as `45,815`, and a comma is what separates latitude from longitude in a
+  `geo:` URI - the pin would land somewhere else entirely, on the maintainers' own phones, while
+  passing every en-US test.
+- The `geo:` URI carries `?q=` rather than a bare `geo:lat,lng`, which only pans the map. `q=`
+  is what drops the marker, and the parenthesised label is what names it.
+- **The intent names Google Maps explicitly.** Left to the system, `ACTION_VIEW` on a `geo:` URI
+  opened an "Open with" chooser on the test handset, where six applications claim the scheme
+  (Maps, Waze, Uber, Bolt, myAudi, Zoom). `MapIntentFactory` sets the package when Maps is
+  installed and degrades to the chooser, then to a browser, when it is not.
+
+**Still local-only: `link` and `hashtag`.** Both are written to Room and never sent, exactly as the
+location used to be. They are lower stakes - neither implies a transmission the way a location pin
+does, and neither costs a runtime permission - but the same "shows as attached, arrives as nothing"
+mismatch applies, and it should be closed or the fields removed.
 
 **G22 — targetSdk 36 forced edge-to-edge and the menu button fell under the navigation bar. —
 FOUND AND FIXED ON DEVICE 2026-07-27.** Android 15 makes edge-to-edge mandatory for targetSdk 35+,

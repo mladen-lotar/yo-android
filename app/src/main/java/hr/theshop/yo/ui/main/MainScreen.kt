@@ -66,7 +66,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
+import hr.theshop.yo.data.location.MapIntentFactory
 import hr.theshop.yo.data.photo.decodeSampledBitmap
+import hr.theshop.yo.domain.location.LocationLink
 import hr.theshop.yo.domain.model.Group
 import hr.theshop.yo.data.remote.AddFriendOutcome
 import hr.theshop.yo.domain.model.PhoneContact
@@ -794,6 +796,18 @@ private fun Context.openUrl(url: String) {
     runCatching { startActivity(view) }
 }
 
+/**
+ * Opens the shared point on a map. Built by the same factory the notification uses, so a location
+ * behaves identically whether it is opened from the shade or from history.
+ */
+private fun Context.openMap(latitude: Double, longitude: Double, label: String) {
+    val intent =
+        MapIntentFactory.forCoordinates(this, latitude, longitude, label)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        } ?: return
+    runCatching { startActivity(intent) }
+}
+
 @Composable
 private fun HistorySheet(
     history: List<YoMessage>,
@@ -833,17 +847,33 @@ private fun HistorySheet(
 
 @Composable
 private fun HistoryRow(message: YoMessage) {
+    val context = LocalContext.current
+    val latitude = message.latitude
+    val longitude = message.longitude
+    val hasLocation = latitude != null && longitude != null &&
+        LocationLink.isValid(latitude, longitude)
     val line = buildString {
         append("${message.sender.uppercase()} → ${message.recipient.uppercase()}")
         message.link?.let { append("  ·  $it") }
         message.hashtag?.let { append("  ·  #$it") }
-        if (message.latitude != null && message.longitude != null) {
-            append("  ·  ${message.latitude}, ${message.longitude}")
+        if (hasLocation) {
+            append("  ·  ${LocationLink.format(latitude!!)}, ${LocationLink.format(longitude!!)}")
         }
     }
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .then(
+                if (hasLocation) {
+                    Modifier.clickable {
+                        // Labelled with the sender: the pin marks where *they* were, which from
+                        // this device's own history is the person who sent it.
+                        context.openMap(latitude!!, longitude!!, message.sender)
+                    }
+                } else {
+                    Modifier
+                },
+            )
             .padding(horizontal = 20.dp, vertical = 7.dp),
     ) {
         Text(text = line, style = YoBody)

@@ -30,12 +30,16 @@ TEST_PASSWORD = "correct-horse-battery"
 class RecordingFCMClient:
     def __init__(self):
         self.calls = []
+        # Coordinates are recorded separately so the existing (token, sender) assertions - about
+        # twenty of them, none concerned with location - keep saying what they were written to say.
+        self.location_calls = []
         self.result = True
         self.error = None
         self.fail_tokens = set()
 
-    def send_yo(self, fcm_token, sender):
+    def send_yo(self, fcm_token, sender, latitude=None, longitude=None):
         self.calls.append((fcm_token, sender))
+        self.location_calls.append((fcm_token, sender, latitude, longitude))
         if self.error is not None:
             raise self.error
         if fcm_token in self.fail_tokens:
@@ -845,6 +849,140 @@ class FriendsAndBlocksTest(YoServerTestCase):
             {"blocked": []},
             self.request("GET", "/v1/blocked", token=bob_token)[1],
         )
+
+
+class SendLocationTest(YoServerTestCase):
+    """Gap G20: the app captured a location, stored it locally and never sent it, so the sender
+    was told they had shared a position the recipient could not possibly receive."""
+
+    def send_location(self, latitude, longitude, recipient="BOB"):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device(recipient, "bob-token")
+        return self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": recipient, "latitude": latitude, "longitude": longitude},
+            token=alice_token,
+        )
+
+    def test_attached_location_reaches_the_push(self):
+        status, body = self.send_location(45.815, 15.982)
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(
+            [("bob-token", "ALICE", 45.815, 15.982)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_a_send_without_a_location_carries_none(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice_token)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", None, None)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_negative_coordinates_survive(self):
+        self.send_location(-33.8688, -151.2093)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", -33.8688, -151.2093)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_integer_coordinates_are_accepted_as_numbers(self):
+        self.send_location(45, 16)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", 45.0, 16.0)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_a_lone_coordinate_is_rejected(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": 45.815},
+            token=alice_token,
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+        # Rejected outright rather than sent without the location: silently dropping half a
+        # position tells the sender their location went out when it did not.
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_out_of_range_coordinates_are_rejected(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        for latitude, longitude in ((90.1, 0), (-90.1, 0), (0, 180.1), (0, -180.1)):
+            with self.subTest(latitude=latitude, longitude=longitude):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/send",
+                    {
+                        "recipient": "BOB",
+                        "latitude": latitude,
+                        "longitude": longitude,
+                    },
+                    token=alice_token,
+                )
+                self.assertEqual(400, status)
+
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_the_poles_and_the_antimeridian_are_accepted(self):
+        self.send_location(90, 180)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", 90.0, 180.0)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_non_numeric_coordinates_are_rejected(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        # True is in this list because bool subclasses int in Python: without an explicit check
+        # it would sail through as the coordinate 1.0. None means "no latitude", which pairs with
+        # a longitude that IS present - rejected by the both-or-neither rule rather than by type.
+        for latitude in ("45.815", None, [45.815], {"lat": 1}, True):
+            with self.subTest(latitude=latitude):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/send",
+                    {"recipient": "BOB", "latitude": latitude, "longitude": 15.982},
+                    token=alice_token,
+                )
+                self.assertEqual(400, status)
+
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_a_blocked_recipient_still_sees_nothing(self):
+        alice_token = self.signup("ALICE")
+        bob_token = self.signup_with_device("BOB", "bob-token")
+        self.request("POST", "/v1/block", {"username": "ALICE"}, token=bob_token)
+
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": 45.815, "longitude": 15.982},
+            token=alice_token,
+        )
+
+        # Same indistinguishable-from-delivered answer as a plain Yo, and no push carrying a
+        # position to somebody who blocked the sender.
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual([], self.fcm_client.calls)
 
 
 class SendTest(YoServerTestCase):

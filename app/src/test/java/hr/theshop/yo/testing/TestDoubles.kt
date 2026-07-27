@@ -45,7 +45,11 @@ open class StubYoBackendApi : YoBackendApi {
 
     override suspend fun block(username: String): Boolean = true
 
-    override suspend fun sendYo(recipient: String): Boolean = true
+    override suspend fun sendYo(
+        recipient: String,
+        latitude: Double?,
+        longitude: Double?,
+    ): Boolean = true
 
     override suspend fun uploadPhoto(
         messageId: String,

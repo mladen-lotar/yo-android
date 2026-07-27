@@ -59,6 +59,37 @@ class YoRemoteDeliveryPortImplTest {
         assertTrue(backendApi.uploads.isEmpty())
     }
 
+    // The regression this guards is gap G20: an attached location was written to local history
+    // and never sent, so the sender saw "location attached" while the recipient got a bare Yo.
+    // Nothing crashed and no test failed - the coordinates simply stopped at the phone.
+    @Test
+    fun `deliver forwards an attached location to the backend`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, FakePhotoEncoder())
+
+        deliveryPort.deliver(
+            YoMessage(
+                id = "message-8",
+                sender = "me",
+                recipient = "Ada",
+                latitude = 45.815,
+                longitude = 15.982,
+            ),
+        )
+
+        assertEquals(listOf(SendCall("Ada", 45.815, 15.982)), backendApi.sends)
+    }
+
+    @Test
+    fun `deliver sends no coordinates when no location was attached`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, FakePhotoEncoder())
+
+        deliveryPort.deliver(YoMessage(id = "message-9", sender = "me", recipient = "Ada"))
+
+        assertEquals(listOf(SendCall("Ada", null, null)), backendApi.sends)
+    }
+
     @Test
     fun `deliver skips upload when a photo cannot be encoded`() = runTest {
         val backendApi = FakeYoBackendApi()
@@ -189,8 +220,12 @@ class YoRemoteDeliveryPortImplTest {
         val sends = mutableListOf<SendCall>()
         val uploads = mutableListOf<UploadCall>()
 
-        override suspend fun sendYo(recipient: String): Boolean {
-            sends += SendCall(recipient)
+        override suspend fun sendYo(
+            recipient: String,
+            latitude: Double?,
+            longitude: Double?,
+        ): Boolean {
+            sends += SendCall(recipient, latitude, longitude)
             return sendResult
         }
 
@@ -221,6 +256,8 @@ class YoRemoteDeliveryPortImplTest {
 
     private data class SendCall(
         val recipient: String,
+        val latitude: Double? = null,
+        val longitude: Double? = null,
     )
 
     private data class UploadCall(

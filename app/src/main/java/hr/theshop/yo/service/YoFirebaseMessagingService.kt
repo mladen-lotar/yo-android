@@ -3,6 +3,8 @@ package hr.theshop.yo.service
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import dagger.hilt.android.AndroidEntryPoint
+import hr.theshop.yo.domain.location.LocationCoordinates
+import hr.theshop.yo.domain.location.LocationLink
 import hr.theshop.yo.domain.usecase.RegisterDeviceUseCase
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +35,18 @@ class YoFirebaseMessagingService : FirebaseMessagingService() {
             return
         }
         val sender = message.data["sender"]?.takeIf(String::isNotBlank) ?: return
-        YoNotifier.postYoNotification(this, sender)
+        YoNotifier.postYoNotification(this, sender, coordinatesFrom(message))
+    }
+
+    /**
+     * FCM data values are always strings, so the coordinates arrive as text and may be absent,
+     * partial or junk. Anything short of a complete, valid pair yields null, which downgrades the
+     * push to a plain Yo - the Yo itself must still arrive when only the location is malformed.
+     */
+    private fun coordinatesFrom(message: RemoteMessage): LocationCoordinates? {
+        val latitude = message.data["latitude"]?.toDoubleOrNull() ?: return null
+        val longitude = message.data["longitude"]?.toDoubleOrNull() ?: return null
+        if (!LocationLink.isValid(latitude, longitude)) return null
+        return LocationCoordinates(latitude = latitude, longitude = longitude)
     }
 }

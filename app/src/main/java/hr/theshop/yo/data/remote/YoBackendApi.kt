@@ -3,6 +3,7 @@ package hr.theshop.yo.data.remote
 import hr.theshop.yo.domain.model.AuthFailure
 import hr.theshop.yo.domain.model.AuthResult
 import hr.theshop.yo.domain.model.GoogleAuthResult
+import hr.theshop.yo.domain.location.LocationLink
 import hr.theshop.yo.domain.model.YoSession
 import hr.theshop.yo.domain.repository.SessionStore
 import java.io.IOException
@@ -49,7 +50,15 @@ interface YoBackendApi {
 
     suspend fun block(username: String): Boolean
 
-    suspend fun sendYo(recipient: String): Boolean
+    /**
+     * [latitude] and [longitude] are sent only when the sender attached their location, and are
+     * relayed to the recipient's device so the Yo can be opened on a map.
+     */
+    suspend fun sendYo(
+        recipient: String,
+        latitude: Double? = null,
+        longitude: Double? = null,
+    ): Boolean
 
     suspend fun uploadPhoto(
         messageId: String,
@@ -207,10 +216,27 @@ class HttpYoBackendApi(
         }.getOrDefault(false)
     }
 
-    override suspend fun sendYo(recipient: String): Boolean {
+    override suspend fun sendYo(
+        recipient: String,
+        latitude: Double?,
+        longitude: Double?,
+    ): Boolean {
         // No sender field: spoofing another user is impossible because the server reads the
         // sender off the bearer token.
-        val body = JSONObject().put("recipient", recipient).toString()
+        val body =
+            JSONObject()
+                .put("recipient", recipient)
+                .apply {
+                    // Both or neither: a lone coordinate is not a position, and the server
+                    // rejects the pair outright rather than guessing at the missing half.
+                    if (latitude != null && longitude != null &&
+                        LocationLink.isValid(latitude, longitude)
+                    ) {
+                        put("latitude", latitude)
+                        put("longitude", longitude)
+                    }
+                }
+                .toString()
         val response = execute(method = "POST", path = "/v1/send", body = body)
         return response.isSuccessful && JSONObject(response.body).optBoolean("delivered", false)
     }

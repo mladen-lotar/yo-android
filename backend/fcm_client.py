@@ -12,6 +12,15 @@ FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 FCM_ENDPOINT = "https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
 
 
+def format_coordinate(value: float) -> str:
+    """Six decimal places, matching the app's own formatting on both ends of the wire.
+
+    Python's format is locale-independent, so this always yields a dot separator - which is what
+    the `geo:` URI on the handset requires, since a comma there separates latitude from longitude.
+    """
+    return f"{float(value):.6f}"
+
+
 class FCMError(RuntimeError):
     pass
 
@@ -97,23 +106,35 @@ class FCMClient:
         self._credential_source: Optional[str] = None
         self._lock = threading.Lock()
 
-    def send_yo(self, fcm_token: str, sender: str) -> bool:
+    def send_yo(
+        self,
+        fcm_token: str,
+        sender: str,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+    ) -> bool:
         service_account_path, project_id = self._configuration()
         access_token = self._access_token(service_account_path)
         endpoint = FCM_ENDPOINT.format(
             project_id=urllib.parse.quote(project_id, safe="")
         )
+        data: Dict[str, str] = {
+            "type": "yo",
+            "sender": sender,
+            "timestamp": str(int(time.time() * 1000)),
+        }
+        if latitude is not None and longitude is not None:
+            # Every value in an FCM data message must be a string; a float here is rejected by
+            # the API outright. Six decimals matches what the app formats and parses.
+            data["latitude"] = format_coordinate(latitude)
+            data["longitude"] = format_coordinate(longitude)
         payload: Dict[str, object] = {
             "message": {
                 "token": fcm_token,
                 # Data-only messages default to normal priority, which Doze may hold back until
                 # the next maintenance window. A Yo that arrives in ten minutes is not a Yo.
                 "android": {"priority": "high"},
-                "data": {
-                    "type": "yo",
-                    "sender": sender,
-                    "timestamp": str(int(time.time() * 1000)),
-                },
+                "data": data,
             }
         }
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
