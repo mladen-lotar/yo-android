@@ -90,6 +90,34 @@ obfuscated. R8 is on (`isMinifyEnabled`/`isShrinkResources`); the app has no ref
 mapping - every request is built field-by-field with `org.json` - so the usual "R8 broke my API
 models" failure mode does not apply here.
 
+### Verified on 27 July 2026
+
+The release pipeline was built and checked end to end, using a throwaway `google-services.json`
+(the real Cloud project does not exist yet - G21) which was deleted immediately afterwards:
+
+```
+app-release.aab   4.7 MB    signer certificate expires 2053-12-12
+app-release.apk   2.3 MB    SHA-1 2202ede8e1b3789440a75223f46ee1202ddd61ba
+package: hr.theshop.yo   versionCode 1   targetSdkVersion 36   compileSdkVersion 36
+```
+
+The APK's signing fingerprint matches the upload keystore exactly, and R8 ran without breaking the
+build. What is *not* verified is that the minified app runs correctly - that needs an install on a
+device, which needs the real Firebase project first. **Smoke-test the release build on a handset
+before uploading**; R8 failures show up at runtime, not at build time.
+
+### Permissions the merged manifest adds
+
+`AndroidManifest.xml` declares seven permissions; the built APK carries ten. Libraries merge in:
+
+| Added | From |
+|---|---|
+| `USE_BIOMETRIC`, `USE_FINGERPRINT` | `androidx.credentials` |
+| `ACCESS_NETWORK_STATE` | Firebase / Play Services |
+
+They are harmless but they appear on the store listing, so the biometric ones will be visible to
+users even though the app never asks for a fingerprint. Nothing to fix - just do not be surprised.
+
 ## 5. The name
 
 The original Yo (Or Arbel, 2014) shut down around 2016. Checked on 27 July 2026:
