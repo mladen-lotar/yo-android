@@ -44,6 +44,10 @@ val yoInviteUrl = optionalSetting("yoInviteUrl", "YO_INVITE_URL")
 // client id is public by design and grants nothing without the account it names.
 val yoGoogleClientId = optionalSetting("yoGoogleClientId", "YO_GOOGLE_CLIENT_ID")
 
+// Google Play requires the privacy policy to be reachable from inside the app as well as from
+// the store listing. Served by the backend at /privacy so it cannot drift from the code.
+val yoPrivacyUrl = optionalSetting("yoPrivacyUrl", "YO_PRIVACY_URL")
+
 fun escapeForBuildConfig(value: String?): String =
     (value ?: "").replace("\\", "\\\\").replace("\"", "\\\"")
 
@@ -76,6 +80,7 @@ android {
             "YO_GOOGLE_CLIENT_ID",
             "\"${escapeForBuildConfig(yoGoogleClientId)}\"",
         )
+        buildConfigField("String", "YO_PRIVACY_URL", "\"${escapeForBuildConfig(yoPrivacyUrl)}\"")
     }
 
     signingConfigs {
@@ -144,6 +149,7 @@ val verifyYoConfiguration =
             if (yoBackendUrl == null) missing += "yoBackendUrl (or YO_BACKEND_URL)"
             if (yoInviteUrl == null) missing += "yoInviteUrl (or YO_INVITE_URL)"
             if (yoGoogleClientId == null) missing += "yoGoogleClientId (or YO_GOOGLE_CLIENT_ID)"
+            if (yoPrivacyUrl == null) missing += "yoPrivacyUrl (or YO_PRIVACY_URL)"
             if (missing.isNotEmpty()) {
                 throw GradleException(
                     "Cannot build an app artifact without: ${missing.joinToString(", ")}. " +

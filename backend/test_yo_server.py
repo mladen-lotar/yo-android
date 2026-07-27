@@ -1389,13 +1389,11 @@ class BroadcastTest(YoServerTestCase):
         )
 
 
-class InstallPageTest(unittest.TestCase):
-    """
-    The install page is the landing target of shared invite links.
+class StaticPageTestCase(unittest.TestCase):
+    """Harness for the unauthenticated HTML routes: install, privacy, delete-account.
 
-    Deliberately NOT a subclass of YoServerTestCase: inheriting would re-run every API test a
-    second time under a new name. These routes never touch the database, so the harness here is
-    a stub.
+    Deliberately NOT built on YoServerTestCase: inheriting would re-run every API test a second
+    time under a new name. These routes never touch the database, so the stub below is enough.
     """
 
     def setUp(self):
@@ -1425,6 +1423,10 @@ class InstallPageTest(unittest.TestCase):
         response_head, response_body = handler.wfile.getvalue().split(b"\r\n\r\n", 1)
         status = int(response_head.splitlines()[0].decode("ascii").split(" ", 2)[1])
         return status, response_head.decode("latin-1"), response_body
+
+
+class InstallPageTest(StaticPageTestCase):
+    """The install page is the landing target of shared invite links."""
 
     def test_install_page_is_public_because_invitees_have_no_credential(self):
         status, head, body = self.raw_request("GET", "/install")
@@ -1488,6 +1490,48 @@ class InstallPageTest(unittest.TestCase):
 
         self.assertEqual(401, status)
         self.assertIn(b"unauthorized", body)
+
+
+class PolicyPageTest(StaticPageTestCase):
+    """The two URLs Google Play checks before it will list the app."""
+
+    def test_the_privacy_policy_is_public(self):
+        """Play fetches it without an account, so a 401 here fails review."""
+        status, head, body = self.raw_request("GET", "/privacy")
+
+        self.assertEqual(200, status)
+        self.assertIn("text/html", head)
+        self.assertIn(b"Yo privacy policy", body)
+
+    def test_the_deletion_page_is_public(self):
+        status, head, body = self.raw_request("GET", "/delete-account")
+
+        self.assertEqual(200, status)
+        self.assertIn("text/html", head)
+        self.assertIn(b"Delete your Yo account", body)
+
+    def test_the_privacy_policy_states_that_contacts_stay_on_the_device(self):
+        """This is the app's strongest privacy claim and the one a reviewer will check against
+        the READ_CONTACTS permission."""
+        _, _, body = self.raw_request("GET", "/privacy")
+
+        self.assertIn(b"never a phone number", body)
+
+    def test_the_privacy_policy_points_at_the_deletion_route(self):
+        _, _, body = self.raw_request("GET", "/privacy")
+
+        self.assertIn(b"/delete-account", body)
+
+    def test_both_pages_are_reachable_with_a_trailing_slash(self):
+        for path in ("/privacy/", "/delete-account/"):
+            status, _, _ = self.raw_request("GET", path)
+            self.assertEqual(200, status, path)
+
+    def test_the_pages_carry_no_credential(self):
+        for path in ("/privacy", "/delete-account"):
+            _, _, body = self.raw_request("GET", path)
+            for secret_marker in (b"X-Yo-Token", b"Bearer ", b"YO_SERVER_KEY"):
+                self.assertNotIn(secret_marker, body, path)
 
 
 class DeleteAccountTest(YoServerTestCase):

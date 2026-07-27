@@ -51,6 +51,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import hr.theshop.yo.BuildConfig
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -123,6 +124,7 @@ fun MainScreen(
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
+    val context = LocalContext.current
     var lastSentTo by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(lastSentTo) {
@@ -264,6 +266,7 @@ fun MainScreen(
                 sheet = null
                 viewModel.logOut()
             },
+            onPrivacy = { context.openUrl(BuildConfig.YO_PRIVACY_URL) },
             onDeleteAccount = { sheet = Sheet.DeleteAccount },
         )
         Sheet.DeleteAccount -> DeleteAccountSheet(
@@ -455,6 +458,7 @@ private fun MenuSheet(
     onInvite: () -> Unit,
     onAddFriend: () -> Unit,
     onLogOut: () -> Unit,
+    onPrivacy: () -> Unit,
     onDeleteAccount: () -> Unit,
 ) {
     YoSheet(onDismiss = onDismiss) {
@@ -497,6 +501,13 @@ private fun MenuSheet(
             // Alizarin is the palette's only red and the doc reserves it for the menu button, so
             // it is the one colour here that reads as "this one is different". Deleting an account
             // is the only irreversible thing the app can do.
+            Band(
+                color = YoPalette.colorForIndex(5),
+                label = "PRIVACY",
+                onClick = onPrivacy,
+                onLongClick = onPrivacy,
+                clickLabel = "Open the privacy policy",
+            )
             Band(
                 color = YoPalette.Alizarin,
                 label = "DELETE ACCOUNT",
@@ -751,6 +762,15 @@ private fun Context.shareInvite(message: String) {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     runCatching { startActivity(chooser) }
+}
+
+/** Opens a URL in the browser. Used for the privacy policy, which Play requires to be
+ * reachable from inside the app as well as from the store listing. */
+private fun Context.openUrl(url: String) {
+    val view = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { startActivity(view) }
 }
 
 @Composable
