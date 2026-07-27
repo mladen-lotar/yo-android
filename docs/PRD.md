@@ -573,7 +573,26 @@ permissions. Shipping a button that implies a transmission that does not happen 
 thing a Play reviewer asks about, and asking for `ACCESS_FINE_LOCATION` for a write-only-to-self
 feature is a weak justification.
 
-**G21 — no Cloud project owns `hr.theshop.yo`.** The package rename invalidates both Google
+**G21 — no Cloud project owns `hr.theshop.yo`. — FCM HALF RESOLVED 2026-07-27.** A Firebase
+Android app for `hr.theshop.yo` now exists in `yo-theshop`
+(`1:747034506241:android:e5b34b298d59ea5e48bc00`) with **both** SHA-1 fingerprints registered —
+the debug key `BC:E5:5B:00:…` and the new upload key `22:02:ED:E8:…` — and a real
+`google-services.json` fetched from it. Push therefore works for the renamed package, and the
+release build passes its configuration gate. Done entirely through the Firebase Management API
+using the existing `firebase-adminsdk-fbsvc@yo-theshop` service-account key, so it needed no
+interactive login.
+
+**Google sign-in is still blocked.** The returned config carries only a `client_type: 3` (web)
+OAuth client and no `client_type: 1` (Android) one, because Firebase only auto-creates the Android
+client when Google sign-in is enabled on the project — and enabling it needs Firebase Auth, which
+needs billing on `yo-theshop` (G15). So the app still points at the borrowed **blocksurge** web
+client, which has no Android client for `hr.theshop.yo` either. Until one of the two is true —
+billing on `yo-theshop`, or a new Android client registered for `hr.theshop.yo` + the release SHA-1
+in whichever project holds the web client — `CONTINUE WITH GOOGLE` will fail with `cmsh:[28444]`
+for the renamed package. There is no public API for creating an Android OAuth client; it is a
+console action or a billing decision. Original text follows.
+
+**G21 (original) — no Cloud project owns `hr.theshop.yo`.** The package rename invalidates both Google
 integrations at once: `google-services.json` keys the FCM app on the package name, and an Android
 OAuth client is registered as a (package, SHA-1) pair. Neither matches any more. The fix is the
 same project that G16 already called for - one project owning both the FCM app and the OAuth

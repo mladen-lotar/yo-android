@@ -19,6 +19,8 @@ decisions behind the parts that are not obvious. Written 27 July 2026.
 | Data safety declaration | Answers prepared in section 6; must be typed into the Console |
 | Content rating questionnaire | Outstanding - Console only |
 | Backend on real hosting | **Outstanding** - see section 8 |
+| FCM for `hr.theshop.yo` | Done - app + both SHA-1s in `yo-theshop` |
+| Google sign-in for `hr.theshop.yo` | **Outstanding** - needs an Android OAuth client, see section 9 |
 | Closed testing, 12 testers x 14 days | **Unknown** - see section 9 |
 
 ## 2. Toolchain
@@ -250,11 +252,23 @@ What the move needs:
 1. Confirm the Play developer account type. A personal account created after Nov 2023 must run
    **closed testing with at least 12 testers opted in for 14 continuous days** before it can apply
    for production. This dominates the schedule; check it first.
-2. Create the Firebase/Cloud project properly (G16, G21): a project that owns both the FCM app and
-   the OAuth clients for `hr.theshop.yo`, with **both** SHA-1 fingerprints from section 4
-   registered - the release key as well as the debug key, or Google sign-in works in development
-   and fails for every real user.
-3. Regenerate `app/google-services.json` from that project for the new package name.
+2. **Push: done** (27 Jul 2026). `yo-theshop` now has a Firebase Android app for `hr.theshop.yo`
+   (`1:747034506241:android:e5b34b298d59ea5e48bc00`) with both SHA-1s from section 4 registered,
+   and `app/google-services.json` is fetched from it. It stays gitignored.
+3. **Google sign-in: still blocked** (G21). The project returns only a web OAuth client; Firebase
+   auto-creates the Android one only when Google sign-in is enabled, which needs Firebase Auth,
+   which needs billing on `yo-theshop`. Pick one:
+   - put `yo-theshop` on billing, enable Google sign-in, let Firebase create both clients, then
+     point `yoGoogleClientId` and the backend's `YO_GOOGLE_CLIENT_ID` at its web client; or
+   - keep borrowing `blocksurge-theshop` and add an Android client there for `hr.theshop.yo` with
+     **both** fingerprints.
+
+   Either way the release SHA-1 must be registered, not just the debug one - that is the failure
+   that works perfectly in development and breaks for every real user. There is no public API for
+   creating an Android OAuth client, so this is a console action.
+
+   Until it is done, `CONTINUE WITH GOOGLE` fails with `cmsh:[28444]` on the renamed package.
+   Username and password sign-in is unaffected.
 4. Move the backend (section 8) and repoint `yoBackendUrl`.
 5. `./gradlew :app:testDebugUnitTest` and `python3 -m unittest discover` in `backend/`.
 6. `./gradlew :app:bundleRelease`, upload the `.aab` and `mapping.txt`.
