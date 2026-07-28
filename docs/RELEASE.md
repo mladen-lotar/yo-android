@@ -310,18 +310,35 @@ launch.
 
 What the move needs:
 
-1. **A host.** Any small VM. The service is a single-file Python `ThreadingHTTPServer` with one
-   dependency (`google-auth`); no container is required, though one is fine.
-2. **A process supervisor.** systemd unit replacing the launchd agent, `Restart=always`, running
-   as a non-root user. Environment carries `YO_GOOGLE_CLIENT_ID`, `YO_FIREBASE_PROJECT_ID`,
-   `YO_FIREBASE_SA_KEY` and `YO_APK_PATH` if the APK is served.
+1. **A host.** Any small VM. The service is a Python `ThreadingHTTPServer` across five runtime
+   modules (`yo_server`, `yo_db`, `yo_auth`, `yo_google`, `fcm_client`) with one direct
+   dependency (`google-auth`, six packages transitively, all prebuilt wheels - no compiler).
+   It is **single-replica permanently**: the rate limiters are in-memory and the store is a
+   non-WAL SQLite file, so a second replica halves every limit and invites `SQLITE_BUSY`.
+2. **A process supervisor.** `Restart=always` running as a non-root user. Environment carries
+   `YO_GOOGLE_CLIENT_ID`, `YO_FIREBASE_PROJECT_ID`, `YO_FIREBASE_SA_KEY`, `YO_CLOUDFLARE_RANGES`
+   and `YO_APK_PATH` if the APK is served. Two settings decide whether a containerised run works
+   at all and neither has a usable default: `--host 0.0.0.0` (the default `127.0.0.1` is
+   unreachable from outside the container) and `--database` on the mounted volume (the default
+   lands in the image layer and is discarded on every restart).
+   Fail-fast is **not** total: an existing database the process cannot write does not fail at
+   startup - `initialize()` is `CREATE TABLE IF NOT EXISTS`, a no-op needing no write lock - so
+   it starts, reports healthy, serves reads, and fails every write. `/healthz` never opens the
+   database. Prove writes explicitly after any deploy.
 3. **TLS on a stable hostname.** Keep `yo.the-shop.io`, repointed from the tunnel to the host,
    with a real certificate. The release build refuses a non-`https://` backend URL at build time.
 4. **The service-account key**, currently `~/.config/yo/firebase-sa.json`, `chmod 600`, copied
    outside the repository and never into it.
-5. **Rate limiting still keys on `CF-Connecting-IP`.** If Cloudflare is dropped, that header
-   disappears and every caller collapses into one bucket - one abuser would lock out everybody.
-   Whatever proxy replaces it must set a trusted client-IP header and the code must read it.
+5. **Rate limiting keys on `CF-Connecting-IP`, but only from a Cloudflare peer.** The header is
+   believed only when the request's peer - the **rightmost** `X-Forwarded-For` entry, which a
+   proxy authors from the TCP peer - falls inside `YO_CLOUDFLARE_RANGES`. Otherwise the peer
+   itself is the key.
+   Do not "simplify" this to `X-Forwarded-For[0]`: Cloudflare *forwards* a client-supplied
+   `X-Forwarded-For` unmodified, so position [0] is attacker-chosen, while it *rejects* a
+   client-supplied `CF-Connecting-IP` at the edge and writes the header itself. Trusting
+   `CF-Connecting-IP` unconditionally was a measured bypass - 15 signups against a limit of 10.
+   The `yo-cf-only` ipAllowList middleware on the Traefik router is what makes the CF branch
+   sound; leaving `YO_CLOUDFLARE_RANGES` empty disables the branch and fails closed.
 6. **Database migration.** Stop the agent, copy `backend/yo.db`, start the service. Accounts,
    friendships and FCM tokens all live in that one file.
 7. **Backups.** There are none today beyond one manual `.bak`. A nightly copy off the host is the
@@ -389,10 +406,13 @@ What the move needs:
 5. Re-verify `GOOGLE SIGN-IN` on a handset against the `yo-theshop` clients (section 9.3).
 6. Flip the OAuth consent screen off `orgInternalOnly`, or no account outside `the-shop.hr` can
    sign in. Console only.
-7. Move the backend (section 8) and repoint `yoBackendUrl`. Until that happens `/privacy` and
-   `/delete-account` return **401 in production** - both routes exist only on this branch, while
-   the launchd job runs `yo_server.py` straight out of the main checkout. Two Play-required URLs
-   are dead until the deploy, however Done the code column says.
+7. Move the backend (section 8). `yoBackendUrl` does **not** change - the hostname stays
+   `yo.the-shop.io`, which is the entire reason every installed APK keeps working across the
+   move with no rebuild and no Play update.
+   The earlier note here said `/privacy` and `/delete-account` returned 401 in production; that
+   was true only until PR #32 merged. Both serve 200 today. The underlying lesson is still live
+   and worth keeping: the launchd job runs `yo_server.py` straight out of the main checkout with
+   no deploy step, so anything branch-only is simply absent from production.
 8. `./gradlew :app:testDebugUnitTest` and `python3 -m unittest discover` in `backend/`.
 9. `./gradlew :app:bundleRelease`, upload the `.aab` and `mapping.txt`.
 10. Fill in the data safety form (section 6) and the content rating questionnaire.
