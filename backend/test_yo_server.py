@@ -1216,7 +1216,10 @@ class SendAttachmentTest(YoServerTestCase):
         """The bound is inclusive, so the rejection above is the length above the limit rather
         than an off-by-one that also refuses a legal link."""
         link = "h" * MAX_LINK_BYTES
-        hashtag = "#" * MAX_HASHTAG_BYTES
+        # A hashtag of the limit's length, not a hashtag of that many '#'. The leading hashes are
+        # stripped before the charset rule runs, so "#" * 140 is an empty tag rather than a long
+        # one and would be refused for a reason that has nothing to do with the bound under test.
+        hashtag = "h" * MAX_HASHTAG_BYTES
 
         status, _ = self.send(link=link, hashtag=hashtag)
 
@@ -1225,6 +1228,42 @@ class SendAttachmentTest(YoServerTestCase):
             [("bob-token", "ALICE", link, hashtag)],
             self.fcm_client.attachment_calls,
         )
+
+    def test_a_hashtag_cannot_forge_the_notification_body(self):
+        """The recipient's notification body is built by interpolating the hashtag between the
+        app's own separators, and the app writes "TAP TO OPEN <host>" there for a real link. A
+        hashtag carrying that wording put a second, attacker-chosen tap promise in somebody
+        else's shade under a sender name they recognise. Length and type were checked; the
+        characters were not."""
+        forgeries = (
+            "x  ·  TAP TO OPEN paypal.com",
+            "x\nFrom BANK",
+            "x TAP TO OPEN",
+            "· evil.com",
+            "a b",
+            "#",
+            "###",
+        )
+
+        for hashtag in forgeries:
+            with self.subTest(hashtag=hashtag):
+                status, body = self.send(hashtag=hashtag)
+
+                self.assertEqual(400, status)
+                self.assertEqual("bad_request", body["error"])
+                self.assertEqual([], self.fcm_client.attachment_calls)
+
+    def test_a_real_hashtag_still_passes(self):
+        """The charset rule is Unicode-aware on purpose: a Croatian or Chinese tag is a hashtag,
+        and refusing it to stop an ASCII forgery would be the wrong trade."""
+        for hashtag in ("worldcup", "#worldcup", "world_cup", "world-cup", "世界", "šđč"):
+            with self.subTest(hashtag=hashtag):
+                self.fcm_client.attachment_calls.clear()
+
+                status, _ = self.send(hashtag=hashtag)
+
+                self.assertEqual(200, status)
+                self.assertEqual(1, len(self.fcm_client.attachment_calls))
 
     def test_an_attachment_is_never_written_to_the_database(self):
         """The privacy policy claims a link and a hashtag pass through without being stored, so
@@ -1564,7 +1603,7 @@ class BroadcastTest(YoServerTestCase):
         status, body = self.request(
             "POST",
             "/v1/broadcast",
-            {"message": "Package update"},
+            {},
             token=None,
             extra_headers=self.client_headers(),
         )
@@ -1581,6 +1620,56 @@ class BroadcastTest(YoServerTestCase):
             ],
             self.fcm_client.calls,
         )
+
+    def test_broadcast_credentials_are_rate_limited(self):
+        """This was the one credential-checking route with no limiter at all, so a client key
+        could be guessed at line rate while signup and login were held to ten attempts. It
+        shares their bucket on purpose: an attacker must not be able to dodge the limit by
+        moving between routes, which is the property CredentialTest already asserts for the
+        signup/login pair."""
+        self.register_client()
+
+        for _ in range(CREDENTIAL_ATTEMPTS):
+            self.request(
+                "POST",
+                "/v1/broadcast",
+                {},
+                token=None,
+                extra_headers={"X-Yo-Client-Id": "fedex", "X-Yo-Client-Key": "wrong"},
+            )
+
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {},
+            token=None,
+            extra_headers={"X-Yo-Client-Id": "fedex", "X-Yo-Client-Key": "wrong"},
+        )
+
+        self.assertEqual(429, status)
+        self.assertEqual({"error": "rate_limited"}, body)
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_a_broadcast_refuses_a_message_rather_than_dropping_it(self):
+        """This test used to send {"message": "Package update"} and assert the fan-out below,
+        which recorded only (token, sender) - so it passed while the text reached nobody. The
+        field was validated and then never handed to send_yo. A caller told their message went
+        out to every subscriber, when no subscriber could ever see it, is G20's defect wearing
+        a different route; a Yo carries no content, so the field is refused instead."""
+        self.register_client()
+        self.subscribe_two_devices()
+
+        status, body = self.request(
+            "POST",
+            "/v1/broadcast",
+            {"message": "Package update"},
+            token=None,
+            extra_headers=self.client_headers(),
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+        self.assertEqual([], self.fcm_client.calls)
 
     def test_broadcast_rejects_wrong_or_missing_client_credentials(self):
         self.register_client()
@@ -1991,6 +2080,132 @@ class DeleteAccountTest(YoServerTestCase):
         )
         self.assertEqual(404, status)
         self.assertEqual("username_required", body["error"])
+
+
+class LimiterKeyTest(unittest.TestCase):
+    """Which bucket a caller lands in.
+
+    Built by hand rather than through YoServerTestCase.request, because the socket peer has to
+    vary and the harness hardcodes 127.0.0.1.
+    """
+
+    CF_RANGES = (
+        ipaddress.ip_network("173.245.48.0/20"),
+        ipaddress.ip_network("2400:cb00::/32"),
+    )
+
+    def key(self, socket_peer="127.0.0.1", forwarded=None, connecting=None, ranges=None):
+        headers = Message()
+        if forwarded is not None:
+            headers["X-Forwarded-For"] = forwarded
+        if connecting is not None:
+            headers["CF-Connecting-IP"] = connecting
+        handler = YoRequestHandler.__new__(YoRequestHandler)
+        handler.headers = headers
+        handler.client_address = (socket_peer, 0)
+        with mock.patch.object(
+            yo_server,
+            "CLOUDFLARE_RANGES",
+            self.CF_RANGES if ranges is None else ranges,
+        ):
+            return handler._limiter_key()
+
+    def test_one_ipv6_customer_cannot_mint_buckets_out_of_their_own_prefix(self):
+        """The smallest allocation a residential IPv6 customer gets is a /64 - eighteen
+        quintillion addresses. Keying on the full address hands them an unlimited supply of
+        fresh buckets against the limiter that guards a 600,000-iteration PBKDF2."""
+        first = self.key(forwarded="2400:cb00::1", connecting="2001:db8:1:1::5")
+        second = self.key(forwarded="2400:cb00::1", connecting="2001:db8:1:1::99ff")
+
+        self.assertEqual(first, second)
+        self.assertEqual("2001:db8:1:1::", first)
+
+    def test_a_different_prefix_is_a_different_customer(self):
+        """Bucketing to /64 must not collapse unrelated subscribers into one bucket, which
+        would turn one abuser into a lockout for everybody else - the failure the whole
+        CF-Connecting-IP arrangement exists to avoid."""
+        first = self.key(forwarded="2400:cb00::1", connecting="2001:db8:1:1::5")
+        second = self.key(forwarded="2400:cb00::1", connecting="2001:db8:2:2::5")
+
+        self.assertNotEqual(first, second)
+
+    def test_ipv4_keys_on_the_address_itself(self):
+        key = self.key(forwarded="173.245.48.9", connecting="198.51.100.7")
+
+        self.assertEqual("198.51.100.7", key)
+
+    def test_a_direct_caller_cannot_author_its_own_peer(self):
+        """Production was never spoofable here - Traefik strips a client-supplied
+        X-Forwarded-For and appends its own peer, measured 2026-07-28 as twelve forged values
+        landing in one bucket. But that safety lived in the proxy while the docstring claimed
+        this function fell back to the peer by itself. A caller reaching us directly, from a
+        public address, is not a proxy and its chain is ignored.
+
+        The peer here is a genuinely routable address, and it has to be: Python's ipaddress
+        reports is_private == True for the documentation ranges 192.0.2.0/24, 198.51.100.0/24
+        and 203.0.113.0/24, because the predicate means "not globally routable" rather than
+        "RFC1918". Reaching for a TEST-NET address - the obvious thing to write, and what every
+        other address in this file is - makes this test assert the opposite of what it reads as.
+        """
+        key = self.key(socket_peer="8.8.8.8", forwarded="198.51.100.9")
+
+        self.assertEqual("8.8.8.8", key)
+
+    def test_a_non_ip_forwarded_entry_is_not_a_peer(self):
+        """An arbitrary string is a perfectly good dict key, so honouring one would let a
+        caller grow the limiter's table as fast as they can send requests - the leak the
+        _evict_idle docstring names."""
+        key = self.key(forwarded="not-an-ip")
+
+        self.assertEqual("127.0.0.1", key)
+
+
+class AccessLogRedactionTest(unittest.TestCase):
+    """The access log, which the main harness stubs out at YoServerTestCase.request.
+
+    Written against a hand-built handler for exactly that reason: with log_message replaced by
+    a no-op everywhere else, nothing in the suite would notice this regressing.
+    """
+
+    def log_line(self, requestline, code=200):
+        handler = YoRequestHandler.__new__(YoRequestHandler)
+        handler.client_address = ("203.0.113.9", 51000)
+        handler.requestline = requestline
+        handler.request_version = "HTTP/1.1"
+        stream = io.StringIO()
+        with mock.patch("sys.stderr", stream):
+            handler.log_request(code)
+        return stream.getvalue()
+
+    def test_a_block_does_not_record_who_was_blocked(self):
+        """`DELETE /v1/block?username=BOB` beside the caller's IP is a record of who blocked
+        whom, sitting next to a privacy policy that promises the address is kept briefly and
+        only to rate-limit."""
+        line = self.log_line("DELETE /v1/block?username=BOB HTTP/1.1")
+
+        self.assertNotIn("BOB", line)
+        self.assertIn("/v1/block?username=[redacted]", line)
+
+    def test_removing_a_friend_does_not_record_the_friend(self):
+        line = self.log_line("DELETE /v1/friends?username=CAROL HTTP/1.1")
+
+        self.assertNotIn("CAROL", line)
+        self.assertIn("/v1/friends?username=[redacted]", line)
+
+    def test_the_line_is_still_worth_having(self):
+        """Redaction that removed the route or the status would trade a privacy problem for a
+        diagnostic one - this is the only request-level logging the backend has."""
+        line = self.log_line("DELETE /v1/block?username=BOB HTTP/1.1", code=200)
+
+        self.assertIn("203.0.113.9", line)
+        self.assertIn("DELETE", line)
+        self.assertIn("200", line)
+
+    def test_a_request_without_a_query_string_is_untouched(self):
+        line = self.log_line("POST /v1/send HTTP/1.1")
+
+        self.assertIn("POST /v1/send HTTP/1.1", line)
+        self.assertNotIn("redacted", line)
 
 
 if __name__ == "__main__":

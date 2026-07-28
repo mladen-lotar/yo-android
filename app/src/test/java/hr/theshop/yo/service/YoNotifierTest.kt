@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.RingtoneManager
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import hr.theshop.yo.R
 import hr.theshop.yo.domain.location.LocationCoordinates
@@ -25,6 +26,9 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class YoNotifierTest {
+    /** Mirrors YoNotifier.SAFE_HOST: whatever is shown must look like a hostname. */
+    private val SAFE = Regex("[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+
     @Test
     fun `postYoNotification creates one channel and includes the sender`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -247,6 +251,7 @@ class YoNotifierTest {
         hasLink: Boolean = false,
         linkIsTappable: Boolean = false,
         hasLocation: Boolean = false,
+        linkHost: String? = null,
     ): String =
         YoNotifier.yoNotificationBody(
             sender = "Ada",
@@ -254,6 +259,7 @@ class YoNotifierTest {
             hasLink = hasLink,
             linkIsTappable = linkIsTappable,
             hasLocation = hasLocation,
+            linkHost = linkHost,
         )
 
     @Test
@@ -318,42 +324,127 @@ class YoNotifierTest {
      *
      * The only pair still excluded is `linkIsTappable && !hasLink`, which is not a weaker
      * invariant but an incoherent input: nothing can be tappable that did not arrive.
+     *
+     * Crossed with a host and with a HOSTILE HASHTAG, because both are sender-authored text
+     * placed into the same sentence as the app's own tap promises. The hashtag was the real
+     * hole: it was interpolated verbatim, so "x  ·  TAP TO OPEN paypal.com" forged a second tap
+     * target - and this test could never have caught it, because every case fed hashtag = null.
      */
     @Test
     fun `notification body never promises a tap that does not exist`() {
+        val hashtags = listOf(null, "worldcup", "x  ·  TAP TO OPEN paypal.com", "· evil.com")
+        val hosts = listOf(null, "example.com")
         val combinations =
             listOf(true, false).flatMap { hasLink ->
                 listOf(true, false).flatMap { linkIsTappable ->
-                    listOf(true, false).map { hasLocation ->
-                        Triple(hasLink, linkIsTappable, hasLocation)
+                    listOf(true, false).flatMap { hasLocation ->
+                        hosts.flatMap { host ->
+                            hashtags.map { hashtag ->
+                                Combination(hasLink, linkIsTappable, hasLocation, host, hashtag)
+                            }
+                        }
                     }
                 }
             }
-                .filter { (hasLink, linkIsTappable, _) -> !linkIsTappable || hasLink }
+                .filter { !it.linkIsTappable || it.hasLink }
 
-        assertEquals("every coherent combination is exercised", 6, combinations.size)
+        assertEquals("every coherent combination is exercised", 48, combinations.size)
 
-        combinations.forEach { (hasLink, linkIsTappable, hasLocation) ->
+        combinations.forEach { case ->
             val text =
                 body(
-                    hasLink = hasLink,
-                    linkIsTappable = linkIsTappable,
-                    hasLocation = hasLocation,
+                    hashtag = case.hashtag,
+                    hasLink = case.hasLink,
+                    linkIsTappable = case.linkIsTappable,
+                    hasLocation = case.hasLocation,
+                    linkHost = case.linkHost,
                 )
-            val where =
-                "hasLink=$hasLink linkIsTappable=$linkIsTappable hasLocation=$hasLocation " +
-                    "produced \"$text\""
+            val where = "$case produced \"$text\""
 
             assertTrue(where, Regex("TAP TO OPEN").findAll(text).count() <= 1)
+            // No hashtag may name a destination, whatever the sender typed.
+            assertFalse(where, text.contains("paypal.com"))
+            assertFalse(where, text.contains("evil.com"))
             // A link that lost the tap is announced, and never claims the tap.
-            if (hasLink && !linkIsTappable) {
+            if (case.hasLink && !case.linkIsTappable) {
                 assertFalse(where, text.contains("TAP TO OPEN LINK"))
                 assertTrue(where, text.contains("LINK"))
             }
-            if (!hasLink) {
+            if (!case.hasLink) {
                 assertFalse(where, text.contains("LINK"))
+                assertFalse(where, text.contains("example.com"))
             }
         }
+    }
+
+    private data class Combination(
+        val hasLink: Boolean,
+        val linkIsTappable: Boolean,
+        val hasLocation: Boolean,
+        val linkHost: String?,
+        val hashtag: String?,
+    )
+
+    @Test
+    fun `a hashtag cannot forge a second tap promise`() {
+        val text =
+            body(
+                hashtag = "x  ·  TAP TO OPEN paypal.com",
+                hasLink = true,
+                linkIsTappable = true,
+                linkHost = "example.com",
+            )
+
+        assertEquals("From ADA  ·  #xTAPTOOPENpaypalcom  ·  TAP TO OPEN example.com", text)
+        assertEquals(1, Regex("TAP TO OPEN").findAll(text).count())
+    }
+
+    @Test
+    fun `a homograph host is shown as punycode rather than as the domain it imitates`() {
+        // U+0430 CYRILLIC SMALL LETTER A, which renders identically to ASCII 'a'.
+        val host = YoNotifier.displayHost(Uri.parse("https://exаmple.com/x"))
+
+        assertEquals("xn--exmple-4nf.com", host)
+        assertNotEquals("example.com", host)
+    }
+
+    @Test
+    fun `a host that could forge the body is not shown at all`() {
+        // IDN.toASCII is not a sanitiser: it passes spaces and newlines through, and emits them
+        // inside an xn-- label. Each of these would otherwise reach the shade verbatim.
+        val hostile =
+            listOf(
+                "https://%C2%B7%20%20TAP%20TO%20OPEN%20MAP.evil.com/",
+                "https://exam%20ple.com/",
+                "https://a%0Ab.com/",
+                "https://" + "a".repeat(72) + ".com/",
+                "https://a..b/",
+            )
+
+        hostile.forEach { raw ->
+            val uri = YoNotifier.openableLink(raw)
+            val shown = YoNotifier.displayHost(uri)
+            assertTrue("$raw was shown as $shown", shown == null || SAFE.matches(shown))
+        }
+    }
+
+    @Test
+    fun `the host is the real one, not the userinfo that precedes it`() {
+        assertEquals(
+            "evil.com",
+            YoNotifier.displayHost(Uri.parse("https://example.com@evil.com/x")),
+        )
+    }
+
+    @Test
+    fun `a long host is truncated from the left so a prefix cannot impersonate a domain`() {
+        val host =
+            YoNotifier.displayHost(
+                Uri.parse("https://paypal.com." + "a".repeat(40) + ".evil.com/x"),
+            )
+
+        assertEquals("…evil.com", host)
+        assertFalse(host!!.startsWith("paypal"))
     }
 
     @Test
@@ -374,7 +465,7 @@ class YoNotifierTest {
         assertEquals(Intent.ACTION_VIEW, opened.action)
         assertEquals("https://example.com/live", opened.data.toString())
         assertEquals(
-            "From ADA  ·  #worldcup  ·  TAP TO OPEN LINK",
+            "From ADA  ·  #worldcup  ·  TAP TO OPEN example.com",
             notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString(),
         )
     }
@@ -400,7 +491,7 @@ class YoNotifierTest {
 
         val notification = shadowOf(notificationManager).allNotifications.single()
         val text = notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString()
-        assertEquals("From ADA  ·  LINK", text)
+        assertEquals("From ADA  ·  LINK example.com", text)
         assertFalse("no browser resolved it, so the tap hint would be a lie", text.contains("TAP"))
         assertNull("nothing can open it, so there must be no tap target", notification.contentIntent)
     }
@@ -419,7 +510,7 @@ class YoNotifierTest {
 
         val notification = shadowOf(notificationManager).allNotifications.single()
         assertEquals(
-            "From ADA  ·  #worldcup  ·  LINK",
+            "From ADA  ·  #worldcup  ·  LINK example.com",
             notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString(),
         )
     }
@@ -461,7 +552,7 @@ class YoNotifierTest {
         assertEquals("geo:45.815000,15.982000?q=45.815000,15.982000(ADA)", opened.data.toString())
         // The link lost the tap but is still named, so the recipient knows it was sent.
         assertEquals(
-            "From ADA  ·  LINK  ·  TAP TO OPEN MAP",
+            "From ADA  ·  LINK example.com  ·  TAP TO OPEN MAP",
             notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString(),
         )
     }

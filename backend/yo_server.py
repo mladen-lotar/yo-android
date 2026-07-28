@@ -5,6 +5,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -30,6 +31,13 @@ MAX_BODY_BYTES = 2_000_000
 MAX_LINK_BYTES = 2048
 MAX_HASHTAG_BYTES = 140
 
+# A hashtag is interpolated verbatim into the recipient's notification body, which is also where
+# the app writes its own separators and its "TAP TO OPEN" tap promises. Without a charset rule a
+# sender could attach the hashtag "x  ·  TAP TO OPEN paypal.com" and forge a second tap target in
+# somebody else's shade, wearing a name they recognise. \w is Unicode-aware here, so #worldcup and
+# #世界 both pass while spaces, control characters and the separator itself do not.
+HASHTAG_PATTERN = re.compile(r"\A[\w-]+\Z")
+
 # Signup and login are necessarily public - an invitee has no credentials by definition - so
 # they are the abuse surface that replaces the old shared key. Sends are limited per account.
 CREDENTIAL_ATTEMPTS = 10
@@ -48,6 +56,15 @@ CLOUDFLARE_RANGES = tuple(
     for cidr in os.environ.get("YO_CLOUDFLARE_RANGES", "").split(",")
     if cidr.strip()
 )
+
+
+# Everything after a query parameter's "=" up to the next "&" or whitespace. Names are kept so
+# an access-log line still says which route did what; only the values go.
+_QUERY_VALUE = re.compile(r"([?&][A-Za-z0-9_.%\-\[\]]+=)[^&\s\"]*")
+
+
+def _redact_query_values(message: str) -> str:
+    return _QUERY_VALUE.sub(r"\1[redacted]", message)
 
 
 def _parse_ip(raw: str) -> Optional[ipaddress._BaseAddress]:
@@ -214,6 +231,9 @@ of anything to anyone.</p>
   <li><strong>Your friends and blocks</strong>, which are the usernames you added or blocked.</li>
   <li><strong>Your IP address, briefly</strong>, to rate-limit sign-ups and sending. It is not
       retained as a log of who you are.</li>
+  <li><strong>A server access log</strong>, which records the time, the address a request came
+      from, and which route it asked for - but not who you asked about. It rotates and is
+      discarded, and it exists to diagnose faults rather than to build a picture of anyone.</li>
 </ul>
 
 <h2>What passes through without being stored</h2>
@@ -400,6 +420,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         client_id: Optional[str] = None
         username: Optional[str] = None
         if parsed.path == "/v1/broadcast":
+            # Client credentials are guessable in exactly the way a password is, and this was the
+            # one credential-checking route with no limiter at all - signup, login and google all
+            # have one. It shares their bucket deliberately: an attacker must not be able to dodge
+            # the limit by moving between routes.
+            if not self.server.credential_limiter.allow(self._limiter_key()):
+                self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
+                return
             client_id = self._authorize_client()
             if client_id is None:
                 return
@@ -460,10 +487,10 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         would make one global bucket for the whole internet - any single abuser would lock out
         every user.
 
-        The RIGHTMOST X-Forwarded-For entry is the only one this server can trust: a proxy
-        appends the TCP peer there on every request, whether or not it is configured to trust
-        an inbound chain. Position [0] is attacker-chosen, because Cloudflare *forwards* a
-        client-supplied X-Forwarded-For unmodified.
+        The RIGHTMOST X-Forwarded-For entry is the only one this server can trust, and only from
+        a proxy on this host: a proxy appends the TCP peer there on every request, whether or not
+        it is configured to trust an inbound chain. Position [0] is attacker-chosen, because
+        Cloudflare *forwards* a client-supplied X-Forwarded-For unmodified.
 
         CF-Connecting-IP is believed only when that peer is a Cloudflare address. Cloudflare
         rejects any request carrying a client-supplied CF-Connecting-IP and writes the header
@@ -472,10 +499,27 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         the first case; if it is ever removed this falls back to the peer rather than
         reopening the spoof.
         """
-        peer = self.client_address[0] if self.client_address else "unknown"
-        chain = self.headers.get("X-Forwarded-For", "").strip()
-        if chain:
-            peer = chain.split(",")[-1].strip() or peer
+        socket_peer = self.client_address[0] if self.client_address else "unknown"
+        peer = socket_peer
+
+        # Only a reverse proxy on this host may author the chain. Measured 2026-07-28: Traefik
+        # strips a client-supplied X-Forwarded-For and appends its own peer, so production was
+        # never spoofable - twelve forged values landed in one bucket and the 11th request got
+        # its 429. But that safety lived entirely in the proxy, while the comment above promised
+        # this function fell back to the peer on its own. It does now: a direct caller reaches us
+        # from a public address and has its header ignored, so the claim is true without Traefik.
+        parsed_socket = _parse_ip(socket_peer)
+        proxied = parsed_socket is not None and (
+            parsed_socket.is_private or parsed_socket.is_loopback
+        )
+        if proxied:
+            chain = self.headers.get("X-Forwarded-For", "").strip()
+            if chain:
+                # A non-IP entry is not a peer, and keying the limiter on it would let a caller
+                # mint unlimited buckets out of arbitrary strings.
+                forwarded = _parse_ip(chain.split(",")[-1])
+                if forwarded is not None:
+                    peer = str(forwarded)
 
         parsed = _parse_ip(peer)
         if parsed is not None and any(parsed in net for net in CLOUDFLARE_RANGES):
@@ -484,9 +528,39 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 return str(real)
         return peer
 
+    def log_message(self, format: str, *args: Any) -> None:
+        """The access log, with query-string values removed.
+
+        BaseHTTPRequestHandler logs the full request line, so `DELETE /v1/block?username=BOB`
+        sat next to the caller's IP - a record of who was blocked, beside a privacy policy that
+        promises the IP is kept "briefly" and only "to rate-limit sign-ups and sending". A log
+        that rotates at 30 MB keeps it for months, and debugging is not that stated purpose.
+        Parameter names survive so the line is still useful; the values do not.
+
+        Overriding here rather than in log_request is deliberate: log_error funnels through this
+        too, and that is the path that echoes a malformed request line back from send_error.
+        """
+        super().log_message("%s", _redact_query_values(format % args))
+
+    def _limiter_key(self) -> str:
+        """The rate-limit bucket for the caller.
+
+        IPv6 is bucketed to its /64. The smallest allocation a residential customer receives is
+        a /64 - 18 quintillion addresses - so keying on the full address hands every IPv6 client
+        an unlimited supply of fresh buckets, and this limiter is simultaneously the signup-flood
+        control, the login brute-force control, and the only cost control on the 600,000-iteration
+        PBKDF2 that /v1/signup runs. IPv4 keys on the address, where one address is roughly one
+        host. Both are unchanged for `send_limiter`, which keys on the authenticated username.
+        """
+        address = self._client_address()
+        parsed = _parse_ip(address)
+        if isinstance(parsed, ipaddress.IPv6Address):
+            return str(ipaddress.ip_network(f"{address}/64", strict=False).network_address)
+        return address
+
     def _handle_credentials(self, path: str) -> None:
         """POST /v1/signup and POST /v1/login - the only routes that mint a token."""
-        if not self.server.credential_limiter.allow(self._client_address()):
+        if not self.server.credential_limiter.allow(self._limiter_key()):
             self._write_json(
                 HTTPStatus.TOO_MANY_REQUESTS,
                 {"error": "rate_limited"},
@@ -552,7 +626,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 {"error": "google_not_configured"},
             )
             return
-        if not self.server.credential_limiter.allow(self._client_address()):
+        if not self.server.credential_limiter.allow(self._limiter_key()):
             self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
             return
         try:
@@ -780,6 +854,8 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         # rejected by Google, and surface to the sender as a 502 that no retry can ever clear.
         if len(value.encode("utf-8")) > limit:
             raise BadRequestError(f"{key} must be at most {limit} bytes")
+        if key == "hashtag" and not HASHTAG_PATTERN.fullmatch(value.lstrip("#")):
+            raise BadRequestError("hashtag must be letters, digits, underscores or dashes")
         return value
 
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
@@ -857,9 +933,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         client_id: str,
         body: Dict[str, Any],
     ) -> None:
-        message = body.get("message")
-        if message is not None and not isinstance(message, str):
-            raise BadRequestError("message must be a string")
+        # A broadcast Yo carries no content, exactly like every other Yo - the fan-out below sends
+        # the client id as the sender and nothing else. `message` used to be accepted here, type
+        # checked, and then never passed to send_yo: the caller was told their text had gone out
+        # and no subscriber ever saw it. That is G20's defect class in a route of its own, so the
+        # field is refused rather than dropped. Delivering it would be a product change, not a fix.
+        if "message" in body:
+            raise BadRequestError("a broadcast carries no message; a Yo is the whole content")
         tokens = self.server.database.list_subscriber_tokens(client_id)
         delivered_count = 0
         failed_count = 0

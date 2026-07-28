@@ -272,6 +272,7 @@ class HttpYoBackendApi(
         body: String? = null,
     ): BackendResponse =
         withContext(ioDispatcher) {
+            var authenticated = false
             val connection =
                 (URL("$baseUrl$path").openConnection() as HttpURLConnection).apply {
                     requestMethod = method
@@ -280,6 +281,7 @@ class HttpYoBackendApi(
                     setRequestProperty("Accept", "application/json")
                     sessionStore.current()?.let { session ->
                         setRequestProperty("Authorization", "Bearer ${session.token}")
+                        authenticated = true
                     }
                     if (body != null) {
                         doOutput = true
@@ -305,6 +307,19 @@ class HttpYoBackendApi(
                     responseStream?.bufferedReader(Charsets.UTF_8)?.use { reader ->
                         reader.readText()
                     }.orEmpty()
+                // A 401 on a request that CARRIED a token means the token is dead - the server
+                // has no other reason to refuse it. Without this the app kept it forever: the
+                // friends fetch threw, so the home screen showed an error banner and no bands to
+                // tap, and every "TAP TO RETRY" re-issued the same doomed request. The only way
+                // out was finding LOG OUT in the menu. Clearing the session flips SessionStore,
+                // which MainActivity already gates on, so the sign-in screen appears by itself.
+                //
+                // The guard is exact rather than a blanket 401 check: /v1/signup, /v1/login and
+                // /v1/google come through here too and legitimately answer 401 for a wrong
+                // password, but a signed-out caller has no token to attach.
+                if (authenticated && statusCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                    sessionStore.clear()
+                }
                 BackendResponse(statusCode = statusCode, body = responseBody)
             } finally {
                 connection.disconnect()

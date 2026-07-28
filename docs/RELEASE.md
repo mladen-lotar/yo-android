@@ -5,6 +5,16 @@ decisions behind the parts that are not obvious. Written 27 July 2026; revised 2
 the backend moved off the laptop (section 8), the photo feature was removed (section 6), and the
 store icon was found to be in a format Play rejects (section 7).
 
+**Revised again 28 July 2026, second pass.** An audit measured the claims here against the release
+APK, the store assets and the live systems instead of re-reading them, and five were wrong. The
+permission count in section 4 was guessed rather than measured, and its table missed two
+permissions. The screenshots were 32-bit RGBA against a spec that is no-alpha, and are now RGB -
+though one of the two is stale for a different reason (section 7). The full-description placeholder
+in section 7 described copy that already exists in `store/listing.md`, which this document never
+referenced. Section 6's argument for declaring precise location contradicts the code. And section 9
+item 7 told a future operator to check a vendored file list that does not exist anywhere. All five
+are corrected below rather than quietly rewritten.
+
 ## 1. What Play requires, and where it stands
 
 | Requirement | State |
@@ -17,9 +27,10 @@ store icon was found to be in a format Play rejects (section 7).
 | In-app account deletion | Done - menu, DELETE ACCOUNT band |
 | Web account-deletion URL | Done - served at `/delete-account` |
 | 512x512 icon, 1024x500 feature graphic | Done - `store/`, regenerate with `tools/generate-store-assets.py`. Icon is now **32-bit RGBA**; the 24-bit version Play rejects was shipped until 28 Jul 2026, see section 7 |
-| Phone screenshots (min 2) | Done - `store/screenshots/`, captured from the release build |
+| Phone screenshots (min 2) | **Outstanding** - both are **RGB, and Play's spec is no-alpha, so the mode is right**; but `sc-menu.png` predates the BLOCKED band and shows 7 of the app's 8 menu rows. Needs a recapture on a handset, see section 7 |
+| Release artifact matches HEAD | **Outstanding** - the `.aab` must be **rebuilt from HEAD before upload**; the one previously on disk predates the CAMERA removal, see section 4 |
 | Data safety declaration | Answers prepared in section 6; must be typed into the Console |
-| Content rating questionnaire | Outstanding - Console only |
+| Content rating questionnaire | **Answers done, entry outstanding** - fully derived in `store/listing.md`; the questionnaire itself is Console-only |
 | Photo attachment | **Removed** (28 Jul 2026) - it was upload-only and could never be read back; see PRD G24. No `CAMERA` permission at all now |
 | Send confirmation is honest | Done (28 Jul 2026) - `YO!` only on confirmed delivery, `COULDN'T YO <NAME> - TAP TO RETRY` otherwise; see PRD G25 |
 | Link / hashtag actually delivered | Done (28 Jul 2026) - they now reach the recipient's notification instead of only local history. Needed a manifest `<queries>` entry to work at all on Android 11+; see PRD G23 |
@@ -30,7 +41,7 @@ store icon was found to be in a format Play rejects (section 7).
 | FCM for `hr.theshop.yo` | Done - app + both SHA-1s in `yo-theshop` |
 | Google sign-in for `hr.theshop.yo` | Done - all clients in `yo-theshop` (G16 closed); not yet re-verified on device |
 | OAuth consent screen off `orgInternalOnly` | **Outstanding** - Console only, blocks every non-`the-shop.hr` account |
-| App access - credentials for the reviewer | **Outstanding** - a demo account is needed, and it cannot be a Google one; see section 9 |
+| App access - credentials for the reviewer | **Half done** - the declaration and the instructions text are drafted in `store/listing.md`; the demo **account itself still does not exist** and cannot be a Google one. See section 9 item 11 |
 | Closed testing, 12 testers x 14 days | **Unknown** - see section 9 |
 
 ## 2. Toolchain
@@ -96,6 +107,20 @@ Build the bundle:
 ./gradlew :app:bundleRelease
 # app/build/outputs/bundle/release/app-release.aab
 ```
+
+**Rebuild the bundle from HEAD before uploading it, every time.** The `.aab` previously sitting in
+`app/build/outputs/` was built **2h14m before the commit that removed `CAMERA`**, and still declared
+`android.permission.CAMERA` and `<uses-feature android:name="android.hardware.camera">`. Uploading
+it would have contradicted **both** the data safety form in section 6 (which now answers the whole
+*Photos and videos* section "no") and the store listing in section 7 - a permission on the listing
+page for a feature the app does not have, submitted alongside a declaration saying it has no such
+feature.
+
+The general form is worth keeping, because nothing in this repository catches it: **build time is
+not commit time.** A stale artifact is indistinguishable from a fresh one by inspection, `bundleRelease`
+succeeds identically either way, and no check anywhere asserts that the artifact was built from
+HEAD. Verify with `aapt dump permissions` against the bundle you are actually about to upload, not
+against one you built earlier.
 
 Upload `app/build/outputs/mapping/release/mapping.txt` with it, or every crash report arrives
 obfuscated. R8 is on (`isMinifyEnabled`/`isShrinkResources`); the app has no reflective JSON
@@ -195,19 +220,31 @@ than as re-verified on device.
 `AndroidManifest.xml` now declares **six** permissions - `ACCESS_COARSE_LOCATION`,
 `ACCESS_FINE_LOCATION`, `INTERNET`, `POST_NOTIFICATIONS`, `READ_CONTACTS`, `VIBRATE`. It declared
 seven until 28 July 2026; `CAMERA` and its `<uses-feature>` went with the photo removal (section 6,
-and PRD G24). Libraries merge in three more:
+and PRD G24). Libraries merge in **five** more:
 
 | Added | From |
 |---|---|
 | `USE_BIOMETRIC`, `USE_FINGERPRINT` | `androidx.credentials` |
 | `ACCESS_NETWORK_STATE` | Firebase / Play Services |
+| `WAKE_LOCK` | firebase-messaging |
+| `com.google.android.c2dm.permission.RECEIVE` | firebase-messaging |
 
-They are harmless but they appear on the store listing, so the biometric ones will be visible to
+The biometric ones are harmless but they appear on the store listing, so they will be visible to
 users even though the app never asks for a fingerprint. Nothing to fix - just do not be surprised.
 
-The merged total was measured at ten when the manifest declared seven. It has **not** been
-re-measured since `CAMERA` was removed; the arithmetic says nine, and `aapt dump permissions` on the
-next release APK is what would confirm it.
+**Both the count and the table above were wrong until 28 July 2026, and the count was wrong by
+guessing.** This section used to say the merged total "was measured at ten when the manifest
+declared seven", that it had "**not** been re-measured since `CAMERA` was removed", and that "the
+arithmetic says nine". Subtracting one from a stale measurement is not a measurement.
+
+Measured with `aapt dump permissions` on the release APK: **11 real permissions** - the 6 declared
+in `app/src/main/AndroidManifest.xml` plus the 5 merged from libraries above - or **12** if you
+count the self-defined signature permission
+`hr.theshop.yo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`, which the app declares for its own use and
+which no user ever grants. The table listed only three merged permissions and missed `WAKE_LOCK` and
+`com.google.android.c2dm.permission.RECEIVE`, both from firebase-messaging - which is to say it
+missed the two that push delivery depends on. Re-run `aapt dump permissions` after any dependency
+change; the merged manifest is not derivable from the one in the repository.
 
 ## 5. The name
 
@@ -299,9 +336,24 @@ Two things a reviewer will look for, and where they stand:
   `ACCESS_BACKGROUND_LOCATION`. If a reviewer disagrees, the cheapest answer is a one-line
   explanation on the attach sheet rather than a code change.
 
-Precise location is declared because the manifest requests `ACCESS_FINE_LOCATION`. Dropping to
-coarse only would let this be declared as approximate, at the cost of a pin that can be a city
-block out - which for "come and find me" is the whole feature.
+Precise location is declared because the manifest requests `ACCESS_FINE_LOCATION`. **That answer is
+right; the argument this section used to give for it is not, and the two should not be left sitting
+next to each other.**
+
+The old wording justified the declaration by saying that dropping to coarse "would be a pin that can
+be a city block out - which for 'come and find me' is the whole feature". But
+`app/src/main/java/hr/theshop/yo/data/location/FusedOneShotLocationProvider.kt:31` already requests
+`Priority.PRIORITY_BALANCED_POWER_ACCURACY`, **not** `PRIORITY_HIGH_ACCURACY`. The app therefore
+already accepts, at runtime, roughly the accuracy the argument calls unacceptable - the permission
+allows a precise fix, and the code does not ask for one.
+
+**This does not change the data-safety answer.** The manifest declares `ACCESS_FINE_LOCATION`, so
+"precise" is the correct and required declaration whatever the runtime priority is; declaring
+"approximate" while holding the fine permission would be the wrong answer, not a truer one. But one
+of the two is wrong on the merits - either the provider should ask for high accuracy because the
+feature needs it, or the manifest should drop to coarse because it does not - and it is worth naming
+that rather than leaving a justification in this document that the code contradicts. Deciding it is
+a product question (P2 also argues for the cheaper fix), not a release blocker.
 
 ## 7. Store listing
 
@@ -326,7 +378,22 @@ inconsistency worth tidying.
 
 Two screenshots are in `store/screenshots/` (1080x2340, captured from the release build on a
 signed-in S23): the friends list and the menu. Play wants at least 2; more is better, and the
-invite sheet and a delivered notification are the obvious next two. Capture with:
+invite sheet and a delivered notification are the obvious next two.
+
+**Both screenshots are now RGB, and that is the fix rather than the defect.** Play's screenshot spec
+is **no alpha**, and both files were 32-bit RGBA with a fully opaque alpha channel - the exact
+inverse of the icon bug above, and invisible to an eyeball check in exactly the same way. The two
+specs genuinely disagree with each other: hi-res icon 32-bit **with** alpha, feature graphic and
+screenshots 24-bit **without**. Check the mode, never assume consistency across the three.
+
+**`sc-menu.png` is stale and must be recaptured - this one needs a handset.** It shows **7** menu
+bands; the app renders **8**. The missing one is **BLOCKED**, added with G26 on 28 July 2026
+(`MainScreen.kt`), which is the band that makes the moderation answer in section 9 item 10 true. A
+screenshot showing 7 rows is a store listing quietly asserting the app has no unblock surface, in
+the same submission where the content rating questionnaire answers that blocking is the moderation
+control. Recapture it before upload; nothing about this is fixable from the repository.
+
+Capture with:
 
 ```sh
 adb -s <serial> shell screencap -p /sdcard/yo-1.png
@@ -337,17 +404,27 @@ Worth capturing: the friends list with a few bands, the menu, the invite sheet, 
 Yo notification. Note that a pattern-locked Samsung returns an all-black screencap while the
 Bouncer is up - unlock first, or the files look like the app rendered nothing.
 
-Suggested copy:
+**The listing copy lives in `store/listing.md`, and this section used to carry a "FULL DESCRIPTION -
+PLACEHOLDER, TO BE WRITTEN BY HAND" block instead.** That block was obsolete: the copy exists.
+`store/listing.md` holds the app name, the short description, the full description, the App access
+instructions, the category and contact block, and the content rating answers - and until
+28 July 2026 this document **never referenced that file at all**, so a reader following RELEASE.md
+would have concluded the listing was unwritten and written it a second time.
+
+The full description is **2,803 characters against Play's 4,000 limit** and satisfies every
+constraint the placeholder listed: it says what a Yo is, that friends are added explicitly by
+username, that contacts never leave the phone, and it carries the independence statement from
+section 5. It does **not** mention photo attachment, which was the placeholder's one hard
+prohibition - that feature was removed on 28 July 2026 (PRD G24), and a store listing describing a
+feature the app does not have is its own rejection reason.
+
+`store/listing.md` is the source of truth for listing copy. Edit it there, not here; this document
+records release *process*, and duplicating the copy into it is how the two drift.
+
+For quick reference, the two short fields:
 
 - **Title:** `Yo - The Shop` (30 chars max)
 - **Short description:** `One tap. One word. Yo.` (80 chars max)
-
-> **FULL DESCRIPTION - PLACEHOLDER, TO BE WRITTEN BY HAND.**
-> Deliberately not drafted here. When it is written it must cover: what a Yo is; that friends are
-> added explicitly by username; that contacts never leave the phone; and the independence statement
-> from section 5. It must **not** mention photo attachment - that feature was removed on
-> 28 July 2026 (PRD G24), and a store listing describing a feature the app does not have is its own
-> rejection reason.
 
 ## 8. Backend deployment - done 28 July 2026
 
@@ -523,6 +600,17 @@ looks the way it does, and they are what any future host must also satisfy.
    The `yo-cf-only` ipAllowList middleware on the Traefik router is what makes the CF branch
    sound; leaving `YO_CLOUDFLARE_RANGES` empty disables the branch and fails closed.
    After the fix the same probe returns `201` ten times and then `429`.
+   **Two corrections from 28 July 2026** (PRD G32, G33). The forwarded chain is now read **only when
+   the socket peer is private or loopback** - only a proxy on this host may author it. Production was
+   never spoofable, which was *measured*: twelve forged `X-Forwarded-For` values landed in one bucket,
+   ten `400`s then `429`, because Traefik strips a client-supplied header and appends its own peer.
+   But that safety lived **entirely in the proxy**, while the function's own docstring promised it
+   fell back to the peer without one. It does now. And **IPv6 is bucketed to its /64**: a residential
+   customer's smallest allocation is a /64, so keying on the full address handed every IPv6 client an
+   unlimited supply of buckets against the limiter that is also the login brute-force control and the
+   only cost control on a 600,000-iteration PBKDF2. `YO_CLOUDFLARE_RANGES` in production already
+   lists all seven Cloudflare IPv6 ranges alongside the fifteen IPv4 ones, so real users do not
+   collapse into a shared bucket.
 6. **Prove a write after every deploy**, from the public internet rather than from the host, and
    never from `/healthz` alone: `GET /healthz`, `GET /privacy`, `GET /delete-account`, then a real
    signup, register and send from a phone. A read-only database passes every check that only reads.
@@ -652,14 +740,29 @@ from this that are worth carrying forward:
    **The lesson attached to this item has now inverted, and the new form is the dangerous one.**
    It used to read: the launchd job runs `yo_server.py` straight out of the main checkout with no
    deploy step, so anything branch-only is simply absent from production. That is no longer how
-   production is fed. `backend/` is **vendored into `lotar/claude` by an explicit file list** and
-   built into an image, so production is a snapshot taken at deploy time. The failure mode is
-   therefore the opposite one: `yo-android` `main` can be *ahead* of the vendored copy, and
-   nothing anywhere reports the drift - the container keeps serving old code perfectly happily,
-   and the explicit file list means a **newly added** backend file is silently not vendored at
-   all rather than vendored stale. A merge to `main` is no longer a deploy. Redeploying is a
-   separate, deliberate step, and the vendored file list has to be checked whenever the backend
-   gains a module.
+   production is fed. `backend/` is copied into `lotar/claude` and built into an image, so
+   production is a snapshot taken at deploy time. The failure mode is therefore the opposite one:
+   `yo-android` `main` can be *ahead* of the vendored copy, and nothing anywhere reports the drift -
+   the container keeps serving old code perfectly happily. A merge to `main` is no longer a deploy.
+   Redeploying is a separate, deliberate step.
+
+   **The instruction that used to end this item was impossible to follow, so it is deleted.** It
+   said `backend/` is vendored "by an explicit file list", that a **newly added** file is therefore
+   silently not vendored at all, and that "the vendored file list has to be checked whenever the
+   backend gains a module". **There is no file list.** No script, no Makefile, no manifest, in either
+   repository - only a prose line in `modules/yo/CLAUDE.md` in `lotar/claude` asserting that one
+   exists. The only machine-readable step is that repo's `Dockerfile`, which does
+   `COPY backend/*.py ./` - **a glob**.
+
+   That inverts the hazard as well as the remedy. A newly added module is **not** skipped; the glob
+   picks up whatever reaches the vendored directory. The whole risk is the **manual copy** into that
+   directory, which no list would have guarded either. Checking a file list that does not exist is
+   worse than checking nothing, because it reads like a control and stops the reader looking further.
+
+   **What to actually do:** after copying, diff the vendored directory against `yo-android` `main`
+   and confirm the running container matches. Verified that way on 28 July 2026 - all 7 vendored
+   files byte-identical to `main`, and the six `.py` files inside the running container hash-matching
+   them, so production is genuinely running `main` as of that date.
 8. `./gradlew :app:testDebugUnitTest` and `python3 -m unittest discover` in `backend/`.
 9. `./gradlew :app:bundleRelease`, upload the `.aab` and `mapping.txt`.
 10. Fill in the data safety form (section 6) and the content rating questionnaire.
@@ -670,12 +773,16 @@ from this that are worth carrying forward:
     now actually reachable from the UI (PRD G26) — it was not until 28 July 2026, and answering
     "users can block" while shipping a build where they could not would have been false.
 
-    Answer it knowing PRD **G30** is open: `POST /v1/send` requires authentication but **not**
-    friendship, so a stranger can push a link into any guessable username's notification shade, and
-    the notification never shows the destination host. It is bounded — `http`/`https` only — and
-    blocking is reactive by construction, since it only works after the first message lands. If a
-    reviewer probes UGC safety, that is the honest answer and the cheap mitigation (show the host)
-    is a string change.
+    Answer it knowing PRD **G30** is partly closed as of 28 July 2026. `POST /v1/send` still
+    requires authentication but **not** friendship, so a stranger can still push a link into any
+    guessable username's notification shade. What changed is that **the notification now names the
+    destination host**, in punycode, so a homograph domain reads as `xn--…` rather than as the
+    thing it is imitating - and a sender-supplied hashtag can no longer forge a second tap promise
+    beside it, which it could until that day. It remains bounded to `http`/`https`, and blocking
+    remains reactive by construction, working only after the first message lands. The stronger
+    mitigation - requiring friendship to send - is **declined**, with reasoning in G30: one form of
+    it is free for the attacker to defeat and the other is mutual consent under another name, which
+    section 5 of the PRD rejects. That is the honest answer if a reviewer probes UGC safety.
 11. **App access: provide reviewer credentials.** Play's *App access* declaration asks whether any
     part of the app is behind a login. Here all of it is - first launch is the sign-in screen, and
     an unauthenticated install can reach nothing but `/healthz`. So "all functionality is available
@@ -688,11 +795,19 @@ from this that are worth carrying forward:
     password demo account**, which is exactly the path FR9 keeps as the default and which works for
     anybody.
 
+    **The declaration text and the instructions box are already drafted** in `store/listing.md`,
+    under *App access (for the Play reviewer)*, including the explicit warning not to try
+    `CONTINUE WITH GOOGLE`. What does **not** exist is the account itself. That half is outstanding
+    and cannot be done from this repository.
+
     **Pre-seed it with a friend, or the reviewer sees an empty screen.** A new account's home screen
     is deliberately blank until it adds somebody (FR9), so a reviewer who signs in and finds nothing
     has been shown a working app that looks broken. Seed the demo account with at least one
     friendship - ideally a second demo account with a registered device, so a Yo can actually be
-    sent and the notification observed - and say so in the instructions box.
+    sent and the notification observed - and say so in the instructions box. `store/listing.md`
+    records the two conditions that must both hold: the friendship must be seeded in **both**
+    directions, because `list_friends` selects on `owner` only, and the friend must have registered a
+    device at least once or the reviewer's Yo visibly fails with `recipient_unregistered`.
 
     Whatever is seeded, note it here when it is created, and remember it is a real account in the
     production database: it needs deleting after launch, the same way `GTEST` was (PRD §7.1).
