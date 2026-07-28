@@ -3,7 +3,9 @@
 Status: consolidated 2026-07-25 from GitHub issues #1–#7 and #11, then reconciled against the
 historical record of the original app. Last revised 2026-07-26, when Google sign-in (FR10) was
 added on top of the accounts work that closed gaps G3–G7.
-Repo: `mladen-lotar/yo-android` · Package: `com.example.yo` · Baseline commit: `e401a0c`
+Repo: `mladen-lotar/yo-android` · Package: `hr.theshop.yo` (renamed from `com.example.yo`
+2026-07-27 for the Play release) · Baseline commit: `e401a0c`
+Release process and Play requirements: **[RELEASE.md](RELEASE.md)**.
 
 This document is the single source of truth for *what this app is meant to be*. It exists because
 the specification previously lived only in closed GitHub issues, so a reader of the checkout saw a
@@ -495,7 +497,18 @@ is not exposed. The only programmatic route is Firebase auto-creating the pair w
 + SHA-1 is registered in a project that already has Google enabled as a sign-in provider, and that
 needs the project on billing (G15). See §7.1 for what was done instead and the cleanup it implies.
 
-**G16 — the working OAuth clients live in the wrong project.** Because `yo-theshop` has no billing
+**G16 — RESOLVED 27 Jul 2026.** All OAuth clients now live in `yo-theshop`: the `google.com`
+provider is enabled there, and both Android clients were auto-created from the release and debug
+SHA-1s. `yoGoogleClientId` and `YO_GOOGLE_CLIENT_ID` point at `yo-theshop`'s web client, and
+`blocksurge-theshop` retains only `hr.theshop.blocksurge`. Billing was never actually required —
+that was the *Identity Platform* upgrade, not Firebase Auth. What did block it: Android OAuth
+clients are globally unique on (package name, SHA-1), so blocksurge's had to be deleted **first**,
+and nothing but a hand delete in Cloud Console releases them — not removing the SHA-1, not
+`androidApps:remove`, not the IAP API. See `RELEASE.md` §9.3. Not yet re-verified on a handset.
+The consent screen is still `orgInternalOnly`, which is a separate blocker for outside users.
+Original text follows.
+
+**G16 (historic) — the working OAuth clients live in the wrong project.** Because `yo-theshop` has no billing
 and Firebase Auth would not initialize there, the Android app was registered in
 `blocksurge-theshop` (which is billed and already had Google sign-in enabled), and Firebase
 auto-created both clients there. Yo therefore borrows an unrelated project's OAuth identity. It
@@ -549,6 +562,98 @@ established. A registered-but-deviceless account now answers `recipient_unregist
 This discloses nothing new, which is why it does not worsen G9: `_handle_add_friend` and
 `_handle_block` already answer `no_such_user` for names that do not exist, so any authenticated
 caller could already enumerate accounts. The conflation bought no privacy, only a wrong message.
+
+**G19 — the FCM token APIs the app is built on are deprecated.** firebase-messaging 25.x marks
+`FirebaseMessaging.getToken()`, `deleteToken()`, `send()` and
+`FirebaseMessagingService.onNewToken()` deprecated in favour of `register()` / `unregister()` and
+`onRegistered()` / `onUnregistered()`. The replacement is not a rename: `register()` returns no
+token and delivers it asynchronously to the service instead, so registration stops being something
+the app can ask for and retry, and becomes something it can only wait for. That would rewrite the
+retry, the backoff and the `NOT RECEIVING YOS` state added for G17. Deprecated is not removed, and
+the current path is the one proven end-to-end on a handset, so it is suppressed with a comment for
+this release and migrated deliberately afterwards, together.
+
+**G20 — "ATTACH LOCATION" attached nothing the recipient could see. — RESOLVED 2026-07-27,
+verified on device.** `YoMessage` carried latitude and longitude and `MainViewModel.sendYo` filled
+them from a real position fix, but `YoRemoteDeliveryPortImpl.deliver` sent only `recipient` (and
+the photo): the coordinates were written to local Room history and never transmitted. The feature
+was honest about the permission and dishonest about the product - the person receiving the Yo got
+no location, while the sender was shown one attached.
+
+The pair now travels `deliver` → `POST /v1/send` → FCM data payload → the recipient's notification,
+whose tap target opens a map pinned on the sender. Three things about the fix are worth keeping:
+
+- The notification previously had **no `contentIntent` at all**, so it was inert. Received Yos are
+  never written to this device's Room history - `saveSent` is the only writer - which makes the
+  notification the recipient's *only* surface for a shared location. Its body says
+  `TAP TO OPEN MAP` for that reason; a body identical to a plain Yo gives no reason to tap, and the
+  location is gone as soon as the shade is swiped.
+- Coordinates are formatted with `Locale.ROOT` on both ends. The default locale on a Croatian
+  handset renders 45.815 as `45,815`, and a comma is what separates latitude from longitude in a
+  `geo:` URI - the pin would land somewhere else entirely, on the maintainers' own phones, while
+  passing every en-US test.
+- The `geo:` URI carries `?q=` rather than a bare `geo:lat,lng`, which only pans the map. `q=`
+  is what drops the marker, and the parenthesised label is what names it.
+- **The intent names Google Maps explicitly.** Left to the system, `ACTION_VIEW` on a `geo:` URI
+  opened an "Open with" chooser on the test handset, where six applications claim the scheme
+  (Maps, Waze, Uber, Bolt, myAudi, Zoom). `MapIntentFactory` sets the package when Maps is
+  installed and degrades to the chooser, then to a browser, when it is not.
+
+**Still local-only: `link` and `hashtag`.** Both are written to Room and never sent, exactly as the
+location used to be. They are lower stakes - neither implies a transmission the way a location pin
+does, and neither costs a runtime permission - but the same "shows as attached, arrives as nothing"
+mismatch applies, and it should be closed or the fields removed.
+
+**G22 — targetSdk 36 forced edge-to-edge and the menu button fell under the navigation bar. —
+FOUND AND FIXED ON DEVICE 2026-07-27.** Android 15 makes edge-to-edge mandatory for targetSdk 35+,
+so raising the target from 34 changed where the app draws without changing a line of layout code.
+`MainScreen` applied no window insets at all (`AuthScreen` already called `systemBarsPadding`), so
+the list drew under the status bar and the 144px menu FAB ended at y=2304 on a 2340px screen with
+the navigation bar covering everything below roughly y=2190. Measured on an S23: only a ~30px strip
+of the button responded to touch. That button is the sole route to PRIVACY and DELETE ACCOUNT, both
+of which Play requires to be reachable, so this was a release blocker that no unit test could see -
+it needed a real handset. Fixed with vertical `systemBars` content padding on the list and a bottom
+`windowInsetsPadding` on the button; the FAB now occupies y=2016-2160, clear of the bar, and a
+centre tap opens the menu. Horizontal insets are deliberately not applied: the bands are full-bleed
+and padding them would inset their colour from the screen edge.
+
+**G21 — no Cloud project owns `hr.theshop.yo`. — RESOLVED 2026-07-27.** FCM: a Firebase Android app
+for the renamed package in `yo-theshop`. Google sign-in: `yo-theshop` still cannot host it (no
+billing → no Firebase Auth → Firebase never auto-creates the Android OAuth client), so the package
+was also registered in **`blocksurge-theshop`**, which has Google sign-in enabled; adding the two
+SHA-1s there made Firebase auto-create **two `client_type: 1` Android clients**, one per
+fingerprint, alongside the existing web client `973904690282-a4dnbf8b…` the app and backend already
+share. Proven on an S23 with the **release-signed** build: the Credential Manager picker opened -
+no `cmsh:[28444]` - sign-in completed, and the home screen showed the account's friend band.
+This leaves G16 standing: the OAuth clients still live in a borrowed project. Original text follows.
+
+**G21 (original) — no Cloud project owns `hr.theshop.yo`. — FCM HALF RESOLVED 2026-07-27.** A Firebase
+Android app for `hr.theshop.yo` now exists in `yo-theshop`
+(`1:747034506241:android:e5b34b298d59ea5e48bc00`) with **both** SHA-1 fingerprints registered —
+the debug key `BC:E5:5B:00:…` and the new upload key `22:02:ED:E8:…` — and a real
+`google-services.json` fetched from it. Push therefore works for the renamed package, and the
+release build passes its configuration gate. Done entirely through the Firebase Management API
+using the existing `firebase-adminsdk-fbsvc@yo-theshop` service-account key, so it needed no
+interactive login.
+
+**Google sign-in is still blocked.** The returned config carries only a `client_type: 3` (web)
+OAuth client and no `client_type: 1` (Android) one, because Firebase only auto-creates the Android
+client when Google sign-in is enabled on the project — and enabling it needs Firebase Auth, which
+needs billing on `yo-theshop` (G15). So the app still points at the borrowed **blocksurge** web
+client, which has no Android client for `hr.theshop.yo` either. Until one of the two is true —
+billing on `yo-theshop`, or a new Android client registered for `hr.theshop.yo` + the release SHA-1
+in whichever project holds the web client — `CONTINUE WITH GOOGLE` will fail with `cmsh:[28444]`
+for the renamed package. There is no public API for creating an Android OAuth client; it is a
+console action or a billing decision. Original text follows.
+
+**G21 (original) — no Cloud project owns `hr.theshop.yo`.** The package rename invalidates both Google
+integrations at once: `google-services.json` keys the FCM app on the package name, and an Android
+OAuth client is registered as a (package, SHA-1) pair. Neither matches any more. The fix is the
+same project that G16 already called for - one project owning both the FCM app and the OAuth
+clients - now with `hr.theshop.yo` and with **both** signing fingerprints registered: the new
+upload key (`22:02:ED:E8:…`) as well as the debug key (`BC:E5:5B:00:…`). Registering only the
+debug key is the failure that works perfectly in development and breaks for every real user.
+Blocked on `gcloud auth login` / `firebase login`; both CLI tokens are expired.
 
 ---
 

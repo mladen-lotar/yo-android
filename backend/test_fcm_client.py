@@ -112,6 +112,33 @@ class SendYoTest(unittest.TestCase):
         self.assertIsInstance(timestamp, str)
         self.assertGreater(int(timestamp), 1_600_000_000_000)
 
+    def test_an_attached_location_rides_in_the_data_payload(self):
+        configured_client().send_yo(
+            "device-token",
+            "ALICE",
+            latitude=45.815,
+            longitude=15.982,
+        )
+        data = self.transport.payload["message"]["data"]
+        # Strings, not floats: FCM rejects a data message whose values are not strings, and the
+        # handset parses these back to doubles.
+        self.assertEqual("45.815000", data["latitude"])
+        self.assertEqual("15.982000", data["longitude"])
+        self.assertIsInstance(data["latitude"], str)
+
+    def test_a_yo_without_a_location_carries_no_coordinates(self):
+        configured_client().send_yo("device-token", "ALICE")
+        data = self.transport.payload["message"]["data"]
+        self.assertNotIn("latitude", data)
+        self.assertNotIn("longitude", data)
+
+    def test_coordinates_are_formatted_with_a_dot_separator(self):
+        # The handset splits latitude from longitude on a comma, so a comma decimal separator
+        # would corrupt the position rather than fail loudly.
+        self.assertEqual("-33.868800", fcm_client.format_coordinate(-33.8688))
+        self.assertEqual("0.000000", fcm_client.format_coordinate(0))
+        self.assertNotIn(",", fcm_client.format_coordinate(45.815))
+
     def test_request_targets_the_projects_v1_endpoint(self):
         configured_client().send_yo("device-token", "ALICE")
         request = self.transport.requests[-1]

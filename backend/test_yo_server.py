@@ -30,12 +30,16 @@ TEST_PASSWORD = "correct-horse-battery"
 class RecordingFCMClient:
     def __init__(self):
         self.calls = []
+        # Coordinates are recorded separately so the existing (token, sender) assertions - about
+        # twenty of them, none concerned with location - keep saying what they were written to say.
+        self.location_calls = []
         self.result = True
         self.error = None
         self.fail_tokens = set()
 
-    def send_yo(self, fcm_token, sender):
+    def send_yo(self, fcm_token, sender, latitude=None, longitude=None):
         self.calls.append((fcm_token, sender))
+        self.location_calls.append((fcm_token, sender, latitude, longitude))
         if self.error is not None:
             raise self.error
         if fcm_token in self.fail_tokens:
@@ -847,6 +851,140 @@ class FriendsAndBlocksTest(YoServerTestCase):
         )
 
 
+class SendLocationTest(YoServerTestCase):
+    """Gap G20: the app captured a location, stored it locally and never sent it, so the sender
+    was told they had shared a position the recipient could not possibly receive."""
+
+    def send_location(self, latitude, longitude, recipient="BOB"):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device(recipient, "bob-token")
+        return self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": recipient, "latitude": latitude, "longitude": longitude},
+            token=alice_token,
+        )
+
+    def test_attached_location_reaches_the_push(self):
+        status, body = self.send_location(45.815, 15.982)
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(
+            [("bob-token", "ALICE", 45.815, 15.982)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_a_send_without_a_location_carries_none(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice_token)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", None, None)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_negative_coordinates_survive(self):
+        self.send_location(-33.8688, -151.2093)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", -33.8688, -151.2093)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_integer_coordinates_are_accepted_as_numbers(self):
+        self.send_location(45, 16)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", 45.0, 16.0)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_a_lone_coordinate_is_rejected(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": 45.815},
+            token=alice_token,
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+        # Rejected outright rather than sent without the location: silently dropping half a
+        # position tells the sender their location went out when it did not.
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_out_of_range_coordinates_are_rejected(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        for latitude, longitude in ((90.1, 0), (-90.1, 0), (0, 180.1), (0, -180.1)):
+            with self.subTest(latitude=latitude, longitude=longitude):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/send",
+                    {
+                        "recipient": "BOB",
+                        "latitude": latitude,
+                        "longitude": longitude,
+                    },
+                    token=alice_token,
+                )
+                self.assertEqual(400, status)
+
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_the_poles_and_the_antimeridian_are_accepted(self):
+        self.send_location(90, 180)
+
+        self.assertEqual(
+            [("bob-token", "ALICE", 90.0, 180.0)],
+            self.fcm_client.location_calls,
+        )
+
+    def test_non_numeric_coordinates_are_rejected(self):
+        alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+        # True is in this list because bool subclasses int in Python: without an explicit check
+        # it would sail through as the coordinate 1.0. None means "no latitude", which pairs with
+        # a longitude that IS present - rejected by the both-or-neither rule rather than by type.
+        for latitude in ("45.815", None, [45.815], {"lat": 1}, True):
+            with self.subTest(latitude=latitude):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/send",
+                    {"recipient": "BOB", "latitude": latitude, "longitude": 15.982},
+                    token=alice_token,
+                )
+                self.assertEqual(400, status)
+
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_a_blocked_recipient_still_sees_nothing(self):
+        alice_token = self.signup("ALICE")
+        bob_token = self.signup_with_device("BOB", "bob-token")
+        self.request("POST", "/v1/block", {"username": "ALICE"}, token=bob_token)
+
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": 45.815, "longitude": 15.982},
+            token=alice_token,
+        )
+
+        # Same indistinguishable-from-delivered answer as a plain Yo, and no push carrying a
+        # position to somebody who blocked the sender.
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual([], self.fcm_client.calls)
+
+
 class SendTest(YoServerTestCase):
     def test_send_calls_fcm_client_for_registered_recipient(self):
         alice_token = self.signup("ALICE")
@@ -1389,13 +1527,11 @@ class BroadcastTest(YoServerTestCase):
         )
 
 
-class InstallPageTest(unittest.TestCase):
-    """
-    The install page is the landing target of shared invite links.
+class StaticPageTestCase(unittest.TestCase):
+    """Harness for the unauthenticated HTML routes: install, privacy, delete-account.
 
-    Deliberately NOT a subclass of YoServerTestCase: inheriting would re-run every API test a
-    second time under a new name. These routes never touch the database, so the harness here is
-    a stub.
+    Deliberately NOT built on YoServerTestCase: inheriting would re-run every API test a second
+    time under a new name. These routes never touch the database, so the stub below is enough.
     """
 
     def setUp(self):
@@ -1425,6 +1561,10 @@ class InstallPageTest(unittest.TestCase):
         response_head, response_body = handler.wfile.getvalue().split(b"\r\n\r\n", 1)
         status = int(response_head.splitlines()[0].decode("ascii").split(" ", 2)[1])
         return status, response_head.decode("latin-1"), response_body
+
+
+class InstallPageTest(StaticPageTestCase):
+    """The install page is the landing target of shared invite links."""
 
     def test_install_page_is_public_because_invitees_have_no_credential(self):
         status, head, body = self.raw_request("GET", "/install")
@@ -1488,6 +1628,197 @@ class InstallPageTest(unittest.TestCase):
 
         self.assertEqual(401, status)
         self.assertIn(b"unauthorized", body)
+
+
+class PolicyPageTest(StaticPageTestCase):
+    """The two URLs Google Play checks before it will list the app."""
+
+    def test_the_privacy_policy_is_public(self):
+        """Play fetches it without an account, so a 401 here fails review."""
+        status, head, body = self.raw_request("GET", "/privacy")
+
+        self.assertEqual(200, status)
+        self.assertIn("text/html", head)
+        self.assertIn(b"Yo privacy policy", body)
+
+    def test_the_deletion_page_is_public(self):
+        status, head, body = self.raw_request("GET", "/delete-account")
+
+        self.assertEqual(200, status)
+        self.assertIn("text/html", head)
+        self.assertIn(b"Delete your Yo account", body)
+
+    def test_the_privacy_policy_states_that_contacts_stay_on_the_device(self):
+        """This is the app's strongest privacy claim and the one a reviewer will check against
+        the READ_CONTACTS permission."""
+        _, _, body = self.raw_request("GET", "/privacy")
+
+        self.assertIn(b"never a phone number", body)
+
+    def test_the_privacy_policy_points_at_the_deletion_route(self):
+        _, _, body = self.raw_request("GET", "/privacy")
+
+        self.assertIn(b"/delete-account", body)
+
+    def test_both_pages_are_reachable_with_a_trailing_slash(self):
+        for path in ("/privacy/", "/delete-account/"):
+            status, _, _ = self.raw_request("GET", path)
+            self.assertEqual(200, status, path)
+
+    def test_the_pages_carry_no_credential(self):
+        for path in ("/privacy", "/delete-account"):
+            _, _, body = self.raw_request("GET", path)
+            for secret_marker in (b"X-Yo-Token", b"Bearer ", b"YO_SERVER_KEY"):
+                self.assertNotIn(secret_marker, body, path)
+
+
+class DeleteAccountTest(YoServerTestCase):
+    """DELETE /v1/account - the in-app deletion Google Play requires."""
+
+    def test_deleting_an_account_reports_what_it_deleted(self):
+        token = self.signup("ALICE")
+
+        status, body = self.request("DELETE", "/v1/account", token=token)
+
+        self.assertEqual(200, status, body)
+        self.assertEqual({"deleted": True, "username": "ALICE"}, body)
+        self.assertFalse(self.server.database.account_exists("ALICE"))
+
+    def test_deletion_requires_a_credential(self):
+        self.signup("ALICE")
+
+        status, body = self.request("DELETE", "/v1/account", token=None)
+
+        self.assertEqual(401, status)
+        self.assertTrue(self.server.database.account_exists("ALICE"))
+
+    def test_the_token_stops_working_afterwards(self):
+        token = self.signup("ALICE")
+        self.request("DELETE", "/v1/account", token=token)
+
+        status, _ = self.request("GET", "/v1/friends", token=token)
+
+        self.assertEqual(401, status)
+
+    def test_every_device_of_the_account_is_forgotten(self):
+        """Sessions on other devices must die too, or the account is only half-deleted."""
+        first = self.signup("ALICE")
+        status, body = self.request(
+            "POST",
+            "/v1/login",
+            {"username": "ALICE", "password": TEST_PASSWORD},
+            token=None,
+        )
+        self.assertEqual(200, status, body)
+        second = body["token"]
+
+        self.request("DELETE", "/v1/account", token=first)
+
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=second)[0])
+
+    def test_the_username_can_be_claimed_again(self):
+        token = self.signup("ALICE")
+        self.request("DELETE", "/v1/account", token=token)
+
+        status, body = self.request(
+            "POST",
+            "/v1/signup",
+            {"username": "ALICE", "password": TEST_PASSWORD},
+            token=None,
+        )
+
+        self.assertEqual(201, status, body)
+
+    def test_a_deleted_user_disappears_from_other_peoples_friend_lists(self):
+        """The half-deletion that matters most: a name left in someone else's list is tappable,
+        answers recipient_not_found, and cannot be removed by anyone."""
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request("POST", "/v1/friends", {"username": "BOB"}, token=alice)
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        status, body = self.request("GET", "/v1/friends", token=alice)
+        self.assertEqual(200, status)
+        self.assertEqual([], body["friends"])
+
+    def test_blocks_are_cleared_in_both_directions(self):
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request("POST", "/v1/block", {"username": "BOB"}, token=alice)
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        self.assertFalse(self.server.database.is_blocked("ALICE", "BOB"))
+        self.assertEqual([], self.server.database.list_blocked("ALICE"))
+
+    def test_the_registered_device_is_removed(self):
+        alice = self.signup_with_device("ALICE")
+        bob = self.signup_with_device("BOB")
+        self.request("DELETE", "/v1/account", token=bob)
+
+        status, body = self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice)
+
+        # Not "unregistered": there is no account behind the name any more.
+        self.assertEqual(404, status)
+        self.assertEqual("recipient_not_found", body["reason"])
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_photos_the_user_uploaded_are_deleted(self):
+        alice = self.signup("ALICE")
+        self.request(
+            "POST",
+            "/v1/photo",
+            {"message_id": "message-1", "mime_type": "image/jpeg", "data": "d"},
+            token=alice,
+        )
+
+        self.request("DELETE", "/v1/account", token=alice)
+
+        self.assertIsNone(self.server.database.get_photo("message-1"))
+
+    def test_photos_received_from_someone_else_survive(self):
+        """They are the sender's data, and the sender did not ask to be forgotten."""
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request(
+            "POST",
+            "/v1/photo",
+            {
+                "message_id": "message-1",
+                "mime_type": "image/jpeg",
+                "data": "d",
+                "recipient": "BOB",
+            },
+            token=alice,
+        )
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        self.assertIsNotNone(self.server.database.get_photo("message-1"))
+
+    def test_a_deleted_google_account_is_unlinked_not_orphaned(self):
+        """Otherwise the identity still points at a username that no longer exists, and the
+        person can never sign in again with the same Google account."""
+        self.server.google_verifier = StubGoogleVerifier()
+        status, body = self.request(
+            "POST",
+            "/v1/google",
+            {"id_token": "an.id.token", "username": "ALICE"},
+            token=None,
+        )
+        self.assertEqual(201, status, body)
+
+        self.request("DELETE", "/v1/account", token=body["token"])
+
+        status, body = self.request(
+            "POST",
+            "/v1/google",
+            {"id_token": "an.id.token"},
+            token=None,
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("username_required", body["error"])
 
 
 if __name__ == "__main__":

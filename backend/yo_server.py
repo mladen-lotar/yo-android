@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import threading
 import time
@@ -139,6 +140,133 @@ INSTALL_PAGE_TEMPLATE = """<!doctype html>
 """
 
 
+# Google Play requires a privacy policy at a public URL, and - for any app that offers account
+# creation - a web page where deletion can be requested by someone who cannot use the app. Both
+# are served here rather than from a separate host so that they cannot drift away from the
+# implementation they describe.
+DOCUMENT_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#9b59b6">
+<title>{{TITLE}}</title>
+<style>
+  body {
+    background: #9B59B6; color: #fff; margin: 0; padding: 32px 20px 64px;
+    font-family: arial, helvetica, sans-serif; line-height: 1.55;
+  }
+  main { max-width: 40em; margin: 0 auto; }
+  h1 { font-size: 40px; margin: 0 0 4px; letter-spacing: -0.03em; }
+  h2 { font-size: 20px; margin: 32px 0 8px; }
+  p, li { font-size: 16px; }
+  a { color: #fff; }
+  .updated { opacity: 0.85; font-size: 14px; margin-top: 0; }
+</style>
+</head>
+<body>
+<main>
+{{BODY}}
+</main>
+</body>
+</html>
+"""
+
+PRIVACY_PAGE_BODY = """<h1>Yo privacy policy</h1>
+<p class="updated">Last updated 27 July 2026. Yo is published by The Shop.</p>
+
+<h2>The short version</h2>
+<p>Yo sends one word. It needs to know who you are and which device to wake, and it is not
+interested in anything else. There is no advertising, no analytics, no profiling and no selling
+of anything to anyone.</p>
+
+<h2>What we store</h2>
+<ul>
+  <li><strong>Your username.</strong> Chosen by you. It is how friends address you.</li>
+  <li><strong>Your password, hashed.</strong> PBKDF2-HMAC-SHA256. The password itself is never
+      stored and cannot be recovered from what is.</li>
+  <li><strong>A Google account identifier</strong>, if you sign in with Google: only Google's
+      opaque subject id. Your email address is never stored.</li>
+  <li><strong>A notification token</strong> for your device, issued by Firebase Cloud Messaging.
+      Without it a Yo cannot reach your phone.</li>
+  <li><strong>Your friends and blocks</strong>, which are the usernames you added or blocked.</li>
+  <li><strong>Photos you attach</strong> to a Yo, readable only by you and the person you sent
+      it to.</li>
+  <li><strong>Your IP address, briefly</strong>, to rate-limit sign-ups and sending. It is not
+      retained as a log of who you are.</li>
+  <li><strong>Your location, only when you attach it.</strong> Turning on "attach location" for a
+      Yo takes a single position fix and sends it with that Yo, so the person receiving it can
+      open a map. It is passed straight through to the notification and is never written to our
+      database. There is no continuous tracking and no access while the app is in the background:
+      one fix, when you ask for it, for one message.</li>
+</ul>
+
+<h2>What stays on your phone</h2>
+<ul>
+  <li><strong>Your contacts.</strong> If you allow contacts access, Yo reads names on the device
+      to show an invite list. Only a name and a local id are ever held, never a phone number or
+      an email address, and none of it is sent to us or to anyone else. Invitations are sent by
+      whichever messaging app you pick, and Yo never learns who you chose.</li>
+  <li><strong>Your Yo history and groups.</strong> Stored locally and erased when you delete your
+      account or uninstall the app. Links and hashtags you attach are kept here and nowhere
+      else.</li>
+</ul>
+
+<h2>Who else sees it</h2>
+<p>The person you send a Yo to, which is the point of sending it. If you attached a location, they
+see it.</p>
+<p>Google, in two narrow roles: Firebase Cloud Messaging carries the notification to your device -
+including an attached location, since that travels inside the notification - and Google verifies
+the sign-in token if you choose "continue with Google". Nothing is shared with anyone else, and
+nothing is sold.</p>
+
+<h2>How long we keep it</h2>
+<p>Until you delete your account. Then it is gone, in full and immediately.</p>
+
+<h2>Deleting your account</h2>
+<p>In the app: menu, then DELETE ACCOUNT. This erases your account, your friends, your blocks,
+your photos, your notification token and your local history, and removes you from other people's
+friend lists. It cannot be undone. If you cannot use the app, request deletion at
+<a href="/delete-account">/delete-account</a>.</p>
+
+<h2>Children</h2>
+<p>Yo is not directed at children under 13 and we do not knowingly hold their data.</p>
+
+<h2>Your rights</h2>
+<p>You can access, correct or erase what we hold. Deleting your account does all three at once.
+For anything else, write to <a href="mailto:mladen@the-shop.io">mladen@the-shop.io</a>.</p>
+
+<h2>Changes</h2>
+<p>If this policy changes materially we will say so in the app before the change takes effect.</p>
+"""
+
+DELETE_ACCOUNT_PAGE_BODY = """<h1>Delete your Yo account</h1>
+<p class="updated">Yo is published by The Shop.</p>
+
+<h2>The fastest way</h2>
+<p>Open Yo, tap the menu button, then <strong>DELETE ACCOUNT</strong> and confirm. It takes
+effect immediately and needs nothing from us.</p>
+
+<h2>If you cannot open the app</h2>
+<p>Email <a href="mailto:mladen@the-shop.io">mladen@the-shop.io</a> from an address you can be
+reached at, with the username you want deleted. We will verify that the account is yours before
+deleting anything, and confirm once it is done - within 30 days, and normally far sooner.</p>
+
+<h2>What deletion removes</h2>
+<ul>
+  <li>Your account and username, which becomes free for anyone to claim again.</li>
+  <li>Every sign-in session, on every device.</li>
+  <li>Your friends and blocks - and you disappear from other people's friend lists.</li>
+  <li>Your notification token, so no further Yo can reach you.</li>
+  <li>Any photos you sent.</li>
+  <li>Your Yo history and groups held on your own phone.</li>
+</ul>
+<p>Photos other people sent to you are not removed, because they belong to whoever sent them.
+They go when that person deletes their own account.</p>
+<p>Nothing is retained after deletion, and none of it can be undone.</p>
+"""
+
+
 class BadRequestError(ValueError):
     pass
 
@@ -186,6 +314,17 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/install/yo.apk":
             self._handle_install_apk()
             return
+        # Unauthenticated by requirement: Google Play checks both URLs without an account, and
+        # the deletion page exists precisely for people who cannot get into the app.
+        if parsed.path in ("/privacy", "/privacy/"):
+            self._handle_document_page("Yo privacy policy", PRIVACY_PAGE_BODY)
+            return
+        if parsed.path in ("/delete-account", "/delete-account/"):
+            self._handle_document_page(
+                "Delete your Yo account",
+                DELETE_ACCOUNT_PAGE_BODY,
+            )
+            return
         username = self._authenticate()
         if username is None:
             return
@@ -214,6 +353,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/v1/block":
                 self._handle_unblock(username, parsed.query)
+                return
+            if parsed.path == "/v1/account":
+                self._handle_delete_account(username)
                 return
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except BadRequestError as error:
@@ -455,6 +597,24 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         self.server.database.delete_token(yo_auth.hash_token(self._bearer_token()))
         self._write_json(HTTPStatus.OK, {"ended": True})
 
+    def _handle_delete_account(self, username: str) -> None:
+        """Erase the caller's account. Required by Google Play for any app with sign-up.
+
+        The bearer token is the only authorisation asked for. A password would be a second
+        factor for exactly one class of account and none at all for the other: accounts created
+        through Google sign-in have no password, so requiring one would make them undeletable -
+        the opposite of what the policy is for. The destructive confirmation lives in the app.
+
+        Deleting is idempotent from the caller's side: a second attempt with a now-invalid token
+        gets 401, which is indistinguishable from success and gives an interrupted client
+        nothing dangerous to retry into.
+        """
+        deleted = self.server.database.delete_account(username)
+        if not deleted:
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "no_such_user"})
+            return
+        self._write_json(HTTPStatus.OK, {"deleted": True, "username": username})
+
     def _authorize_client(self) -> Optional[str]:
         client_id = self.headers.get("X-Yo-Client-Id", "")
         supplied_key = self.headers.get("X-Yo-Client-Key", "")
@@ -531,8 +691,37 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             {"blocked": self.server.database.list_blocked(username)},
         )
 
+    def _optional_coordinates(
+        self,
+        body: Dict[str, Any],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """The attached location, or (None, None) when the sender did not share one.
+
+        Rejected rather than silently dropped when malformed: a Yo whose location quietly
+        vanished looks to the sender exactly like one that arrived, and they have no way to tell
+        that the recipient never got the pin.
+        """
+        latitude = body.get("latitude")
+        longitude = body.get("longitude")
+        if latitude is None and longitude is None:
+            return None, None
+        if latitude is None or longitude is None:
+            raise BadRequestError("latitude and longitude must be sent together")
+        for name, value in (("latitude", latitude), ("longitude", longitude)):
+            # bool is a subclass of int, so True would otherwise pass as the coordinate 1.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise BadRequestError(f"{name} must be a number")
+            if not math.isfinite(value):
+                raise BadRequestError(f"{name} must be a finite number")
+        if not -90 <= latitude <= 90:
+            raise BadRequestError("latitude must be between -90 and 90")
+        if not -180 <= longitude <= 180:
+            raise BadRequestError("longitude must be between -180 and 180")
+        return float(latitude), float(longitude)
+
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
         recipient = self._target_username(body, key="recipient")
+        latitude, longitude = self._optional_coordinates(body)
         if not self.server.send_limiter.allow(sender):
             self._write_json(
                 HTTPStatus.TOO_MANY_REQUESTS,
@@ -564,7 +753,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            delivered = bool(self.server.fcm_client.send_yo(fcm_token, sender))
+            delivered = bool(
+                self.server.fcm_client.send_yo(
+                    fcm_token,
+                    sender,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
         except FCMNotConfiguredError:
             self._write_json(
                 HTTPStatus.OK,
@@ -720,6 +916,18 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return yo_auth.validate_username(values[0])
         except yo_auth.CredentialError as error:
             raise BadRequestError(str(error)) from error
+
+    def _handle_document_page(self, title: str, body_html: str) -> None:
+        page = DOCUMENT_PAGE_TEMPLATE.replace("{{TITLE}}", title).replace(
+            "{{BODY}}",
+            body_html,
+        )
+        encoded = page.encode("utf-8")
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def _handle_install_page(self) -> None:
         apk = _configured_apk_path()
