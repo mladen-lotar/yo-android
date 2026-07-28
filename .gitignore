@@ -11,4 +11,10 @@
 .cxx
 __pycache__/
 *.pyc
-backend/yo.db
+.kotlin/
+# Every database, not just the live one. `backend/yo.db` alone left
+# `backend/yo.db.migrated-20260728` - a real database with real accounts - one `git add -A` away
+# from a public repo, and its `-journal`/`-wal` siblings with it.
+backend/yo.db*
+backend/*.db
+backend/*.db-journal

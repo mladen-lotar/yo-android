@@ -34,6 +34,19 @@ Optional environment:
 |---|---|
 | `YO_GOOGLE_CLIENT_ID` | `/v1/google` answers `503 google_not_configured`; everything else is unaffected. |
 | `YO_APK_PATH` | `/install` says the download is not published yet. |
+| `YO_CLOUDFLARE_RANGES` | Fails **closed**: `CF-Connecting-IP` is never trusted and every per-IP limiter keys on the socket peer. Safe, but behind a proxy that makes one global bucket for the whole internet, so set it whenever the service is published through Cloudflare. |
+
+`YO_CLOUDFLARE_RANGES` is a comma-separated list of CIDRs. `CF-Connecting-IP` is honoured **only**
+when the request's own peer falls inside one of them, and the peer is read from the **rightmost**
+`X-Forwarded-For` entry — the one a reverse proxy authors from the TCP peer. Do not "simplify" this
+to `X-Forwarded-For[0]`: Cloudflare forwards a client-supplied `X-Forwarded-For` unmodified, so
+position [0] is attacker-chosen, while it *rejects* a client-supplied `CF-Connecting-IP` at the edge
+and writes that header itself. Trusting `CF-Connecting-IP` unconditionally was a measured bypass —
+15 signups against a limit of 10.
+
+The value has a twin at the edge: an allowlist on the proxy is what guarantees the peer is really
+Cloudflare. They are one trust boundary written down twice, so **change them together**; widening
+one alone either breaks routing or reopens the bypass.
 
 The SQLite registry defaults to `backend/yo.db`. Use
 `--database /path/to/yo.db` to select another file. The server binds to
@@ -170,31 +183,49 @@ When a Yo cannot be delivered, `reason` says which of two different things went 
 They were one string until 2026-07-26, which meant a real friend whose registration had failed was
 reported to the sender as a nonexistent user.
 
-## Photo attachment
-
-Upload a base64-encoded photo for a message:
+A Yo may also carry an optional `link` and `hashtag`. Both are forwarded to the recipient in the
+push and **neither is stored**:
 
 ```sh
-curl -X POST http://127.0.0.1:8790/v1/photo \
+curl -X POST http://127.0.0.1:8790/v1/send \
   -H "Authorization: Bearer $YO_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"message_id":"id","mime_type":"image/jpeg","data":"base64","recipient":"friend"}'
+  -d '{"recipient":"friend","link":"https://example.com","hashtag":"lunch"}'
 ```
 
-`message_id` is chosen by the caller, so uploads record an owner: only the uploader may overwrite
-an id, and only the uploader and the named `recipient` may read it back. Everyone else gets 404.
+Both are validated, not sanitised: a non-string, or one over length, fails the whole request with a
+400. Silently dropping an attachment would be indistinguishable to the sender from delivering it,
+which is the failure this validation exists to prevent.
 
-Photo upload request bodies are capped at 2 MB, and the base64 `data` payload
-is capped at approximately 1.4 MB.
-The approximately 1.4 MB cap is measured in actual UTF-8-encoded bytes of the
-`data` field, not Python string length.
+| Bound | Value | Measured in |
+|---|---|---|
+| `MAX_LINK_BYTES` | 2048 | **bytes** of UTF-8, not characters |
+| `MAX_HASHTAG_BYTES` | 140 | **bytes** of UTF-8, not characters |
 
-Fetch the stored photo by message ID:
+The unit is the point, and the constants were renamed from `..._LENGTH` to make it unmissable.
+FCM's data payload caps at roughly 4096 **bytes**, so 2048 astral-plane characters would pass a
+code-point check, be rejected by Google, and come back as a 502 no retry could ever clear.
 
-```sh
-curl 'http://127.0.0.1:8790/v1/photo?message_id=id' \
-  -H "Authorization: Bearer $YO_TOKEN"
-```
+There is a test asserting no table or column retains either value — the privacy policy and the Play
+data-safety declaration both rest on that.
+
+## Photo attachment — removed 2026-07-28
+
+`POST /v1/photo` and `GET /v1/photo` no longer exist, and neither does the `photos` table. Both
+verbs answer `404 {"error":"not_found"}` to an authenticated caller.
+
+The upload worked; nothing could ever read it back. The Android app had no fetch method and the push
+carried no message id to fetch with, so every stored photo was unreachable, unpruned, and described
+by a privacy policy claiming it was readable by the recipient. Delivering it properly needs a
+receive-side persistence layer the app deliberately does not have, so the feature was withdrawn
+rather than finished. Full reasoning: `docs/PRD.md` G24.
+
+If you are probing for these routes, **send a valid token**. Authentication runs before path
+matching, so an unauthenticated request answers `401` for any unknown path and cannot tell a removed
+route from a live one.
+
+The `photos` table is still present on the existing production database — empty, and deliberately
+not dropped; see `docs/PRD.md` §7.
 
 ## Broadcast API (third-party clients)
 

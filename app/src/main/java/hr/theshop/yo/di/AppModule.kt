@@ -8,7 +8,6 @@ import hr.theshop.yo.data.location.FusedOneShotLocationProvider
 import hr.theshop.yo.data.local.GroupDao
 import hr.theshop.yo.data.local.YoDao
 import hr.theshop.yo.data.local.YoDatabase
-import hr.theshop.yo.data.photo.BitmapPhotoEncoder
 import hr.theshop.yo.data.remote.CredentialManagerGoogleIdTokenProvider
 import hr.theshop.yo.data.remote.FirebaseFcmTokenProvider
 import hr.theshop.yo.data.remote.HttpYoBackendApi
@@ -19,7 +18,6 @@ import hr.theshop.yo.data.remote.YoRemoteDeliveryPortImpl
 import hr.theshop.yo.data.repository.GroupRepositoryImpl
 import hr.theshop.yo.data.repository.YoRepositoryImpl
 import hr.theshop.yo.domain.location.OneShotLocationProvider
-import hr.theshop.yo.domain.photo.PhotoEncoder
 import hr.theshop.yo.domain.repository.ContactsRepository
 import hr.theshop.yo.domain.repository.DeviceRegistrationStore
 import hr.theshop.yo.domain.repository.FcmTokenProvider
@@ -117,14 +115,6 @@ abstract class LocationModule {
     abstract fun bindOneShotLocationProvider(
         impl: FusedOneShotLocationProvider,
     ): OneShotLocationProvider
-}
-
-@Module
-@InstallIn(SingletonComponent::class)
-abstract class PhotoModule {
-    @Binds
-    @Singleton
-    abstract fun bindPhotoEncoder(impl: BitmapPhotoEncoder): PhotoEncoder
 }
 
 @Module

@@ -68,7 +68,11 @@ def _draw_centred(image: Image.Image, text: str, width_fraction: float) -> None:
 
 
 def build_icon(size: int = 512) -> Image.Image:
-    icon = Image.new("RGB", (size, size), BRAND)
+    # RGBA, not RGB: Play's hi-res icon is specified as a 32-bit PNG and its uploader rejects a
+    # 24-bit one outright. The square is opaque either way, so this changes the file's format and
+    # not its appearance. The feature graphic below must STAY RGB - that one is specified as
+    # 24-bit with no alpha, so "fixing" it to match would be the actual regression.
+    icon = Image.new("RGBA", (size, size), BRAND)
     _draw_centred(icon, "Yo", width_fraction=0.62)
     return icon
 

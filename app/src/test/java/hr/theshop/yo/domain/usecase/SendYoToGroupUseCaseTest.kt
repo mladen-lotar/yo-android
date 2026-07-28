@@ -2,6 +2,7 @@ package hr.theshop.yo.domain.usecase
 
 import hr.theshop.yo.domain.model.Group
 import hr.theshop.yo.domain.model.YoMessage
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.repository.GroupRepository
 import hr.theshop.yo.domain.repository.YoRepository
 import kotlinx.coroutines.flow.Flow
@@ -60,6 +61,28 @@ class SendYoToGroupUseCaseTest {
         )
     }
 
+    // One outcome per member, not one for the fan-out: the caller cannot say "nobody got it"
+    // unless it can see what happened to each of them.
+    @Test
+    fun `invoke returns one outcome per member`() = runTest {
+        val group =
+            Group(
+                id = "group-1",
+                name = "Friends",
+                memberUsernames = listOf("Ada", "Lin", "Sam"),
+            )
+        val yoRepository = FakeYoRepository(outcome = YoSendOutcome.NotDelivered)
+        val useCase =
+            SendYoToGroupUseCase(
+                groupRepository = FakeGroupRepository(listOf(group)),
+                sendYoUseCase = SendYoUseCase(yoRepository),
+            )
+
+        val outcomes = useCase(sender = "me", groupId = group.id)
+
+        assertEquals(List(3) { YoSendOutcome.NotDelivered }, outcomes)
+    }
+
     @Test
     fun `invoke returns empty list when group does not exist`() = runTest {
         val yoRepository = FakeYoRepository()
@@ -72,7 +95,7 @@ class SendYoToGroupUseCaseTest {
         val result = useCase(sender = "me", groupId = "missing")
 
         assertEquals(0, yoRepository.saveCallCount)
-        assertEquals(emptyList<YoMessage>(), result)
+        assertEquals(emptyList<YoSendOutcome>(), result)
     }
 
     @Test
@@ -93,7 +116,7 @@ class SendYoToGroupUseCaseTest {
         val result = useCase(sender = "me", groupId = group.id)
 
         assertEquals(0, yoRepository.saveCallCount)
-        assertEquals(emptyList<YoMessage>(), result)
+        assertEquals(emptyList<YoSendOutcome>(), result)
     }
 
     private class FakeGroupRepository(
@@ -112,7 +135,9 @@ class SendYoToGroupUseCaseTest {
             groups.firstOrNull { group -> group.id == groupId }
     }
 
-    private class FakeYoRepository : YoRepository {
+    private class FakeYoRepository(
+        private val outcome: YoSendOutcome = YoSendOutcome.Delivered,
+    ) : YoRepository {
         override suspend fun clear() {
             savedMessages.clear()
         }
@@ -120,9 +145,10 @@ class SendYoToGroupUseCaseTest {
         val savedMessages = mutableListOf<YoMessage>()
         var saveCallCount = 0
 
-        override suspend fun saveSent(message: YoMessage) {
+        override suspend fun saveSent(message: YoMessage): YoSendOutcome {
             saveCallCount += 1
             savedMessages += message
+            return outcome
         }
 
         override fun observeHistory(): Flow<List<YoMessage>> = flowOf(savedMessages.toList())

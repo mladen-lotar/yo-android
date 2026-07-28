@@ -50,21 +50,23 @@ interface YoBackendApi {
 
     suspend fun block(username: String): Boolean
 
+    /** Who this account has blocked. Without it a block is a one-way door. */
+    suspend fun fetchBlocked(): List<String>
+
+    suspend fun unblock(username: String): Boolean
+
     /**
-     * [latitude] and [longitude] are sent only when the sender attached their location, and are
-     * relayed to the recipient's device so the Yo can be opened on a map.
+     * Every attachment the sender can add travels here, because the recipient's notification is
+     * the only surface any of it can appear on - received Yos are never written to their device.
+     * Anything omitted from this call is something the sender is shown as attached and the
+     * recipient can never see.
      */
     suspend fun sendYo(
         recipient: String,
         latitude: Double? = null,
         longitude: Double? = null,
-    ): Boolean
-
-    suspend fun uploadPhoto(
-        messageId: String,
-        base64Data: String,
-        mimeType: String,
-        recipient: String?,
+        link: String? = null,
+        hashtag: String? = null,
     ): Boolean
 }
 
@@ -216,10 +218,27 @@ class HttpYoBackendApi(
         }.getOrDefault(false)
     }
 
+    override suspend fun fetchBlocked(): List<String> {
+        val response = execute(method = "GET", path = "/v1/blocked")
+        if (!response.isSuccessful) {
+            throw IOException("Backend returned HTTP ${response.statusCode}")
+        }
+        val blocked = JSONObject(response.body).getJSONArray("blocked")
+        return List(blocked.length()) { index -> blocked.getString(index) }
+    }
+
+    override suspend fun unblock(username: String): Boolean =
+        runCatching {
+            execute(method = "DELETE", path = "/v1/block?username=${encode(username)}")
+                .isSuccessful
+        }.getOrDefault(false)
+
     override suspend fun sendYo(
         recipient: String,
         latitude: Double?,
         longitude: Double?,
+        link: String?,
+        hashtag: String?,
     ): Boolean {
         // No sender field: spoofing another user is impossible because the server reads the
         // sender off the bearer token.
@@ -235,27 +254,14 @@ class HttpYoBackendApi(
                         put("latitude", latitude)
                         put("longitude", longitude)
                     }
+                    link?.takeIf(String::isNotBlank)?.let { put("link", it) }
+                    hashtag?.takeIf(String::isNotBlank)?.let { put("hashtag", it) }
                 }
                 .toString()
         val response = execute(method = "POST", path = "/v1/send", body = body)
+        // Not `isSuccessful` alone: an unconfigured FCM answers 200 with delivered:false, so
+        // treating any 2xx as sent would report every such Yo as having arrived.
         return response.isSuccessful && JSONObject(response.body).optBoolean("delivered", false)
-    }
-
-    override suspend fun uploadPhoto(
-        messageId: String,
-        base64Data: String,
-        mimeType: String,
-        recipient: String?,
-    ): Boolean {
-        val body =
-            JSONObject()
-                .put("message_id", messageId)
-                .put("mime_type", mimeType)
-                .put("data", base64Data)
-                .apply { if (recipient != null) put("recipient", recipient) }
-                .toString()
-        val response = execute(method = "POST", path = "/v1/photo", body = body)
-        return response.isSuccessful && JSONObject(response.body).optBoolean("stored", false)
     }
 
     private fun encode(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())

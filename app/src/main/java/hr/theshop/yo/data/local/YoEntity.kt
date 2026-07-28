@@ -13,5 +13,9 @@ data class YoEntity(
     val hashtag: String?,
     val latitude: Double?,
     val longitude: Double?,
-    val photoUri: String?,
+    // Vestigial: photo attachment was removed, but the column stays because dropping it bumps the
+    // Room schema, and this database has no migrations and no destructive fallback - so a bump
+    // would crash on first open for every install that already exists. It is always null now, and
+    // goes when there is a real reason to write a Migration.
+    val photoUri: String? = null,
 )

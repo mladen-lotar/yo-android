@@ -10,6 +10,7 @@ import hr.theshop.yo.domain.model.PhoneContact
 import hr.theshop.yo.data.remote.AddFriendOutcome
 import hr.theshop.yo.data.remote.YoBackendApi
 import hr.theshop.yo.domain.model.YoMessage
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.repository.ContactsRepository
 import hr.theshop.yo.domain.repository.DeviceRegistrationStore
 import hr.theshop.yo.domain.repository.GroupRepository
@@ -23,6 +24,7 @@ import hr.theshop.yo.domain.usecase.SendYoToGroupUseCase
 import hr.theshop.yo.domain.usecase.SendYoUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.SharingStarted
@@ -55,6 +57,9 @@ class MainViewModel @Inject constructor(
     private val _friends = MutableStateFlow<List<String>>(emptyList())
     val friends: StateFlow<List<String>> = _friends.asStateFlow()
 
+    private val _blocked = MutableStateFlow<List<String>>(emptyList())
+    val blocked: StateFlow<List<String>> = _blocked.asStateFlow()
+
     private val _addFriendOutcome = MutableStateFlow<AddFriendOutcome?>(null)
     val addFriendOutcome: StateFlow<AddFriendOutcome?> = _addFriendOutcome.asStateFlow()
 
@@ -76,6 +81,26 @@ class MainViewModel @Inject constructor(
 
     private val _pushRetrying = MutableStateFlow(false)
     val pushRetrying: StateFlow<Boolean> = _pushRetrying.asStateFlow()
+
+    /**
+     * Send state lives here rather than in the composable because it is the only place it can be
+     * tested: there are no instrumented UI tests in this project, so anything held in a
+     * `remember` is unverifiable. It used to be a `remember` set on tap, which is exactly why a
+     * failed send was indistinguishable from a delivered one.
+     */
+    private val _sendInFlightTo = MutableStateFlow<String?>(null)
+    val sendInFlightTo: StateFlow<String?> = _sendInFlightTo.asStateFlow()
+
+    private val _sendDeliveredTo = MutableStateFlow<String?>(null)
+    val sendDeliveredTo: StateFlow<String?> = _sendDeliveredTo.asStateFlow()
+
+    private val _sendFailure = MutableStateFlow<SendFailure?>(null)
+    val sendFailure: StateFlow<SendFailure?> = _sendFailure.asStateFlow()
+
+    private var failedAttempt: (suspend () -> YoSendOutcome)? = null
+
+    /** Monotonic; only the newest send is allowed to publish an outcome. See [runSend]. */
+    private var sendGeneration = 0
 
     private val _contacts = MutableStateFlow<List<PhoneContact>>(emptyList())
 
@@ -219,7 +244,39 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             backendApi.block(friend)
             loadFriends()
+            loadBlocked()
         }
+    }
+
+    fun unblock(username: String) {
+        viewModelScope.launch {
+            backendApi.unblock(username)
+            loadBlocked()
+        }
+    }
+
+    /** Called when the blocked sheet opens; a stale list here is a list you cannot act on. */
+    fun refreshBlocked() {
+        viewModelScope.launch { loadBlocked() }
+    }
+
+    /**
+     * `internal` purely so the cancellation contract below is assertable. Called from inside
+     * `viewModelScope.launch` everywhere in production, where a rethrown cancellation cancels the
+     * child coroutine and reaches no caller a test could hold - so private, this rule could only
+     * be asserted by reading it.
+     */
+    internal suspend fun loadBlocked() {
+        _blocked.value =
+            try {
+                backendApi.fetchBlocked()
+            } catch (e: CancellationException) {
+                // Not a failed load. A plain runCatching would swallow it here exactly as it
+                // used to in saveSent, and this is the one screen that undoes a one-way door.
+                throw e
+            } catch (e: Throwable) {
+                _blocked.value
+            }
     }
 
     /** Drops the token server-side first, so a stolen copy of it dies with the logout. */
@@ -276,20 +333,31 @@ class MainViewModel @Inject constructor(
         link: String? = null,
         hashtag: String? = null,
         attachLocation: Boolean = false,
-        photoUri: String? = null,
+        label: String = recipient,
     ) {
-        viewModelScope.launch {
+        launchSend(label) {
             val coords = if (attachLocation) locationProvider.getCurrentLocation() else null
             sendYoUseCase(sender = username, recipient = recipient) {
                 copy(
-                    link = link?.takeIf { it.isNotBlank() },
+                    link = normalizeLink(link),
                     hashtag = hashtag?.takeIf { it.isNotBlank() }?.trimStart('#')?.takeIf { it.isNotBlank() },
                     latitude = coords?.latitude,
                     longitude = coords?.longitude,
-                    photoUri = photoUri,
                 )
             }
         }
+    }
+
+    /**
+     * "example.com" is what people type, and the recipient's notification only ever opens http or
+     * https - so without this the most likely input travels the whole way and is then discarded at
+     * the last step, which is the same shows-as-attached-arrives-as-nothing failure the delivery
+     * work exists to remove. Anything already carrying a scheme is left exactly as typed, so a
+     * deliberate non-web scheme is still rejected later rather than rewritten into a web one.
+     */
+    internal fun normalizeLink(raw: String?): String? {
+        val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return if (SCHEME_PREFIX.containsMatchIn(trimmed)) trimmed else "https://$trimmed"
     }
 
     fun createGroup(name: String, memberUsernames: List<String>) {
@@ -298,9 +366,85 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    fun sendYoToGroup(groupId: String) {
-        viewModelScope.launch {
-            sendYoToGroupUseCase(sender = username, groupId = groupId)
+    fun sendYoToGroup(groupId: String, label: String) {
+        launchSend(label) {
+            collapse(sendYoToGroupUseCase(sender = username, groupId = groupId))
         }
+    }
+
+    /**
+     * One verdict for a fan-out. Anything short of everybody is reported as not delivered: the
+     * sender cannot tell which member missed it, so claiming success because the loop finished
+     * is the same lie as the old unconditional flash, one level up.
+     */
+    private fun collapse(outcomes: List<YoSendOutcome>): YoSendOutcome =
+        when {
+            outcomes.isEmpty() -> YoSendOutcome.NotDelivered
+            outcomes.all { it == YoSendOutcome.Delivered } -> YoSendOutcome.Delivered
+            outcomes.all { it == YoSendOutcome.Unreachable } -> YoSendOutcome.Unreachable
+            else -> YoSendOutcome.NotDelivered
+        }
+
+    private fun launchSend(label: String, block: suspend () -> YoSendOutcome) {
+        viewModelScope.launch { runSend(label, block) }
+    }
+
+    private suspend fun runSend(label: String, block: suspend () -> YoSendOutcome) {
+        // Nothing stops the user tapping a second band while the first send is still open, and
+        // the two can finish in either order. Without this token a slow send to Alice lands its
+        // verdict after a fast send to Bob, leaving Bob's "YO!" on screen beside Alice's failure
+        // - and the retry row would then re-issue whichever attempt happened to be stored last,
+        // sending a second Yo to Bob under Alice's name.
+        val generation = ++sendGeneration
+        _sendInFlightTo.value = label
+        _sendFailure.value = null
+        _sendDeliveredTo.value = null
+        val outcome =
+            try {
+                block()
+            } catch (e: CancellationException) {
+                if (generation == sendGeneration) {
+                    _sendInFlightTo.value = null
+                }
+                throw e
+            } catch (e: Throwable) {
+                // getCurrentLocation() is the one step outside saveSent's own handling.
+                YoSendOutcome.Unreachable
+            }
+        if (generation != sendGeneration) {
+            // Superseded. The newer send owns every one of these fields now.
+            return
+        }
+        _sendInFlightTo.value = null
+        if (outcome == YoSendOutcome.Delivered) {
+            _sendDeliveredTo.value = label
+        } else {
+            // Kept together with the failure, never in a separate slot: they must describe the
+            // same attempt or the retry silently addresses somebody else.
+            failedAttempt = block
+            _sendFailure.value = SendFailure(label, outcome)
+        }
+    }
+
+    /** Re-issues the attempt that failed. The failures that produce it are usually transient. */
+    fun retrySend() {
+        val failure = _sendFailure.value ?: return
+        val attempt = failedAttempt ?: return
+        if (_sendInFlightTo.value != null) {
+            return
+        }
+        viewModelScope.launch { runSend(failure.label, attempt) }
+    }
+
+    /** Ends the "YO!" flash. Driven by the composable's timer, so the duration stays a UI concern. */
+    fun clearSendDelivered() {
+        _sendDeliveredTo.value = null
+    }
+
+    data class SendFailure(val label: String, val outcome: YoSendOutcome)
+
+    private companion object {
+        /** RFC 3986 scheme: letter, then letters/digits/+/-/. up to the colon. */
+        val SCHEME_PREFIX = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:")
     }
 }

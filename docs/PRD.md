@@ -1,8 +1,11 @@
 # Yo (Android) — Product Requirements Document
 
 Status: consolidated 2026-07-25 from GitHub issues #1–#7 and #11, then reconciled against the
-historical record of the original app. Last revised 2026-07-26, when Google sign-in (FR10) was
-added on top of the accounts work that closed gaps G3–G7.
+historical record of the original app. Google sign-in (FR10) was added 2026-07-26 on top of the
+accounts work that closed gaps G3–G7. Last revised 2026-07-28: the backend moved off the laptop
+onto real hosting (§7), §7.1/§7.2 were reconciled against the live Google projects — several
+identity values recorded here had been stale since the package rename — and the pre-release audit
+promoted G20's tail to G23 and opened G23–G30, one of which removes a shipped feature (photos, G24).
 Repo: `mladen-lotar/yo-android` · Package: `hr.theshop.yo` (renamed from `com.example.yo`
 2026-07-27 for the Play release) · Baseline commit: `e401a0c`
 Release process and Play requirements: **[RELEASE.md](RELEASE.md)**.
@@ -59,10 +62,10 @@ recipient and one tap. Optional attachments must never become required steps.
 No background polling, no periodic sync, no always-on foreground "listening" service, and no
 continuous location listener. Location is a one-shot fetch at send time.
 
-**P3 — DRY: one send pipeline.** `SendYoUseCase` is the single send path. Links, hashtags,
-location, groups, and photos all *extend* it. Group send resolves to N calls through the same
-pipeline, never a parallel implementation. Similarly `YoNotifier` is the only code that posts a
-notification — both the local and the remote path terminate there.
+**P3 — DRY: one send pipeline.** `SendYoUseCase` is the single send path. Links, hashtags, location
+and groups all *extend* it. Group send resolves to N calls through the same pipeline, never a
+parallel implementation. Similarly `YoNotifier` is the only code that posts a notification — both
+the local and the remote path terminate there. (Photos extended it too until 2026-07-28; see G24.)
 
 **P4 — No runtime LLM in the app.** Local LLMs and a Fable-tier orchestrator were used to *build*
 this app. Shipping an on-device or networked model at runtime would directly violate P2 and is
@@ -78,6 +81,11 @@ why, so absence is never mistaken for incompleteness.
 FR1–FR8 are implemented and verified on a physical Galaxy S25 (SM_S931B) against the live backend.
 FR9 is implemented and covered by tests, but has **not** yet been exercised on the phone — it landed
 while the device was disconnected, and it is a breaking change for the installed build (§7).
+
+**FR6 is the exception: it was withdrawn on 2026-07-28.** It is kept below with its number and its
+original text, marked as removed, because a requirement that was deliberately dropped is a decision
+worth being able to find — deleting it would leave the numbering with a hole and the reasoning
+nowhere. See G24.
 
 ### FR1 — Send a Yo (historical: 2014-04-01 core)
 Single "Yo" button sends to the selected friend. Persisted to Room as local history, rendered as
@@ -105,6 +113,28 @@ notification itself — both paths are covered by `YoNotifierTest`.
 ### FR3 — Links and hashtags (historical: 2014-08)
 Optional link and hashtag fields on the send screen, carried as nullable fields on `YoMessage`
 through the same pipeline. A user-supplied leading `#` is not double-prefixed when rendered.
+
+**They are delivered to the recipient as of 2026-07-28.** Until then both were written to local
+Room history and never transmitted — the same "shows as attached, arrives as nothing" mismatch that
+G20 was about for location. They now ride `sendYo` → `POST /v1/send` → the FCM data payload → the
+recipient's notification: a hashtag renders inline in the body, and a link makes the notification
+tappable. See G20's closing note.
+
+Two properties of that path are deliberate:
+
+- **The backend rejects rather than drops.** A `link` or `hashtag` that is not a string, or is over
+  length, fails the request with a 400. A silently-dropped attachment is indistinguishable to the
+  sender from a delivered one, which is the exact failure this change exists to end — so the send
+  fails loudly instead.
+- **The bound is in bytes, not characters.** `MAX_LINK_BYTES = 2048` and `MAX_HASHTAG_BYTES = 140`
+  are checked against `len(value.encode("utf-8"))`. FCM's data payload caps at roughly 4096 **bytes**,
+  so 2048 astral-plane characters would have passed a code-point check, been rejected by Google, and
+  surfaced as a 502 that no amount of retrying could ever clear — a failure that looks like an
+  outage and is actually a validation bug. The constants were renamed from `..._LENGTH` so the unit
+  is impossible to misread at the call site.
+- **Neither is stored server-side.** The backend validates and forwards; no table or column holds
+  either. There is a test asserting that, because it is the claim the privacy policy and the data
+  safety form both rest on, and a schema change could quietly falsify it.
 *Source: issues #4, #11.*
 
 ### FR4 — Location attach (historical: 2014-10)
@@ -118,17 +148,32 @@ A Room-backed Group of member usernames. One tap Yos every member, implemented a
 resolution followed by N sends through the existing pipeline (P3).
 *Source: issue #5.*
 
-### FR6 — Photo attach (historical: 2015-06 v2)
-Capture via camera or pick from gallery, JPEG-encoded with full 8-case EXIF orientation correction
-(rotate/flip/transpose) and a long-edge cap of `UPLOAD_MAX_EDGE_PX = 1280`, uploaded to the backend
-and fetched back byte-identically. Camera permission denial does not crash. No video and no
-multi-photo — neither shipped in the original.
+### FR6 — Photo attach — **WITHDRAWN 2026-07-28** (historical: 2015-06 v2)
+**This requirement no longer describes the app.** The feature was removed rather than completed;
+the full reasoning, and what finishing it would have cost, is in G24. The app has no camera or
+gallery UI, no `CAMERA` permission, and the backend has no photo routes. §5 records the omission
+alongside the other deliberate ones.
+
+Original text, kept so the decision is legible: *Capture via camera or pick from gallery,
+JPEG-encoded with full 8-case EXIF orientation correction (rotate/flip/transpose) and a long-edge
+cap of `UPLOAD_MAX_EDGE_PX = 1280`, uploaded to the backend and fetched back byte-identically.
+Camera permission denial does not crash. No video and no multi-photo — neither shipped in the
+original.*
+
+What that text never said, and what turned out to be the whole problem, is that "fetched back
+byte-identically" was only ever true of the **uploader**. No recipient could fetch anything: the app
+had no fetch method and the push carried no message id to fetch with.
 *Source: issue #7.*
 
 ### FR7 — Public broadcast API (historical: World Cup / FedEx / IFTTT integrations)
 Authenticated `POST /v1/broadcast` lets a registered third-party client broadcast a Yo to its
 subscribers, reusing FCM fan-out. Client credentials are `X-Yo-Client-Id` plus `X-Yo-Client-Key`,
 verified against a stored hash. Backend-only; no Android changes.
+
+**It exists and has never been used.** Checked against the production database on 2026-07-28:
+`api_clients` and `subscriptions` are both **0 rows**. No client has ever been provisioned, so no
+broadcast has ever been sent, and the whole surface is unexercised outside its unit tests. That is
+worth knowing before trusting it, and worth weighing against the alternative of removing it.
 *Source: issue #6.*
 
 ---
@@ -190,10 +235,20 @@ return byte-identical 401s, so the endpoint cannot be used to enumerate who exis
 
 Signup and login must be public — an invitee has no credential by definition — so they, not the old
 shared key, are now the abuse surface. Both are rate limited per caller IP (10 per 15 minutes) and
-sends per account (60 per minute). The limiter keys on `CF-Connecting-IP`, because the service is
-published through a Cloudflare tunnel and every socket therefore reports `127.0.0.1`: keying on the
-socket would have made one global bucket for the entire internet and turned a single abuser into a
-lockout for every user.
+sends per account (60 per minute). The limiter cannot key on the socket, because the service is
+published through Cloudflare and every socket reports the proxy: one global bucket for the entire
+internet, turning a single abuser into a lockout for every user.
+
+It therefore keys on `CF-Connecting-IP`, **but only when the request's peer is itself a Cloudflare
+address** — the peer being the *rightmost* `X-Forwarded-For` entry, which the reverse proxy authors
+from the TCP peer, checked against `YO_CLOUDFLARE_RANGES`. Anything else keys on the peer. Trusting
+`CF-Connecting-IP` unconditionally, as this originally did, was a **measured bypass: 15 signups
+against a limit of 10**, since any client may set that header directly. `X-Forwarded-For[0]` is not
+a fix either — Cloudflare forwards a client-supplied `X-Forwarded-For` unmodified, so position [0]
+is attacker-chosen, while it *rejects* a client-supplied `CF-Connecting-IP` at the edge and writes
+that header itself. Empty ranges fail closed to the socket peer. See RELEASE.md §8.3 and §8.7 item
+5: the `yo-cf-only` allowlist on the edge router and `YO_CLOUDFLARE_RANGES` in the application are
+one trust boundary stated twice, and must change together.
 
 **Friends.** `list_friends` returns the people you added, never the user table. Adding is
 unilateral and needs no acceptance — that is how Yo worked, and why "Yo <USERNAME>" was something
@@ -206,9 +261,16 @@ The visible consequence is that a new account's home screen is **empty** until i
 the menu gained an **ADD FRIEND** band — the counterpart of Yo's own "FIND FRIENDS" row. Without it
 this change would have shipped a blank app.
 
-**Photos** are now scoped too: uploads record an owner and an optional recipient, only those two can
-read one back, and only the owner can overwrite a `message_id` (which the client chooses, so
-otherwise anyone could clobber anyone's photo by reusing their id).
+**Photos** were scoped by this work too — uploads recorded an owner and an optional recipient, only
+those two could read one back, and only the owner could overwrite a `message_id`. That scoping is
+gone with the routes it protected (G24, 2026-07-28); it is noted here only because the access-control
+model above is otherwise described as covering every stored object, and photos were the one object
+type that has since stopped existing.
+
+**Blocking, removing a friend and unblocking are reachable from the UI as of 2026-07-28.** All three
+were implemented, backed by these endpoints and covered by passing tests, and none of them was
+called by any Composable — see G26. The control FR9 names as *the* control on unwanted Yos was, in
+the shipped build, not a control the user could reach.
 *Source: this task. Historical claims about uppercase usernames and unilateral adds follow Yo's own
 API documentation and the well-documented spammability of the original.*
 
@@ -255,17 +317,30 @@ start. See §7 for the one console value needed to switch it on.
 
 ## 4. Technical requirements
 
-**Android.** Kotlin, Jetpack Compose, Hilt, Room, Coroutines. minSdk 24, targetSdk 34, compileSdk
-34. Gradle/AGP/Compose-BOM version pins reused from the sibling `anon-chat-android` project rather
+**Android.** Kotlin, Jetpack Compose, Hilt, Room, Coroutines. minSdk 24, targetSdk **36**,
+compileSdk **36** — raised from 34 for the Play release, which is what forced mandatory
+edge-to-edge and produced G22.
+Gradle/AGP/Compose-BOM version pins reused from the sibling `anon-chat-android` project rather
 than re-derived. Build tooling only — none of that project's crypto, Signal-protocol, or BLE-mesh
 code is relevant here.
 
 **Backend.** Python ≥ 3.10 (uses PEP-604 `X | Y` annotations — 3.9 fails to import),
-`ThreadingHTTPServer` + SQLite, `google-auth` as the only runtime dependency, used for configured
-FCM delivery and for verifying Google ID tokens (FR10). Endpoints: `/healthz`, `/install`,
-`/v1/signup`, `/v1/login`, `/v1/google`, `/v1/session` (DELETE), `/v1/register`, `/v1/friends`
-(GET/POST/DELETE), `/v1/block` (POST/DELETE), `/v1/blocked`, `/v1/send`, `/v1/photo` (POST + GET),
-`/v1/broadcast`.
+`ThreadingHTTPServer` + SQLite, `google-auth` as the only runtime dependency — **pinned to 2.56.2**
+since 2026-07-28, so a rebuild cannot silently change the library that verifies Google ID tokens —
+used for configured FCM delivery and for verifying Google ID tokens (FR10). Endpoints: `/healthz`,
+`/install`, `/privacy`, `/delete-account`, `/v1/signup`, `/v1/login`, `/v1/google`, `/v1/session`
+(DELETE), `/v1/register`, `/v1/friends` (GET/POST/DELETE), `/v1/block` (POST/DELETE),
+`/v1/blocked`, `/v1/send`, `/v1/account` (DELETE), `/v1/broadcast`.
+
+`/v1/photo` (POST + GET) was removed on 2026-07-28 with the feature (G24). Both verbs now answer
+`404 {"error":"not_found"}` to an authenticated caller. The tests that assert this deliberately send
+a **valid token**, and one of them exists only to say why: authentication runs before path matching,
+so an unauthenticated probe answers `401` for any unknown path and would pass identically against a
+server still serving photos.
+
+`/privacy` and `/delete-account` are public HTML pages, not API routes, and Play requires both to
+stay reachable — it re-checks them after launch. `DELETE /v1/account` is the in-app half of the
+same requirement.
 
 `google-auth` is imported lazily, inside the verifier. A deployment that has not installed it
 serves every other route normally and answers 503 on `/v1/google`, rather than refusing to start
@@ -275,14 +350,19 @@ Schema changes are additive — the only mechanism is `CREATE TABLE IF NOT EXIST
 `ALTER TABLE ... ADD COLUMN`, so an existing database gains the new tables on next start and needs
 no migration step.
 
-**Auth.** Public: `/healthz`, the `/install` pages, and `/v1/signup` + `/v1/login` (which mint
-credentials and so cannot require one). Everything else requires a bearer token, resolved to an
-account server-side. Broadcast clients keep their separate `X-Yo-Client-Id` / `X-Yo-Client-Key`
+**Auth.** Public: `/healthz`, the `/install`, `/privacy` and `/delete-account` pages, and
+`/v1/signup` + `/v1/login` + `/v1/google` (which mint credentials and so cannot require one).
+Everything else requires a bearer token, resolved to an account server-side. Broadcast clients keep their separate `X-Yo-Client-Id` / `X-Yo-Client-Key`
 pair verified against a stored hash — that path is unchanged. See FR9.
 
 **Configuration.** `yoBackendUrl` and `yoInviteUrl` come from Gradle properties or the gitignored
-`local.properties`, baked into `BuildConfig`; the backend defaults to `http://10.0.2.2:8790` for
-emulator use. There is deliberately **no** `yoBackendKey` and no `YO_SERVER_KEY` — see FR9.
+`local.properties`, baked into `BuildConfig`. There are **no defaults at all** — a missing value
+fails any task that produces an APK or a bundle, naming what is absent. An earlier revision of this
+document said the backend URL "defaults to `http://10.0.2.2:8790` for emulator use"; that default
+was removed precisely because it is the failure that hides itself, an APK that installs, launches,
+looks healthy and silently reaches no server. See RELEASE.md §3 and the repository README, which
+have said this correctly all along. There is deliberately **no** `yoBackendKey` and no
+`YO_SERVER_KEY` — see FR9.
 The Firebase Gradle plugin is applied only if `app/google-services.json` exists, so the app builds
 and runs without Firebase configured.
 
@@ -388,6 +468,7 @@ Recorded rather than smoothed over:
 | User profiles | 2014-08 | Out of scope from the T1 breakdown; nothing in the product depends on it. |
 | IFTTT integration | original API era | Explicitly deferred — no fleet infrastructure for it. The `/v1/broadcast` endpoint is the generic substitute. |
 | iOS / Windows Phone | original platforms | Android-only reimplementation by request. |
+| Photo attachment | 2015-06 v2 | **Shipped, then withdrawn 2026-07-28 (G24).** It was upload-only — no recipient could ever fetch one — so it cost a `CAMERA` permission, unbounded unpruned storage, and a false claim in the live privacy policy, and bought nothing. Delivering it properly needs a receive-side persistence layer the app deliberately does not have. Reinstating it is a real project, not a revert. |
 | Video, multi-photo | never shipped in Yo | Would exceed the original feature set. |
 | E2E encryption, mesh relay | never in Yo | Available in a sibling repo; importing it would contradict P5. |
 | Runtime LLM features | n/a | Violates P2 — see P4. |
@@ -437,8 +518,8 @@ The true causes were dispatch starvation on Room's fixed four-thread `ArchTaskEx
 `SELECT` against an *empty* in-memory database failed to complete within 10s under load) and Room's
 lazy open charging the one-time SQLite open and schema creation to whichever test ran first. Fixed
 by giving Room the test dispatcher as its query and transaction executor, forcing the database open
-in `@Before`, injecting a dispatcher into `BitmapPhotoEncoder`, and moving fixture creation out of
-the timed block. Verified by reproduction, not assertion: 5/5 runs failed before the fix under 300
+in `@Before`, injecting a dispatcher into `BitmapPhotoEncoder` (a class since deleted with the photo
+feature, G24), and moving fixture creation out of the timed block. Verified by reproduction, not assertion: 5/5 runs failed before the fix under 300
 CPU spinners, 5/5 passed after at equal or heavier load, with no assertion changed.
 
 **G7 — No CI. — RESOLVED 2026-07-26.** `.github/workflows/ci.yml` runs both suites on every push to
@@ -575,8 +656,9 @@ this release and migrated deliberately afterwards, together.
 
 **G20 — "ATTACH LOCATION" attached nothing the recipient could see. — RESOLVED 2026-07-27,
 verified on device.** `YoMessage` carried latitude and longitude and `MainViewModel.sendYo` filled
-them from a real position fix, but `YoRemoteDeliveryPortImpl.deliver` sent only `recipient` (and
-the photo): the coordinates were written to local Room history and never transmitted. The feature
+them from a real position fix, but `YoRemoteDeliveryPortImpl.deliver` sent only `recipient` (and,
+at the time, the photo id — since removed, G24): the coordinates were written to local Room history
+and never transmitted. The feature
 was honest about the permission and dishonest about the product - the person receiving the Yo got
 no location, while the sender was shown one attached.
 
@@ -599,10 +681,13 @@ whose tap target opens a map pinned on the sender. Three things about the fix ar
   (Maps, Waze, Uber, Bolt, myAudi, Zoom). `MapIntentFactory` sets the package when Maps is
   installed and degrades to the chooser, then to a browser, when it is not.
 
-**Still local-only: `link` and `hashtag`.** Both are written to Room and never sent, exactly as the
-location used to be. They are lower stakes - neither implies a transmission the way a location pin
-does, and neither costs a runtime permission - but the same "shows as attached, arrives as nothing"
-mismatch applies, and it should be closed or the fields removed.
+**The tail of this entry — `link` and `hashtag` — became G23 and is now closed.** It used to read
+that both were written to Room and never sent, exactly as the location used to be, and that the
+mismatch "should be closed **or the fields removed**". Both routes were taken, one per feature: link
+and hashtag were closed by delivering them (G23), and the photo attachment was closed by removing it
+(G24). The same sentence sanctioned both, and which one is right depends entirely on whether the
+feature can be finished cheaply — it could for a 2 KB string riding an existing payload, and could
+not for a binary needing a receive-side store the app does not have.
 
 **G22 — targetSdk 36 forced edge-to-edge and the menu button fell under the navigation bar. —
 FOUND AND FIXED ON DEVICE 2026-07-27.** Android 15 makes edge-to-edge mandatory for targetSdk 35+,
@@ -625,7 +710,9 @@ SHA-1s there made Firebase auto-create **two `client_type: 1` Android clients**,
 fingerprint, alongside the existing web client `973904690282-a4dnbf8b…` the app and backend already
 share. Proven on an S23 with the **release-signed** build: the Credential Manager picker opened -
 no `cmsh:[28444]` - sign-in completed, and the home screen showed the account's friend band.
-This leaves G16 standing: the OAuth clients still live in a borrowed project. Original text follows.
+At the time this left G16 standing, with the OAuth clients in a borrowed project. **That is no
+longer true**: G16 closed later the same day and every client now lives in `yo-theshop` (§7.1).
+Original text follows.
 
 **G21 (original) — no Cloud project owns `hr.theshop.yo`. — FCM HALF RESOLVED 2026-07-27.** A Firebase
 Android app for `hr.theshop.yo` now exists in `yo-theshop`
@@ -655,68 +742,347 @@ upload key (`22:02:ED:E8:…`) as well as the debug key (`BC:E5:5B:00:…`). Reg
 debug key is the failure that works perfectly in development and breaks for every real user.
 Blocked on `gcloud auth login` / `firebase login`; both CLI tokens are expired.
 
+The gaps below were found by the pre-release audit on 2026-07-28 and by the adversarial review that
+followed it. Five are resolved (G23, G24, G25, G26, G28); three are open and recorded rather than
+fixed — G27 cannot be closed from code at all, and G29 and G30 were deliberately deferred with
+reasons given.
+
+**G23 — `link` and `hashtag` were local-only. — RESOLVED 2026-07-28.** Both were written to Room and
+never transmitted: the sender saw an attachment, the recipient got a plain Yo. This is G20 exactly,
+one attachment along — and it survived G20's fix because that fix added the *coordinates* to the
+payload rather than asking what else the send screen offered that never left the device. Fixing one
+instance of a defect class is not the same as fixing the class.
+
+Both now travel `sendYo` → `POST /v1/send` → the FCM data payload → the recipient's notification. A
+hashtag renders inline in the body; a link makes the notification tappable. FR3 has the validation
+rules and the not-stored guarantee.
+
+**The first fix did not actually work on any modern device, and that is the most useful part of this
+entry.** `linkPendingIntent` gated on `resolveActivity`, and under `targetSdk 36` Android 11+
+package visibility hides anything not on the automatic list — **browsers are not on it**. So
+`resolveActivity` reported that nothing handles `https`, the link was never made tappable, and the
+recipient got a plain Yo: G23 reproduced one layer below where G23 had just been fixed. The manifest
+now declares a second `<queries>` intent for `https` + `BROWSABLE`, directly beneath the `geo:` one
+added for G20 — the same root cause, the same remedy, twenty lines apart, missed anyway.
+
+**No unit test could have caught it.** Robolectric does not enforce package-visibility filtering, so
+the test suite resolves browsers happily and passes either way. This is the third defect in this
+document that needed a real device or a real deployment to see (G13, G22, now G23), and the pattern
+is worth naming: anything that depends on *what else is installed* or *what the platform hides* is
+invisible to the JVM suite by construction.
+
+Three smaller defects on the same path, all fixed:
+
+- **A Yo with both a location and a link dropped the link from the notification entirely.** Location
+  still wins the single `contentIntent` — a pin cannot be recovered later and a link usually can —
+  but the body now reads `· LINK` so the recipient at least knows one arrived. Silently omitting it
+  recreated, for the both-attached case, the exact mismatch this entry exists to remove.
+- **`openableLink` now calls `normalizeScheme()`.** `IntentFilter` scheme matching is
+  case-**sensitive** and expects lowercase, so `HTTPS://x` passed the http/https check and then
+  resolved to nothing at all — validation and resolution disagreeing about the same string.
+- **A bare domain is normalized.** `example.com` is what people actually type, and it carries no
+  scheme, so it was transmitted and then discarded at the last step. `MainViewModel.normalizeLink`
+  prepends `https://` **only when there is no scheme at all**, so a deliberate non-web scheme is
+  still rejected later rather than quietly rewritten into a web one.
+
+**The security rule on this path.** `YoNotifier.openableLink` opens only `http` and `https`, and
+only with a non-blank host. The link is authored by whoever sent the Yo, so an unchecked
+`ACTION_VIEW` would let any sender aim the recipient's tap at a `file://` path, a private
+`content://` provider, or an `intent://` URI reaching a component never meant to be exported —
+turning a notification tap into an attacker-chosen intent on someone else's device. Residual and
+accepted: a sender-supplied `https://` link can still be captured by an installed app holding a
+verified App Link for that host. That is inherent to `ACTION_VIEW`. What is *not* accepted is who
+may send one at all — see G30.
+
+**G24 — photo attachment was write-only. — RESOLVED 2026-07-28 BY REMOVAL.** This is the same shape
+as G20: a feature honest about its permission and dishonest about its product. `POST /v1/photo`
+stored the image correctly, and nothing could ever read it back — the app had **no fetch method at
+all**, and the FCM payload carried no message id for a recipient to fetch *with*. So every photo
+ever attached went into the database and stayed there, unread, unpruned and unreachable, while the
+sender was shown an attachment they had apparently sent.
+
+What it cost while it did nothing:
+
+- a `CAMERA` permission and a camera `<uses-feature>`, both visible on the store listing;
+- unbounded storage on a single non-WAL SQLite file that is also every account and friendship (§7),
+  with no retention or per-owner quota — the rate limiter added on 2026-07-28 slowed the growth and
+  did not bound it;
+- a **false statement in the live privacy policy**, which said a photo was readable only by the
+  sender and the person they sent it to. The second half of that sentence described an access path
+  that did not exist.
+
+**Why removal and not completion.** Delivering it properly is not a small fix. It needs, at minimum:
+a receive-side persistence layer, which the app deliberately does not have — received Yos are never
+written to this device (`saveSent` is the only writer) and the notification is the recipient's only
+surface, the same constraint that shaped the G20 fix; a reordering so the upload completes *before*
+the push rather than racing it; and the retention and per-owner quota work that was never scoped.
+That is a feature project. Against it: the original Yo shipped photos in 2015, so historical
+fidelity argues for keeping it — but P5 says a missing feature is a decision, and shipping a
+permission plus a storage liability plus a false privacy claim in exchange for nothing is not a
+defensible way to honour the history. G20's own text sanctioned this route explicitly: close the
+mismatch *"or the fields removed"*.
+
+Removed: the camera and gallery UI, `uploadPhoto`, `PhotoEncoder` and `BitmapPhotoEncoder`,
+`decodeSampledBitmap`, `res/xml/file_paths.xml`, the `FileProvider` provider block, the `CAMERA`
+permission and camera `<uses-feature>`, the `androidx.exifinterface` dependency, backend
+`POST`/`GET /v1/photo`, `store_photo` and `get_photo`, creation of the `photos` table,
+`PhotoRecord`, the `photo_limiter`, and `MAX_PHOTO_BYTES` / `PHOTO_ATTEMPTS` /
+`PHOTO_WINDOW_SECONDS`.
+
+**Deliberately kept: `YoEntity.photoUri`**, a nullable column that is now always null. Dropping it
+changes the Room schema, and this database has **no migrations and no
+`fallbackToDestructiveMigration`** — a version bump would throw on first open for every install that
+already exists. Verified rather than assumed: `app/schemas/.../2.json` is byte-identical after a
+full build, identityHash still `1536e7be5fe233a3141085fe9c550969`. A dead column is cheap; a crash
+loop on upgrade is not.
+
+**G25 — the send confirmation was unconditional. — RESOLVED 2026-07-28.** The band flashed `YO!` the
+instant it was tapped, before the request had gone anywhere. A Yo that was rate-limited, addressed
+to an account whose device never registered, dropped by a dead network, or handed to an unconfigured
+FCM — which answers **HTTP 200 with `delivered:false`**, so even a 2xx check would have called it a
+success — looked exactly like one that arrived.
+
+`YoRepository.saveSent` returned `Unit`, and that was the bug in one word: there was nowhere to put
+the truth. It now returns `YoSendOutcome { Delivered, NotDelivered, Unreachable }` — three cases
+deliberately, not the server's `reason` string, because the app says the consequence and never the
+mechanism.
+
+Four things about the UI are deliberate:
+
+- **A pending state.** The band shows `...` while in flight. A send is a round trip of up to 10s;
+  without it, an honest flash shows nothing at all on a slow connection and the button reads as
+  dead.
+- **`YO!` only on confirmed delivery**, and `COULDN'T YO <NAME> - TAP TO RETRY` otherwise — in the
+  same slot and the same idiom as the existing `NOT RECEIVING YOS - TAP TO RETRY` band, so there is
+  one visual language for "this did not work, and here is the one action that helps".
+- **The Room write still happens on failure**, deliberately. Link and hashtag exist only in that
+  row, so discarding it would destroy what the user typed at exactly the moment they want to retry.
+- **A group fan-out that did not reach everybody is not reported as delivered**, and cancellation is
+  rethrown rather than reported as a failure — a cancelled coroutine is not a failed send.
+
+**The retry this added could send to the wrong person, and that was worse than the bug it fixed.**
+Two rapid taps put two sends in flight, and `lastSendAttempt` was a **single slot**: the later send
+overwrote it, so a failure banner offered under Alice's label could re-issue Bob's send on tap. A
+retry affordance that silently retargets is a worse outcome than the unconditional `YO!` this entry
+started with — the user is now confidently told a specific thing happened to a specific person.
+`runSend` now takes a monotonic generation token and only the newest send may publish an outcome,
+and the failed attempt is stored **together with** its failure rather than in a parallel slot, so
+the label and the action it retries cannot drift apart. `clearSendFailure()` was removed in the same
+pass; nothing called it.
+
+**G26 — BLOCK and REMOVE FRIEND were unreachable. — RESOLVED 2026-07-28.** Both were implemented,
+backed by real endpoints, and covered by passing tests. No Composable called either. So the app
+shipped with **no way for a user to stop somebody contacting them**, while FR9 and the privacy
+policy both described blocking as *the* control on unwanted Yos — and Play expects exactly that
+control in a user-to-user messaging app carrying user-generated content.
+
+Worth naming the class of failure: every layer was green. The endpoint had tests, the client method
+had tests, and nothing tested that anything called it. A feature can be fully implemented and
+entirely absent.
+
+Both are now on long-press of a friend band. And because a block with no undo is a one-way door,
+**unblock was added at the same time**: `fetchBlocked()` and `unblock()` on the client API — the
+server already had `GET /v1/blocked` and `DELETE /v1/block`, so this was client-side only — behind a
+**BLOCKED** sheet in the menu that lists blocked accounts, tap to unblock.
+
+`loadBlocked` was also rewritten to rethrow `CancellationException` instead of swallowing it in a
+`runCatching` — the same anti-pattern `saveSent` was rewritten to avoid in G25, and it mattered most
+here, on the one screen whose whole job is undoing a one-way door.
+
+**G27 — the OAuth consent screen is `orgInternalOnly`. — STILL OPEN.** Only `the-shop.hr` accounts
+can complete `CONTINUE WITH GOOGLE`, so every real Play user, **and every Play reviewer**, is locked
+out of that sign-in path. Username and password are unaffected, which is why the App access
+declaration must offer a password account (RELEASE.md §9, item 11).
+
+This is **impossible by construction rather than a permissions gap**, which is worth stating plainly
+so nobody spends another afternoon on it: `projects.brands` exposes no `patch` and no `update`
+method in `v1` or in `v1beta1`, and the field is documented as **output only**. There is no call to
+authorise and none to retry. Re-confirmed live on 2026-07-28 — `projects/747034506241/brands/747034506241`
+still reads `orgInternalOnly: true`. Cloud Console is the only route.
+
+**G28 — the 512x512 store icon was 24-bit and Play rejects that. — RESOLVED 2026-07-28.**
+`tools/generate-store-assets.py` built it with `Image.new("RGB", ...)`; Play specifies the hi-res
+icon as a 32-bit PNG and refuses a 24-bit one at upload. Changed to `"RGBA"`, regenerated, verified
+`RGBA (512, 512)`.
+
+The square is opaque either way, so **not one pixel changed appearance** — which is precisely why
+this would have survived every visual review and failed at the upload dialog, after the bundle was
+built and the listing was written.
+
+The feature graphic on the next function **stays `RGB` deliberately**: Play specifies that one as
+24-bit with no alpha, so making the two consistent would be the actual regression. There is now a
+comment in the generator saying so, because the two lines sit twenty apart and read like an
+oversight worth tidying.
+
+**G29 — history still renders a failed send identically to a delivered one. — OPEN, deliberately
+deferred.** G25 fixed the *transient* surface: the band shows `COULDN'T YO <NAME> - TAP TO RETRY`
+and then the moment passes. The Room row it wrote is **permanent**, carries no delivery state, and
+renders exactly like a Yo that arrived. So the surface that lasts is the one still lying, and it
+outlives the one that tells the truth — which is arguably the worse half of the original defect.
+
+It is deferred rather than overlooked, and the cost is the reason. A `delivered` column on
+`YoEntity` bumps the Room schema, and this database has **no migrations and no
+`fallbackToDestructiveMigration`** (see G24): closing this needs a hand-written `Migration`, a newly
+exported schema, and a test that an existing database survives the upgrade. That is the exact work
+G24 avoided by keeping a dead column, and doing it hurriedly before a first release trades a
+cosmetic lie for a crash loop on upgrade. It should be the first thing done after the release, while
+the schema is still trivial and almost nobody has data to migrate.
+
+The row is written on failure on purpose, incidentally — see G25 — because `link` and `hashtag` live
+only in that row and discarding it would destroy what the user typed at the moment they want to
+retry. The fix is a column, not a deletion.
+
+**G30 — anyone can send an attacker-controlled link to any username they can guess. — OPEN.**
+`POST /v1/send` requires **authentication but not friendship**, and signup is public (G11). So the
+cost of pushing a link into a stranger's notification shade is one signup and one guessed username —
+and usernames are guessable by design, since the whole social model is "Yo `<USERNAME>`" printed on
+a poster (FR9).
+
+`openableLink` confines the destination to `http`/`https` (G23), so this is not arbitrary-intent
+territory. What remains is ordinary phishing with a trust advantage: the notification body says
+`TAP TO OPEN LINK` and **never shows the host**, so the recipient taps without seeing where they are
+going, from a notification wearing a name they may recognise.
+
+Two cheap mitigations, neither applied yet:
+
+- **Show the host in the body.** `· example.com` instead of a bare `TAP TO OPEN LINK`. This is a
+  string change and it converts a blind tap into an informed one, which is most of the value.
+- **Require friendship to send.** This is the stronger control and it is nearly free, since the
+  friendship table already exists — but it is a product decision, not a bug fix: it would end
+  unilateral "Yo `<USERNAME>`" sends, which §5 records as deliberate historical fidelity. Blocking
+  is the existing answer, and blocking is reactive by construction: it works only after the first
+  message has already been delivered.
+
+Worth recording alongside this, and pre-existing rather than introduced here: the default
+`BaseHTTPRequestHandler` access log writes the full request line, so the container log contains
+entries like `DELETE /v1/block?username=BOB` next to the caller's IP. That is a record of who
+blocked whom, sitting somewhat awkwardly beside a privacy policy that says the service is not
+retained as a log of who you are. It has always been true; this change is simply the first to
+exercise those routes from the app.
+
 ---
 
-## 7. Deployment state (as of 2026-07-26)
+## 7. Deployment state (as of 2026-07-28)
 
-The backend runs on the operator's Mac as launchd agent `com.yo.backend` (KeepAlive), bound to
-`127.0.0.1:8790`, database `backend/yo.db`, log `~/.ai-fleet/logs/yo-backend.log`. It must be
-launched with Homebrew's `python3` (see §4).
+**The backend runs on a server, not on a laptop, since 2026-07-28.** It is a Docker container
+`yo-backend` on the `the-shop` host, at `/root/claude/modules/yo`, vendored into the **`lotar/claude`**
+repository — not `evh-claude` — and fronted by that host's shared Traefik. The hostname
+`https://yo.the-shop.io` did not change across the move, which is why every installed APK kept
+working with no rebuild and no Play update.
 
-**FR9 is a breaking deployment.** The agent loads `yo_server.py` straight out of the working tree
-with `KeepAlive`, so merging changes the running server as soon as it restarts, and the previously
-installed APK — which sends `X-Yo-Key` and nothing else — will get 401 on every route. Landing
-therefore requires all three, together: merge, `launchctl kickstart -k` the agent, and reinstall the
-APK. `YO_SERVER_KEY` in the plist is now ignored and can be deleted.
+| Piece | Value |
+|---|---|
+| Host | `the-shop`, `ssh root@46.225.53.158` |
+| Repo / path | `lotar/claude`, `/root/claude/modules/yo` |
+| Deploy | `docker compose -f compose.prod.yml up -d --build`, **run from that directory** |
+| DNS | `yo.the-shop.io` → A `116.203.165.173` (Hetzner floating IP), proxied through Cloudflare |
+| Database | `/root/claude/modules/yo/data/yo.db`, bind-mounted at `/data` |
+| Backups | hourly to `/root/backups/yo` (7 days), plus a daily 07:30 pull to the laptop |
 
-The existing database survives untouched (new tables are additive), but its two rows are the
+`46.225.53.158` is the DHCP-delivered primary address: correct for ssh, **wrong for DNS**. And the
+deploy command's working directory is load-bearing — compose reads `.env` from the project
+directory only, and the Traefik labels are `traefik.enable=${YO_TRAEFIK_ENABLE:-false}`, so the
+same command run elsewhere produces a container that builds, starts, passes its healthcheck and is
+simply not routed. **RELEASE.md §8 is the full record**: container hardening, the ownership trap
+that cost real time, the cutover measurements, and the constraints any future host must satisfy.
+
+Two properties of the deployment matter to anyone reading this document for product truth:
+
+- **Exactly one replica, permanently.** The rate limiters are in-memory and the store is a non-WAL
+  SQLite file, so a second replica halves every limit and invites `SQLITE_BUSY`. Horizontal scaling
+  is not a configuration change here; it is a rewrite of FR9's limiter and the storage layer.
+- **A merge to `main` is no longer a deploy.** `backend/` is vendored into `lotar/claude` by an
+  explicit file list and baked into an image, so production is a snapshot taken at deploy time.
+  Under the old launchd agent the hazard was that branch-only code was absent from production;
+  the hazard is now the inverse and quieter — `main` can be *ahead* of the vendored copy and
+  nothing reports it.
+
+**The `photos` table is still there on the production database, and is deliberately left alone.**
+The code that created it is gone (G24) and a *fresh* database never gets one — there is a test
+asserting that. The existing production file keeps the empty table because **nothing drops it**, and
+that is the decision, not an oversight: production holds **0 photo rows**, so there is nothing to
+clean up, and issuing a `DROP TABLE` would rewrite the file and change the content digest that the
+deploy verification compares end to end (RELEASE.md §8.6). Trading a stable, checkable digest for
+the removal of an empty table would be a bad exchange. If it is ever dropped, do it as its own
+change with its own before/after digests, not folded into a code deploy.
+
+### 7.0 How it used to run (historic, to 2026-07-28)
+
+Kept because two entries below are dated against it. The backend ran on the operator's Mac as
+launchd agent `com.yo.backend` (KeepAlive), bound to `127.0.0.1:8790`, database `backend/yo.db`,
+log `~/.ai-fleet/logs/yo-backend.log`, published at `https://yo.the-shop.io` via a CNAME on the
+`fleet-bridge` Cloudflare tunnel. A dedicated hostname was required rather than a path on
+`alfred.the-shop.io`, because the fleet bridge on `:8787` answers `/healthz` and blanket-rejects
+everything under `/v1/*`; Yo's native paths would have shadowed live infrastructure.
+
+**FR9 was a breaking deployment** in that arrangement: the agent loaded `yo_server.py` straight out
+of the working tree, so merging changed the running server as soon as it restarted, and the
+previously installed APK — which sent `X-Yo-Key` and nothing else — got 401 on every route. Landing
+required all three together: merge, `launchctl kickstart -k`, reinstall the APK.
+
+The database carried over untouched (new tables are additive). Its two original rows were the
 hand-seeded `Alice` / `Bob` demo pair with no accounts behind them, so they cannot be signed in as
-and will not appear in anyone's friend list. Nothing of value is lost by ignoring them.
+and appear in nobody's friend list.
 
-It is publicly reachable at **`https://yo.the-shop.io`** via a CNAME on the existing `fleet-bridge`
-Cloudflare tunnel. A dedicated hostname is required rather than a path on `alfred.the-shop.io`,
-because the fleet bridge on `:8787` answers `/healthz` and blanket-rejects everything under
-`/v1/*`; Yo's native paths would shadow live infrastructure. Cloudflared cannot rewrite paths, so a
-`/yo/` prefix would require a code change.
-
-Verified end-to-end on a physical S25 with USB port-forwarding removed: friends fetched and a Yo
-sent over the public internet, `GET /v1/friends 200` and `POST /v1/send 200` server-side, with
-history rendering the sent Yo. Gap G2 still applies to the push itself.
+Verified end-to-end at the time on a physical S25 with USB port-forwarding removed: friends fetched
+and a Yo sent over the public internet, `GET /v1/friends 200` and `POST /v1/send 200` server-side,
+with history rendering the sent Yo.
 
 ### 7.1 Switching on Google sign-in (FR10)
 
 FR10 is live. Nothing here is a secret — an OAuth client id is public by design.
 
-**As provisioned (2026-07-26).** Two projects are involved, which is not the intended end state —
-see G16.
+**As provisioned, re-read from the live projects on 2026-07-28.** Everything is now in **one**
+project, `yo-theshop` (`747034506241`). Push and Google sign-in share it; earlier revisions of this
+document said sign-in "borrows" a different project, and that has not been true since G16 closed on
+2026-07-27.
 
 | Piece | Value |
 |---|---|
-| **Live** web (server) client id | `973904690282-a4dnbf8b3gv1o9v0v6ts2phe9em4kg41.apps.googleusercontent.com` (in `blocksurge-theshop`) |
-| **Live** Android OAuth client | `973904690282-c1l1eqe5veh16ialmru3apmdm74i0n7j.apps.googleusercontent.com`, auto-created |
-| Firebase Android app (live) | `1:973904690282:android:a648ab962c3b942bb4de13`, package `com.example.yo` |
-| Registered SHA-1 | `BC:E5:5B:00:AA:7E:68:4D:72:EF:B7:2F:53:AF:B3:97:20:F7:F8:88` (debug keystore; a release keystore needs its own) |
-| Backend interpreter | `~/.local/share/yo-backend-venv/bin/python` (holds `google-auth` 2.56.2) |
-| Backend env | `YO_GOOGLE_CLIENT_ID` in the launchd plist |
+| Project | `yo-theshop`, project number `747034506241` |
+| **Live** web (server) client id | `747034506241-1ibqvftch4s7htnmfkspteiqs5h2jv9d.apps.googleusercontent.com` |
+| Android OAuth client, **release** SHA-1 | `747034506241-0102hfni4imbn33rv8sqmmtp6sbropdp.apps.googleusercontent.com`, auto-created |
+| Android OAuth client, **debug** SHA-1 | `747034506241-9gdal4ibn24m94kisa0dsrfk9taniuck.apps.googleusercontent.com`, auto-created |
+| Firebase Android app (live) | `1:747034506241:android:e5b34b298d59ea5e48bc00`, package `hr.theshop.yo` |
+| Registered SHA-1, release | `22:02:ED:E8:E1:B3:78:94:40:A7:52:23:F4:6E:E1:20:2D:DD:61:BA` (upload keystore) |
+| Registered SHA-1, debug | `BC:E5:5B:00:AA:7E:68:4D:72:EF:B7:2F:53:AF:B3:97:20:F7:F8:88` |
+| Backend runtime | the production image, `google-auth` pinned to 2.56.2 |
+| Backend env | `YO_GOOGLE_CLIENT_ID` in `/root/claude/modules/yo/.env`, mode `0600` |
 | App config | `yoGoogleClientId` in the gitignored `local.properties` |
 
-Dormant, kept for the migration in G16: project `yo-theshop` (`747034506241`, free tier, no
-billing) with web client `747034506241-c56bjfe0hihuarel9rucuo7b4oogvbkg.apps.googleusercontent.com`,
-Android app `1:747034506241:android:2643dabcb1f28ae548bc00` and the same SHA-1 registered, plus an
-IAP brand `projects/747034506241/brands/747034506241` that is `orgInternalOnly: true`.
+**Both** fingerprints are registered, not just the debug one. Registering only debug is the failure
+that works perfectly in development and breaks for every real user, and it is the reason the
+release build could be driven on a handset at all (RELEASE.md §4).
 
-That `yo-theshop` web client was created through the **IAP API**
+Values that appear in older revisions and are **dead** — do not copy them forward:
+
+| Dead value | Status |
+|---|---|
+| `973904690282-a4dnbf8b3gv1o9v0v6ts2phe9em4kg41…` (web, `blocksurge-theshop`) | no longer used by app or backend |
+| `973904690282-c1l1eqe5veh16ialmru3apmdm74i0n7j…` (Android, `blocksurge-theshop`) | deleted by hand — see G16 |
+| `747034506241-c56bjfe0hihuarel9rucuo7b4oogvbkg…` (web, `yo-theshop`) | the IAP-created client; **never became the live one** |
+| `1:747034506241:android:2643dabcb1f28ae548bc00`, package `com.example.yo` | soft-**deleted** (`state: DELETED`) |
+
+That `-c56bjfe0…` web client was created through the **IAP API**
 (`iap.googleapis.com/v1/projects/{n}/brands` then `.../identityAwareProxyClients`) because Google
-exposes no public API for ordinary OAuth clients. It verifies real tokens correctly but is not
+exposes no public API for ordinary OAuth clients. It verified real tokens correctly but was never
 usable for sign-in on its own, since no Android client can be created alongside it without the
-console — which is the whole of G13.
+console — which is the whole of G13. When Firebase Auth was finally enabled it auto-created the
+`-1ibqvftch…` web client, and that is the live one.
 
-**Two launchd gotchas, both of which cost time here.** `launchctl kickstart -k` restarts the job
-but re-uses the *loaded* configuration, so plist edits are silently ignored; use
-`launchctl bootout gui/$UID/com.yo.backend` followed by
-`launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.yo.backend.plist`. And the interpreter
-must be the venv's, since Homebrew's Python is externally managed and will not accept
-`pip install`.
+Still open on this project: the IAP brand `projects/747034506241/brands/747034506241` is
+`orgInternalOnly: true`, re-confirmed live on 2026-07-28, so only `the-shop.hr` accounts can
+complete sign-in. This is **console-only by construction, not a permissions gap** — `projects.brands`
+exposes no `patch` or `update` method in `v1` or `v1beta1`, and the field is output-only. There is
+no call to retry.
+
+**Two launchd gotchas, historic but worth keeping**, from when the backend ran on the laptop (§7.0).
+`launchctl kickstart -k` restarts the job but re-uses the *loaded* configuration, so plist edits are
+silently ignored; use `launchctl bootout gui/$UID/com.yo.backend` followed by
+`launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.yo.backend.plist`. And the interpreter had
+to be the venv's, since Homebrew's Python is externally managed and will not accept `pip install`.
+Neither applies to production any more — the container installs its dependencies at build time —
+but both still apply to a scratch backend on a Mac.
 
 App and backend must carry the identical client id. Out of step fails closed — a mismatched
 audience is rejected as an invalid token, never accepted. That is not a claim from reading the
@@ -756,23 +1122,31 @@ Two tokens existed for the one account afterwards, one per sign-in — per-devic
 FR9 specifies. The account `MLADEN` created during the production run is a real account and was
 left in place; delete it if it is not wanted.
 
+Both of those runs predate the package rename **and** the move of every OAuth client into
+`yo-theshop`, so they exercised client ids that no longer exist. They are kept as the record of how
+the flow behaves, not as evidence about the current configuration: **Google sign-in has not been
+re-verified on a handset since the consolidation** (RELEASE.md §9, item 5).
+
 ---
 
 ### 7.2 Push delivery — provisioned 2026-07-26
 
-Push runs on `yo-theshop` (project number `747034506241`), a different project from the one Google
-sign-in borrows (§7.1, gap G16). They do not interact: Credential Manager reads
-`BuildConfig.YO_GOOGLE_CLIENT_ID`, never `google-services.json`, so the two can sit side by side.
-What must match is the **sender**: an FCM token minted for project A cannot be targeted by a server
-authenticated as project B, so the app's `google-services.json` and the backend's service-account
-key both have to come from `yo-theshop`.
+Push runs on `yo-theshop` (project number `747034506241`) — **the same project Google sign-in uses**,
+since G16 closed. Earlier revisions said sign-in borrowed a different project and that push and
+sign-in "do not interact"; the second half was always true for a different reason and still is:
+Credential Manager reads `BuildConfig.YO_GOOGLE_CLIENT_ID`, never `google-services.json`. What must
+match is the **sender** — an FCM token minted for project A cannot be targeted by a server
+authenticated as project B — so the app's `google-services.json` and the backend's service-account
+key both have to come from `yo-theshop`. They now do, and so does the OAuth client, so there is
+only one project to keep straight.
 
 | Piece | Value |
 |---|---|
-| App id | `1:747034506241:android:2643dabcb1f28ae548bc00` |
+| App id | `1:747034506241:android:e5b34b298d59ea5e48bc00`, package `hr.theshop.yo` |
+| App id (superseded) | `1:747034506241:android:2643dabcb1f28ae548bc00`, package `com.example.yo` — soft-deleted |
 | `app/google-services.json` | `firebase apps:sdkconfig ANDROID <app id> -P yo-theshop --out app/google-services.json` |
 | `YO_FIREBASE_PROJECT_ID` | `yo-theshop` |
-| `YO_FIREBASE_SA_KEY` | key for `firebase-adminsdk-fbsvc@yo-theshop.iam.gserviceaccount.com`, kept outside the repo |
+| Service-account key | for `firebase-adminsdk-fbsvc@yo-theshop.iam.gserviceaccount.com`. In production it is a compose **secret** at `/run/secrets/yo_firebase_sa`, never in the image or the repo |
 
 `google-services.json` is gitignored and `app/build.gradle.kts` only applies the google-services
 plugin when the file is present, so a fresh clone still builds — with the Firebase half dark. No
@@ -786,7 +1160,11 @@ push, not a foreground one:
 | App launch, signed in | `POST /v1/register 200`, real FCM token stored for `MLADEN` |
 | `POST /v1/send` | `{"delivered":true}` |
 | Device, ~1s later | Notification posted: title `Yo`, text `From MLADEN` |
-| Channel | `yo_push_v2`, importance 4, sound `android.resource://com.example.yo/…`, vibration `0/150/100/150`, accent `0xff9b59b6` |
+| Channel | `yo_push_v2`, importance 4, sound `android.resource://<package>/…`, vibration `0/150/100/150`, accent `0xff9b59b6` |
+
+The sound URI carries the package name, so it read `android.resource://com.example.yo/…` on the run
+above and reads **`android.resource://hr.theshop.yo/…`** on every build since the 2026-07-27 rename.
+Re-verified on the release build on a handset that same day, `pkg=hr.theshop.yo` (RELEASE.md §4).
 
 One bug was found and fixed in the course of this. `fcm_client.send_yo` sent a data-only message
 with no priority, and FCM defaults those to *normal*, which Doze may hold until its next
@@ -812,6 +1190,13 @@ The `NOT RECEIVING YOS` row itself has **not** been seen on a screen: the S23 is
 screencaps come back black, and provoking it would mean breaking registration on purpose. Its logic
 is covered by unit tests on `MainViewModel` (fails → warns, succeeds → silent, signed out → silent,
 retry clears it); the row's rendering is not.
+
+**`FCMDeliveryError` is now logged (2026-07-28).** The message was previously discarded: a delivery
+failure produced `{"delivered":false}` to the caller and left no trace on the server at all, so
+there was nothing to read afterwards to find out *why* Firebase refused — an expired key, a wrong
+project and a revoked token were indistinguishable in retrospect. This is the same class of defect
+as G17, a failure that looks identical to success from every surface anyone would think to check.
+The reason string now reaches the container log (`docker logs yo-backend`).
 
 ---
 

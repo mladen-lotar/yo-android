@@ -16,8 +16,8 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Every method answers benignly so a test can override only what it actually cares about.
- * Shared because [YoBackendApi] has ten methods and hand-rolling a full fake per test file makes
- * every future interface change a multi-file edit.
+ * Shared because [YoBackendApi] has a dozen methods and hand-rolling a full fake per test file
+ * makes every future interface change a multi-file edit.
  */
 open class StubYoBackendApi : YoBackendApi {
     override suspend fun deleteAccount(): Boolean = true
@@ -45,18 +45,59 @@ open class StubYoBackendApi : YoBackendApi {
 
     override suspend fun block(username: String): Boolean = true
 
+    override suspend fun fetchBlocked(): List<String> = emptyList()
+
+    override suspend fun unblock(username: String): Boolean = true
+
     override suspend fun sendYo(
         recipient: String,
         latitude: Double?,
         longitude: Double?,
+        link: String?,
+        hashtag: String?,
     ): Boolean = true
+}
 
-    override suspend fun uploadPhoto(
-        messageId: String,
-        base64Data: String,
-        mimeType: String,
-        recipient: String?,
-    ): Boolean = true
+/**
+ * One call to [YoBackendApi.sendYo], with every argument it carried.
+ *
+ * Recording the whole argument list rather than just the recipient is the point: an attachment
+ * that is never passed here is an attachment the recipient never sees, and a fake that only
+ * remembered the recipient is what let location (G20) and then link and hashtag (G23) each ship
+ * looking delivered. A new attachment must be added to this data class, which makes every
+ * existing `assertEquals(listOf(SendCall(...)), api.sends)` state its value explicitly.
+ */
+data class SendCall(
+    val recipient: String,
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val link: String? = null,
+    val hashtag: String? = null,
+)
+
+/**
+ * A [YoBackendApi] that remembers what was sent through it. Shared rather than re-declared per
+ * test file for the same reason [StubYoBackendApi] is: the delivery contract is the thing several
+ * suites need to assert on, and a private copy per file means the next argument added to `sendYo`
+ * is recorded in one of them and silently dropped by the rest.
+ */
+open class FakeYoBackendApi(
+    var sendResult: Boolean = true,
+    var sendFailure: Throwable? = null,
+) : StubYoBackendApi() {
+    val sends = mutableListOf<SendCall>()
+
+    override suspend fun sendYo(
+        recipient: String,
+        latitude: Double?,
+        longitude: Double?,
+        link: String?,
+        hashtag: String?,
+    ): Boolean {
+        sends += SendCall(recipient, latitude, longitude, link, hashtag)
+        sendFailure?.let { throw it }
+        return sendResult
+    }
 }
 
 /**

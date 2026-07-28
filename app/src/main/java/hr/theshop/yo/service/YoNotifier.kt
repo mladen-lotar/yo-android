@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.net.Uri
@@ -48,13 +49,67 @@ object YoNotifier {
         "${yoNotificationBody(sender)}  ·  TAP TO OPEN MAP"
 
     /**
+     * The same reasoning as the location body, for the other two attachments. A hashtag is shown
+     * inline because there is nothing to open; a link earns a tap hint because there is.
+     */
+    /**
+     * [hasLink] is whether a usable link arrived; [linkIsTappable] is whether it won the single
+     * contentIntent. They are separate on purpose. A link that arrived but cannot be tapped -
+     * because a location outranked it, or because no installed app handles the scheme - is still
+     * ANNOUNCED, since omitting it recreates the very mismatch this change removes; but it must
+     * not be announced as "TAP TO OPEN", because that would be a second, smaller lie.
+     */
+    fun yoNotificationBody(
+        sender: String,
+        hashtag: String?,
+        hasLink: Boolean,
+        linkIsTappable: Boolean,
+        hasLocation: Boolean,
+    ): String = buildString {
+        append(yoNotificationBody(sender))
+        hashtag?.takeIf(String::isNotBlank)?.let { append("  ·  #${it.trimStart('#')}") }
+        if (hasLink) {
+            // `&& !hasLocation` is not redundant with the call site's own gating. There is exactly
+            // one contentIntent and a location always wins it, so a body offering two taps could
+            // only ever be lying about one of them - and this function is public, so the invariant
+            // belongs here rather than in the discipline of every caller.
+            append(if (linkIsTappable && !hasLocation) "  ·  TAP TO OPEN LINK" else "  ·  LINK")
+        }
+        if (hasLocation) {
+            append("  ·  TAP TO OPEN MAP")
+        }
+    }
+
+    /**
+     * Only http and https are ever opened. The link is authored by whoever sent the Yo, so
+     * handing it to ACTION_VIEW unchecked would let any sender aim the recipient's tap at
+     * `file://`, a private `content://` provider, or an `intent://` URI that reaches a component
+     * never meant to be exported.
+     */
+    fun openableLink(raw: String?): Uri? {
+        val trimmed = raw?.trim().orEmpty()
+        if (trimmed.isEmpty()) return null
+        // normalizeScheme lowercases the scheme in the Uri itself, not just for this comparison.
+        // IntentFilter matching is case-SENSITIVE and expects lowercase, so "HTTPS://x" would
+        // otherwise pass the check here and then resolve to nothing at all.
+        val uri = runCatching { Uri.parse(trimmed).normalizeScheme() }.getOrNull() ?: return null
+        if (uri.scheme != "http" && uri.scheme != "https") return null
+        if (uri.host.isNullOrBlank()) return null
+        return uri
+    }
+
+    /**
      * @param coordinates when present, the notification opens a map pinned at that point instead
      *   of doing nothing at all.
+     * @param link opened on tap when there is no location; location wins because a pin cannot be
+     *   recovered later and a link usually can.
      */
     fun postYoNotification(
         context: Context,
         sender: String,
         coordinates: LocationCoordinates? = null,
+        link: String? = null,
+        hashtag: String? = null,
     ) {
         val sound = yoSoundUri(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -89,6 +144,12 @@ object YoNotifier {
         }
 
         val mapIntent = coordinates?.let { mapPendingIntent(context, sender, it) }
+        // Resolved unconditionally, because the body announces a link even when it cannot have
+        // the tap. Gating this on `mapIntent == null` is what made the both-attached case drop
+        // the link from the text entirely - the very mismatch this is here to prevent.
+        val linkUri = openableLink(link)
+        val linkIntent =
+            if (mapIntent == null) linkUri?.let { linkPendingIntent(context, sender, it) } else null
 
         val notification =
             NotificationCompat.Builder(context, CHANNEL_ID)
@@ -96,20 +157,41 @@ object YoNotifier {
                 .setColor(ACCENT_COLOR)
                 .setContentTitle(NOTIFICATION_TITLE)
                 .setContentText(
-                    if (mapIntent == null) {
-                        yoNotificationBody(sender)
-                    } else {
-                        yoLocationNotificationBody(sender)
-                    },
+                    yoNotificationBody(
+                        sender = sender,
+                        hashtag = hashtag,
+                        hasLink = linkUri != null,
+                        linkIsTappable = linkIntent != null,
+                        hasLocation = mapIntent != null,
+                    ),
                 )
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setAutoCancel(true)
                 .setSound(sound)
                 .setVibrate(vibrationPattern)
-                .apply { mapIntent?.let(::setContentIntent) }
+                .apply { (mapIntent ?: linkIntent)?.let(::setContentIntent) }
                 .build()
 
         NotificationManagerCompat.from(context).notify(sender.hashCode(), notification)
+    }
+
+    private fun linkPendingIntent(
+        context: Context,
+        sender: String,
+        uri: Uri,
+    ): PendingIntent? {
+        val target = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (target.resolveActivity(context.packageManager) == null) {
+            return null
+        }
+        return PendingIntent.getActivity(
+            context,
+            // Offset from the map intent's request code so a Yo with a link cannot reuse the
+            // PendingIntent of an earlier Yo that carried a location.
+            sender.hashCode() + 1,
+            target,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
     }
 
     /**

@@ -23,7 +23,12 @@ from yo_db import YoDatabase
 DEFAULT_PORT = 8790
 DEFAULT_DATABASE = Path(__file__).with_name("yo.db")
 MAX_BODY_BYTES = 2_000_000
-MAX_PHOTO_BYTES = 1_400_000
+
+# A link has to survive a round trip through an FCM data payload and back out into an Intent, so
+# it is bounded here rather than wherever it first overflows something. Measured in BYTES, because
+# that is what FCM's ~4 KB data-payload cap counts.
+MAX_LINK_BYTES = 2048
+MAX_HASHTAG_BYTES = 140
 
 # Signup and login are necessarily public - an invitee has no credentials by definition - so
 # they are the abuse surface that replaces the old shared key. Sends are limited per account.
@@ -31,13 +36,6 @@ CREDENTIAL_ATTEMPTS = 10
 CREDENTIAL_WINDOW_SECONDS = 900
 SEND_ATTEMPTS = 60
 SEND_WINDOW_SECONDS = 60
-
-# Photos are stored inside the database and are never pruned, so an unthrottled upload route
-# is a disk-exhaustion path for whatever filesystem the database sits on - which in production
-# is shared with every other service on the host. Signup is public, so "authenticated" is not
-# a meaningful bound on its own.
-PHOTO_ATTEMPTS = 30
-PHOTO_WINDOW_SECONDS = 3600
 
 # How many allowed requests between sweeps of the rate limiter's idle keys.
 _SWEEP_EVERY = 256
@@ -197,7 +195,7 @@ DOCUMENT_PAGE_TEMPLATE = """<!doctype html>
 """
 
 PRIVACY_PAGE_BODY = """<h1>Yo privacy policy</h1>
-<p class="updated">Last updated 27 July 2026. Yo is published by The Shop.</p>
+<p class="updated">Last updated 28 July 2026. Yo is published by The Shop.</p>
 
 <h2>The short version</h2>
 <p>Yo sends one word. It needs to know who you are and which device to wake, and it is not
@@ -214,15 +212,20 @@ of anything to anyone.</p>
   <li><strong>A notification token</strong> for your device, issued by Firebase Cloud Messaging.
       Without it a Yo cannot reach your phone.</li>
   <li><strong>Your friends and blocks</strong>, which are the usernames you added or blocked.</li>
-  <li><strong>Photos you attach</strong> to a Yo, readable only by you and the person you sent
-      it to.</li>
   <li><strong>Your IP address, briefly</strong>, to rate-limit sign-ups and sending. It is not
       retained as a log of who you are.</li>
+</ul>
+
+<h2>What passes through without being stored</h2>
+<p>Anything you attach to a Yo travels inside the notification to the person you sent it to, and
+is not written to our database. We carry it; we do not keep it.</p>
+<ul>
   <li><strong>Your location, only when you attach it.</strong> Turning on "attach location" for a
       Yo takes a single position fix and sends it with that Yo, so the person receiving it can
-      open a map. It is passed straight through to the notification and is never written to our
-      database. There is no continuous tracking and no access while the app is in the background:
-      one fix, when you ask for it, for one message.</li>
+      open a map. There is no continuous tracking and no access while the app is in the
+      background: one fix, when you ask for it, for one message.</li>
+  <li><strong>A link or a hashtag</strong>, when you attach one, so that the person receiving the
+      Yo can open or read it.</li>
 </ul>
 
 <h2>What stays on your phone</h2>
@@ -232,15 +235,15 @@ of anything to anyone.</p>
       an email address, and none of it is sent to us or to anyone else. Invitations are sent by
       whichever messaging app you pick, and Yo never learns who you chose.</li>
   <li><strong>Your Yo history and groups.</strong> Stored locally and erased when you delete your
-      account or uninstall the app. Links and hashtags you attach are kept here and nowhere
-      else.</li>
+      account or uninstall the app. Your groups never leave the phone at all: sending to a group
+      sends an ordinary Yo to each member, and we never learn that the group exists.</li>
 </ul>
 
 <h2>Who else sees it</h2>
-<p>The person you send a Yo to, which is the point of sending it. If you attached a location, they
-see it.</p>
+<p>The person you send a Yo to, which is the point of sending it. If you attached a location, a
+link or a hashtag, they see that too.</p>
 <p>Google, in two narrow roles: Firebase Cloud Messaging carries the notification to your device -
-including an attached location, since that travels inside the notification - and Google verifies
+including anything you attached, since that travels inside the notification - and Google verifies
 the sign-in token if you choose "continue with Google". Nothing is shared with anyone else, and
 nothing is sold.</p>
 
@@ -249,8 +252,8 @@ nothing is sold.</p>
 
 <h2>Deleting your account</h2>
 <p>In the app: menu, then DELETE ACCOUNT. This erases your account, your friends, your blocks,
-your photos, your notification token and your local history, and removes you from other people's
-friend lists. It cannot be undone. If you cannot use the app, request deletion at
+your notification token and your local history, and removes you from other people's friend
+lists. It cannot be undone. If you cannot use the app, request deletion at
 <a href="/delete-account">/delete-account</a>.</p>
 
 <h2>Children</h2>
@@ -258,7 +261,8 @@ friend lists. It cannot be undone. If you cannot use the app, request deletion a
 
 <h2>Your rights</h2>
 <p>You can access, correct or erase what we hold. Deleting your account does all three at once.
-For anything else, write to <a href="mailto:mladen@the-shop.io">mladen@the-shop.io</a>.</p>
+For anything else, write to
+<!--email_off--><a href="mailto:mladen@the-shop.io">mladen@the-shop.io</a><!--/email_off-->.</p>
 
 <h2>Changes</h2>
 <p>If this policy changes materially we will say so in the app before the change takes effect.</p>
@@ -272,9 +276,11 @@ DELETE_ACCOUNT_PAGE_BODY = """<h1>Delete your Yo account</h1>
 effect immediately and needs nothing from us.</p>
 
 <h2>If you cannot open the app</h2>
-<p>Email <a href="mailto:mladen@the-shop.io">mladen@the-shop.io</a> from an address you can be
-reached at, with the username you want deleted. We will verify that the account is yours before
-deleting anything, and confirm once it is done - within 30 days, and normally far sooner.</p>
+<p>Email
+<!--email_off--><a href="mailto:mladen@the-shop.io">mladen@the-shop.io</a><!--/email_off-->
+from an address you can be reached at, with the username you want deleted. We will verify that
+the account is yours before deleting anything, and confirm once it is done - within 30 days, and
+normally far sooner.</p>
 
 <h2>What deletion removes</h2>
 <ul>
@@ -282,11 +288,8 @@ deleting anything, and confirm once it is done - within 30 days, and normally fa
   <li>Every sign-in session, on every device.</li>
   <li>Your friends and blocks - and you disappear from other people's friend lists.</li>
   <li>Your notification token, so no further Yo can reach you.</li>
-  <li>Any photos you sent.</li>
   <li>Your Yo history and groups held on your own phone.</li>
 </ul>
-<p>Photos other people sent to you are not removed, because they belong to whoever sent them.
-They go when that person deletes their own account.</p>
 <p>Nothing is retained after deletion, and none of it can be undone.</p>
 """
 
@@ -319,7 +322,6 @@ class YoHTTPServer(ThreadingHTTPServer):
             CREDENTIAL_WINDOW_SECONDS,
         )
         self.send_limiter = RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS)
-        self.photo_limiter = RateLimiter(PHOTO_ATTEMPTS, PHOTO_WINDOW_SECONDS)
 
 
 class YoRequestHandler(BaseHTTPRequestHandler):
@@ -358,9 +360,6 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/v1/blocked":
             self._handle_list_blocked(username)
-            return
-        if parsed.path == "/v1/photo":
-            self._handle_photo_fetch(username, parsed.query)
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -424,9 +423,6 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/v1/send":
                 self._handle_send(username, body)
-                return
-            if parsed.path == "/v1/photo":
-                self._handle_photo_upload(username, body)
                 return
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except BadRequestError as error:
@@ -758,9 +754,39 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             raise BadRequestError("longitude must be between -180 and 180")
         return float(latitude), float(longitude)
 
+    def _optional_attachment(
+        self,
+        body: Dict[str, Any],
+        key: str,
+        limit: int,
+    ) -> Optional[str]:
+        """A link or hashtag the sender attached, or None.
+
+        Rejected rather than silently dropped, for the same reason as the coordinates above: an
+        attachment that vanishes on the way looks identical to one that arrived, and the sender
+        has no way to discover the recipient never saw it. That mismatch was gap G20 for
+        location and G23 for these two.
+        """
+        value = body.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise BadRequestError(f"{key} must be a string")
+        value = value.strip()
+        if not value:
+            return None
+        # Bytes, not code points. FCM's data payload cap is 4096 BYTES, so a 2048-character link
+        # of astral-plane characters is 8 KB on the wire: it would pass a len() check here, be
+        # rejected by Google, and surface to the sender as a 502 that no retry can ever clear.
+        if len(value.encode("utf-8")) > limit:
+            raise BadRequestError(f"{key} must be at most {limit} bytes")
+        return value
+
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
         recipient = self._target_username(body, key="recipient")
         latitude, longitude = self._optional_coordinates(body)
+        link = self._optional_attachment(body, "link", MAX_LINK_BYTES)
+        hashtag = self._optional_attachment(body, "hashtag", MAX_HASHTAG_BYTES)
         if not self.server.send_limiter.allow(sender):
             self._write_json(
                 HTTPStatus.TOO_MANY_REQUESTS,
@@ -798,6 +824,8 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                     sender,
                     latitude=latitude,
                     longitude=longitude,
+                    link=link,
+                    hashtag=hashtag,
                 )
             )
         except FCMNotConfiguredError:
@@ -823,62 +851,6 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
-
-    def _handle_photo_upload(self, username: str, body: Dict[str, Any]) -> None:
-        if not self.server.photo_limiter.allow(username):
-            self._write_json(
-                HTTPStatus.TOO_MANY_REQUESTS,
-                {"error": "rate_limited"},
-            )
-            return
-        message_id = self._required_string(body, "message_id")
-        mime_type = self._required_string(body, "mime_type")
-        data = self._required_string(body, "data")
-        recipient = (
-            self._target_username(body, key="recipient")
-            if body.get("recipient")
-            else None
-        )
-        if len(data.encode("utf-8")) > MAX_PHOTO_BYTES:
-            self._write_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": "photo_too_large"},
-            )
-            return
-        existing = self.server.database.get_photo(message_id)
-        if existing is not None and existing[2] not in (None, username):
-            # message_id is chosen by the client, so without this a caller could overwrite
-            # somebody else's photo simply by reusing their id.
-            self._write_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
-            return
-        self.server.database.store_photo(
-            message_id,
-            mime_type,
-            data,
-            owner=username,
-            recipient=recipient,
-        )
-        self._write_json(HTTPStatus.OK, {"stored": True})
-
-    def _handle_photo_fetch(self, username: str, query: str) -> None:
-        parameters = parse_qs(query, keep_blank_values=True)
-        values = parameters.get("message_id")
-        message_id = values[0].strip() if values else ""
-        photo = self.server.database.get_photo(message_id)
-        if photo is None:
-            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
-        mime_type, data, owner, recipient = photo
-        # Only the two ends of the conversation. A row with no owner predates ownership and is
-        # denied outright rather than left world-readable - there were none in any live database
-        # when this shipped, so nothing legitimate is lost.
-        if username not in (owner, recipient):
-            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-            return
-        self._write_json(
-            HTTPStatus.OK,
-            {"mime_type": mime_type, "data": data},
-        )
 
     def _handle_broadcast(
         self,
