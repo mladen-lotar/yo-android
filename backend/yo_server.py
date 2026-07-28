@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -31,8 +32,31 @@ CREDENTIAL_WINDOW_SECONDS = 900
 SEND_ATTEMPTS = 60
 SEND_WINDOW_SECONDS = 60
 
+# Photos are stored inside the database and are never pruned, so an unthrottled upload route
+# is a disk-exhaustion path for whatever filesystem the database sits on - which in production
+# is shared with every other service on the host. Signup is public, so "authenticated" is not
+# a meaningful bound on its own.
+PHOTO_ATTEMPTS = 30
+PHOTO_WINDOW_SECONDS = 3600
+
 # How many allowed requests between sweeps of the rate limiter's idle keys.
 _SWEEP_EVERY = 256
+
+# Cloudflare's published egress ranges, supplied as a comma-separated list. MUST stay in sync
+# with the yo-cf-only ipAllowList sourceRange - they are the same trust boundary stated twice.
+# Empty means never believe CF-Connecting-IP, which is the right default off the proxy.
+CLOUDFLARE_RANGES = tuple(
+    ipaddress.ip_network(cidr.strip())
+    for cidr in os.environ.get("YO_CLOUDFLARE_RANGES", "").split(",")
+    if cidr.strip()
+)
+
+
+def _parse_ip(raw: str) -> Optional[ipaddress._BaseAddress]:
+    try:
+        return ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
 
 
 def _hash_client_key(raw_key: str) -> str:
@@ -295,6 +319,7 @@ class YoHTTPServer(ThreadingHTTPServer):
             CREDENTIAL_WINDOW_SECONDS,
         )
         self.send_limiter = RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS)
+        self.photo_limiter = RateLimiter(PHOTO_ATTEMPTS, PHOTO_WINDOW_SECONDS)
 
 
 class YoRequestHandler(BaseHTTPRequestHandler):
@@ -435,19 +460,33 @@ class YoRequestHandler(BaseHTTPRequestHandler):
     def _client_address(self) -> str:
         """The caller's real IP, which is NOT the socket address.
 
-        The server binds 127.0.0.1 and is published through a Cloudflare tunnel, so every
-        socket reports 127.0.0.1. Keying a rate limiter on that would make one global bucket
-        for the whole internet, turning any single abuser into a lockout for every user.
-        Trusting these headers is only safe *because* the socket is loopback-only: a spoofed
-        CF-Connecting-IP requires local access, which is already game over.
+        Behind a reverse proxy every socket reports the proxy, so keying a rate limiter on it
+        would make one global bucket for the whole internet - any single abuser would lock out
+        every user.
+
+        The RIGHTMOST X-Forwarded-For entry is the only one this server can trust: a proxy
+        appends the TCP peer there on every request, whether or not it is configured to trust
+        an inbound chain. Position [0] is attacker-chosen, because Cloudflare *forwards* a
+        client-supplied X-Forwarded-For unmodified.
+
+        CF-Connecting-IP is believed only when that peer is a Cloudflare address. Cloudflare
+        rejects any request carrying a client-supplied CF-Connecting-IP and writes the header
+        itself, so it is authentic for traffic that reached us through Cloudflare and
+        caller-controlled otherwise. The yo-cf-only ipAllowList middleware is what guarantees
+        the first case; if it is ever removed this falls back to the peer rather than
+        reopening the spoof.
         """
-        forwarded = self.headers.get("CF-Connecting-IP", "").strip()
-        if forwarded:
-            return forwarded
+        peer = self.client_address[0] if self.client_address else "unknown"
         chain = self.headers.get("X-Forwarded-For", "").strip()
         if chain:
-            return chain.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "unknown"
+            peer = chain.split(",")[-1].strip() or peer
+
+        parsed = _parse_ip(peer)
+        if parsed is not None and any(parsed in net for net in CLOUDFLARE_RANGES):
+            real = _parse_ip(self.headers.get("CF-Connecting-IP", ""))
+            if real is not None:
+                return str(real)
+        return peer
 
     def _handle_credentials(self, path: str) -> None:
         """POST /v1/signup and POST /v1/login - the only routes that mint a token."""
@@ -770,7 +809,11 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        except FCMDeliveryError:
+        except FCMDeliveryError as exc:
+            # Carries Google's actual status and body. Without logging it, a bad
+            # service-account key and Google being down are indistinguishable - and on a
+            # server nobody is sitting next to, this is the only diagnostic that exists.
+            self.log_error("fcm delivery failed: %s", exc)
             self._write_json(
                 HTTPStatus.BAD_GATEWAY,
                 {
@@ -782,6 +825,12 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
 
     def _handle_photo_upload(self, username: str, body: Dict[str, Any]) -> None:
+        if not self.server.photo_limiter.allow(username):
+            self._write_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "rate_limited"},
+            )
+            return
         message_id = self._required_string(body, "message_id")
         mime_type = self._required_string(body, "mime_type")
         data = self._required_string(body, "data")

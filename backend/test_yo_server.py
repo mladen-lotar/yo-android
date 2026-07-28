@@ -1,19 +1,24 @@
 import io
+import ipaddress
 import json
 import os
 import tempfile
 import unittest
 from email.message import Message
 from types import SimpleNamespace
+from unittest import mock
 
 import yo_auth
 import yo_google
+import yo_server
 from fcm_client import FCMDeliveryError, FCMNotConfiguredError
 from yo_db import YoDatabase
 from yo_server import (
     CREDENTIAL_ATTEMPTS,
     CREDENTIAL_WINDOW_SECONDS,
     MAX_PHOTO_BYTES,
+    PHOTO_ATTEMPTS,
+    PHOTO_WINDOW_SECONDS,
     SEND_ATTEMPTS,
     SEND_WINDOW_SECONDS,
     RateLimiter,
@@ -68,7 +73,9 @@ class YoServerTestCase(unittest.TestCase):
     """Shared harness: a real sqlite database plus a SimpleNamespace standing in for the server.
 
     The handler only ever touches server.database / fcm_client / password_iterations /
-    credential_limiter / send_limiter, so a namespace is enough and avoids binding a socket.
+    credential_limiter / send_limiter / photo_limiter, so a namespace is enough and avoids
+    binding a socket. Every limiter the handler reads must be listed here, or the tests that
+    exercise that route fail with AttributeError rather than a useful assertion.
     """
 
     def setUp(self):
@@ -87,6 +94,7 @@ class YoServerTestCase(unittest.TestCase):
                 CREDENTIAL_WINDOW_SECONDS,
             ),
             send_limiter=RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS),
+            photo_limiter=RateLimiter(PHOTO_ATTEMPTS, PHOTO_WINDOW_SECONDS),
             # Unconfigured by default, matching a deployment with no YO_GOOGLE_CLIENT_ID.
             # GoogleSignInTest installs a stub.
             google_verifier=None,
@@ -338,8 +346,14 @@ class CredentialTest(YoServerTestCase):
         )
         self.assertEqual(429, status)
 
-    def test_the_limiter_keys_on_the_forwarded_client_ip(self):
-        """Every socket is 127.0.0.1 behind the tunnel, so one abuser must not lock out all."""
+    def test_cf_connecting_ip_is_ignored_when_no_cloudflare_ranges_are_configured(self):
+        """A forged CF-Connecting-IP must NOT hand the caller a fresh rate-limit bucket.
+
+        Regression test for a demonstrated bypass: the header used to be trusted first and
+        unconditionally, so 15 signups sailed past a limit of 10 by varying it. With no
+        YO_CLOUDFLARE_RANGES configured nothing is trusted, every caller collapses onto the
+        socket peer, and the limiter holds.
+        """
         for _ in range(CREDENTIAL_ATTEMPTS):
             self.request(
                 "POST",
@@ -349,14 +363,7 @@ class CredentialTest(YoServerTestCase):
                 extra_headers={"CF-Connecting-IP": "198.51.100.7"},
             )
 
-        blocked, _ = self.request(
-            "POST",
-            "/v1/login",
-            {"username": "NOBODY", "password": "nope-nope-nope"},
-            token=None,
-            extra_headers={"CF-Connecting-IP": "198.51.100.7"},
-        )
-        other_caller, _ = self.request(
+        forged, _ = self.request(
             "POST",
             "/v1/signup",
             {"username": "ALICE", "password": TEST_PASSWORD},
@@ -364,8 +371,90 @@ class CredentialTest(YoServerTestCase):
             extra_headers={"CF-Connecting-IP": "203.0.113.9"},
         )
 
+        self.assertEqual(429, forged)
+
+    def test_cf_connecting_ip_is_honoured_only_from_a_cloudflare_peer(self):
+        """Configured ranges restore per-user keying, but only for traffic that came via CF.
+
+        The peer is the RIGHTMOST X-Forwarded-For entry, which the proxy authors from the TCP
+        peer on every request.
+        """
+        cf_peer = "173.245.48.9"  # inside Cloudflare's 173.245.48.0/20
+        with mock.patch.object(
+            yo_server,
+            "CLOUDFLARE_RANGES",
+            (ipaddress.ip_network("173.245.48.0/20"),),
+        ):
+            for _ in range(CREDENTIAL_ATTEMPTS):
+                self.request(
+                    "POST",
+                    "/v1/login",
+                    {"username": "NOBODY", "password": "nope-nope-nope"},
+                    token=None,
+                    extra_headers={
+                        "X-Forwarded-For": cf_peer,
+                        "CF-Connecting-IP": "198.51.100.7",
+                    },
+                )
+
+            blocked, _ = self.request(
+                "POST",
+                "/v1/login",
+                {"username": "NOBODY", "password": "nope-nope-nope"},
+                token=None,
+                extra_headers={
+                    "X-Forwarded-For": cf_peer,
+                    "CF-Connecting-IP": "198.51.100.7",
+                },
+            )
+            other_caller, _ = self.request(
+                "POST",
+                "/v1/signup",
+                {"username": "ALICE", "password": TEST_PASSWORD},
+                token=None,
+                extra_headers={
+                    "X-Forwarded-For": cf_peer,
+                    "CF-Connecting-IP": "203.0.113.9",
+                },
+            )
+
         self.assertEqual(429, blocked)
         self.assertEqual(201, other_caller)
+
+    def test_the_rightmost_forwarded_entry_wins_over_a_client_supplied_chain(self):
+        """A client-supplied XFF prefix must not be mistaken for the peer.
+
+        Cloudflare forwards a client-supplied X-Forwarded-For unmodified and appends, so
+        position [0] is attacker-chosen. Varying only the left entry must not mint a bucket.
+        """
+        with mock.patch.object(
+            yo_server,
+            "CLOUDFLARE_RANGES",
+            (ipaddress.ip_network("173.245.48.0/20"),),
+        ):
+            for _ in range(CREDENTIAL_ATTEMPTS):
+                self.request(
+                    "POST",
+                    "/v1/login",
+                    {"username": "NOBODY", "password": "nope-nope-nope"},
+                    token=None,
+                    extra_headers={
+                        "X-Forwarded-For": "203.0.113.9, 173.245.48.9",
+                        "CF-Connecting-IP": "198.51.100.7",
+                    },
+                )
+            blocked, _ = self.request(
+                "POST",
+                "/v1/signup",
+                {"username": "ALICE", "password": TEST_PASSWORD},
+                token=None,
+                extra_headers={
+                    "X-Forwarded-For": "8.8.8.8, 173.245.48.9",
+                    "CF-Connecting-IP": "198.51.100.7",
+                },
+            )
+
+        self.assertEqual(429, blocked)
 
 
 class GoogleSignInTest(YoServerTestCase):
