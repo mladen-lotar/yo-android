@@ -2,13 +2,23 @@
 
 Status: consolidated 2026-07-25 from GitHub issues #1–#7 and #11, then reconciled against the
 historical record of the original app. Google sign-in (FR10) was added 2026-07-26 on top of the
-accounts work that closed gaps G3–G7. Last revised 2026-07-28: the backend moved off the laptop
+accounts work that closed gaps G3–G7. Revised 2026-07-28: the backend moved off the laptop
 onto real hosting (§7), §7.1/§7.2 were reconciled against the live Google projects — several
 identity values recorded here had been stale since the package rename — and the pre-release audit
 promoted G20's tail to G23 and opened G23–G30, one of which removes a shipped feature (photos, G24).
 Repo: `mladen-lotar/yo-android` · Package: `hr.theshop.yo` (renamed from `com.example.yo`
 2026-07-27 for the Play release) · Baseline commit: `e401a0c`
 Release process and Play requirements: **[RELEASE.md](RELEASE.md)**.
+
+**Last revised 2026-07-28, second pass the same day.** An audit re-derived every gap entry from the
+code and the live systems rather than from this document, and found the *facts* mostly right and
+several *reasons* wrong — which is the worse failure of the two, because a wrong fact gets caught
+the next time somebody looks and a wrong reason is copied forward as settled. G7, G8, G9, G12, G18,
+G19 and G24 are corrected in place: each now says what it used to claim and why that was wrong,
+which is this document's established habit (see G6). G30 is partly closed — the host is now shown
+in the notification body, and a charset rule had to ship with it — and G31, G32 and G33 are new.
+§4 also gained a public endpoint it had always omitted, and §7's "explicit file list" turned out not
+to exist.
 
 This document is the single source of truth for *what this app is meant to be*. It exists because
 the specification previously lived only in closed GitHub issues, so a reader of the checkout saw a
@@ -170,10 +180,39 @@ Authenticated `POST /v1/broadcast` lets a registered third-party client broadcas
 subscribers, reusing FCM fan-out. Client credentials are `X-Yo-Client-Id` plus `X-Yo-Client-Key`,
 verified against a stored hash. Backend-only; no Android changes.
 
-**It exists and has never been used.** Checked against the production database on 2026-07-28:
-`api_clients` and `subscriptions` are both **0 rows**. No client has ever been provisioned, so no
-broadcast has ever been sent, and the whole surface is unexercised outside its unit tests. That is
-worth knowing before trusting it, and worth weighing against the alternative of removing it.
+**Two changes shipped on 2026-07-28.**
+
+- **It shares the credential rate limiter.** It was the **only credential-checking route with no
+  limiter at all** — signup, login and `/v1/google` all had one — so a client key could be guessed
+  at line rate while the human-facing credentials were held to ten attempts per fifteen minutes. It
+  now shares their bucket rather than getting its own, deliberately: an attacker must not be able to
+  dodge the limit by moving between routes.
+- **A `message` field is now refused with a 400** rather than accepted and silently discarded. It
+  was validated as a string and then **never passed to `send_yo`**, so a caller was told their text
+  had gone to every subscriber when no subscriber could ever have seen it. That is G20's defect
+  class in a route of its own. A Yo carries no content — the fan-out sends the client id as the
+  sender and nothing else — so refusing is the correct fix; *delivering* the text would be a product
+  change, and a change to what a Yo is.
+
+**It exists and has never been used.** Re-checked live against the production database on
+2026-07-28: `api_clients` and `subscriptions` are both **0 rows**. No client has ever been
+provisioned, so no broadcast has ever been sent, and the whole surface is unexercised outside its
+unit tests. That is worth knowing before trusting it, and worth weighing against the alternative of
+removing it.
+
+**Three things become mandatory before any client is ever provisioned**, and none of them exists
+today:
+
+1. **A subscriber cap, or an asynchronous fan-out.** The fan-out is serial — one HTTPS call to FCM
+   per subscriber, inside the request — so it crosses Cloudflare's 100-second origin timeout at
+   roughly **400–650 subscribers**. Past that the caller gets a timeout, retries, and the retry
+   restarts the list from the beginning: duplicate pushes to everyone the first attempt already
+   reached, which is the worst possible failure for a broadcast product.
+2. **A user-facing unsubscribe.** There is none. Subscriptions are written only by the admin CLI
+   (`register_client.py --subscribe`), and a subscriber's only exit is deleting their account.
+3. **An idempotency key**, without which (1) has no safe retry and a duplicated broadcast is
+   indistinguishable from two real ones.
+
 *Source: issue #6.*
 
 ---
@@ -241,7 +280,11 @@ internet, turning a single abuser into a lockout for every user.
 
 It therefore keys on `CF-Connecting-IP`, **but only when the request's peer is itself a Cloudflare
 address** — the peer being the *rightmost* `X-Forwarded-For` entry, which the reverse proxy authors
-from the TCP peer, checked against `YO_CLOUDFLARE_RANGES`. Anything else keys on the peer. Trusting
+from the TCP peer, checked against `YO_CLOUDFLARE_RANGES`. **That chain is read only when the socket
+peer is private or loopback**, i.e. only when a proxy on this host authored it; a direct caller from
+a public address has its header ignored entirely, and a non-IP entry falls back to the socket peer
+rather than becoming a bucket of its own. See G33 for why that qualification is not decoration.
+Anything else keys on the peer. **IPv6 keys on the /64, not the address** — see G32. Trusting
 `CF-Connecting-IP` unconditionally, as this originally did, was a **measured bypass: 15 signups
 against a limit of 10**, since any client may set that header directly. `X-Forwarded-For[0]` is not
 a fix either — Cloudflare forwards a client-supplied `X-Forwarded-For` unmodified, so position [0]
@@ -256,6 +299,12 @@ people printed on posters. **Blocking**, not approval, is the control: it is one
 the person from your list, and a blocked sender still receives an ordinary `{"delivered":true}` with
 no push sent, because telling senders they are blocked turns a block into a notification for the
 person who was blocked.
+
+**That is correct here and does not generalise, which G9 originally got wrong.** Answering a lie is
+right when *the sender is the adversary*, which is the whole premise of a block. It is wrong when
+the sender is a friend whose recipient's registration failed — that person is not an attacker to be
+starved of information, they are the one who most needs it, and the one best placed to tell the
+recipient to open the app. Same response shape, opposite ethics; see G9.
 
 The visible consequence is that a new account's home screen is **empty** until it adds somebody, so
 the menu gained an **ADD FRIEND** band — the counterpart of Yo's own "FIND FRIENDS" row. Without it
@@ -328,9 +377,19 @@ code is relevant here.
 `ThreadingHTTPServer` + SQLite, `google-auth` as the only runtime dependency — **pinned to 2.56.2**
 since 2026-07-28, so a rebuild cannot silently change the library that verifies Google ID tokens —
 used for configured FCM delivery and for verifying Google ID tokens (FR10). Endpoints: `/healthz`,
-`/install`, `/privacy`, `/delete-account`, `/v1/signup`, `/v1/login`, `/v1/google`, `/v1/session`
-(DELETE), `/v1/register`, `/v1/friends` (GET/POST/DELETE), `/v1/block` (POST/DELETE),
-`/v1/blocked`, `/v1/send`, `/v1/account` (DELETE), `/v1/broadcast`.
+`/install`, **`/install/yo.apk`**, `/privacy`, `/delete-account`, `/v1/signup`, `/v1/login`,
+`/v1/google`, `/v1/session` (DELETE), `/v1/register`, `/v1/friends` (GET/POST/DELETE), `/v1/block`
+(POST/DELETE), `/v1/blocked`, `/v1/send`, `/v1/account` (DELETE), `/v1/broadcast`.
+
+**`/install/yo.apk` was missing from this list until 2026-07-28**, and it is the one route whose
+absence matters most: it is public, unauthenticated, dispatched **before** the `_authenticate()`
+gate, and it serves `application/vnd.android.package-archive` — a **binary download**, handled by
+`_handle_install_apk`. A section that exists to enumerate the public surface, and misses the only
+public route that serves a binary, is exactly the sort of claim this document exists to make
+trustworthy. It is served only when `YO_APK_PATH` is set, and says so plainly when it is not (FR8).
+
+Three undocumented aliases while enumerating: `/install/`, `/privacy/` and `/delete-account/` are
+each accepted alongside their slash-less forms.
 
 `/v1/photo` (POST + GET) was removed on 2026-07-28 with the feature (G24). Both verbs now answer
 `404 {"error":"not_found"}` to an authenticated caller. The tests that assert this deliberately send
@@ -350,10 +409,13 @@ Schema changes are additive — the only mechanism is `CREATE TABLE IF NOT EXIST
 `ALTER TABLE ... ADD COLUMN`, so an existing database gains the new tables on next start and needs
 no migration step.
 
-**Auth.** Public: `/healthz`, the `/install`, `/privacy` and `/delete-account` pages, and
-`/v1/signup` + `/v1/login` + `/v1/google` (which mint credentials and so cannot require one).
-Everything else requires a bearer token, resolved to an account server-side. Broadcast clients keep their separate `X-Yo-Client-Id` / `X-Yo-Client-Key`
-pair verified against a stored hash — that path is unchanged. See FR9.
+**Auth.** Public: `/healthz`, the `/install`, `/privacy` and `/delete-account` pages, **the
+`/install/yo.apk` download** (added to this partition 2026-07-28 — it was missing, and it is the
+only public route that serves a binary), and `/v1/signup` + `/v1/login` + `/v1/google` (which mint
+credentials and so cannot require one). Everything else requires a bearer token, resolved to an
+account server-side. Broadcast clients keep their separate `X-Yo-Client-Id` / `X-Yo-Client-Key` pair
+verified against a stored hash — that path is otherwise unchanged, though it now shares the
+credential rate limiter (FR7). See FR9.
 
 **Configuration.** `yoBackendUrl` and `yoInviteUrl` come from Gradle properties or the gitignored
 `local.properties`, baked into `BuildConfig`. There are **no defaults at all** — a missing value
@@ -523,10 +585,18 @@ feature, G24), and moving fixture creation out of the timed block. Verified by r
 CPU spinners, 5/5 passed after at equal or heavier load, with no assertion changed.
 
 **G7 — No CI. — RESOLVED 2026-07-26.** `.github/workflows/ci.yml` runs both suites on every push to
-`main` and every pull request: JDK 17 + Gradle for `:app:testDebugUnitTest` and `:app:assembleDebug`,
-and Python 3.12 for the backend. Test reports upload as an artifact on failure. Note the workflow
-has never executed on a GitHub runner — the first push is its real test, particularly Robolectric's
-runtime jar download.
+`main` and every pull request: JDK 17 + Gradle for `:app:testDebugUnitTest` and `:app:lintDebug`,
+and Python 3.12 for the backend. Reports upload as an artifact on failure.
+
+**Two things this entry said were wrong by 2026-07-28.** It said the Gradle job runs
+`:app:assembleDebug`. It runs `:app:lintDebug` instead: producing an APK now requires real
+deployment configuration — backend URL, invite URL, privacy URL, OAuth client id — which CI has no
+business holding, and lint still merges the manifest, links resources and compiles everything, so
+it covers what `assembleDebug` covered here and adds static analysis on top. And it said the
+workflow "has never executed on a GitHub runner — the first push is its real test". It has: the
+last ten runs are green, and the most recent run on `main` took 3m12s. Robolectric's runtime jar
+download, the specific thing that sentence was worried about, has never been the failure it was
+expected to be.
 
 The gaps below were opened, or surfaced, by the work that closed G3–G7. They are recorded rather
 than smoothed over: closing a security gap honestly means naming what it did *not* close.
@@ -534,17 +604,73 @@ than smoothed over: closing a security gap honestly means naming what it did *no
 **G8 — The session token is stored in the clear.** `SharedPreferencesSessionStore` writes it to
 MODE_PRIVATE preferences. Other apps cannot read it, it sits in file-based-encrypted app storage,
 and `allowBackup="false"` keeps it out of cloud backups — but a rooted device or a physical
-extraction yields a working token. `EncryptedSharedPreferences` would close this; it was judged
-disproportionate for a prototype, and it is worth noting that it would not have helped against the
-threat G3 was actually about, since a token only exists after a real login.
+extraction yields a working token. The verdict is still defer, which this entry already reached.
+Its reasoning was wrong in two ways worth recording.
 
-**G9 — `/v1/send` is a device-registration oracle.** Login was hardened so an unknown user and a
-wrong password are indistinguishable, but `send` still answers 404 `recipient_unregistered` for an
-account with no registered device and 200 for one with a device. An authenticated caller can
-therefore learn which accounts have a live install. Bounded — account *existence* is already
-discoverable by design, since you must be able to add someone by name, and `/v1/friends` and
-`/v1/block` say `no_such_user` outright — but the blocked-sender path shows the fix: return an
-indistinguishable success. G18 changed which string is returned, not this property.
+**The named remedy no longer exists.** This entry said "`EncryptedSharedPreferences` would close
+this", which reads as a free option waiting to be taken. It is not available to take:
+`androidx.security:security-crypto` 1.1.0 (released 2025-07-30) **deprecated every API in the
+library**, as of 1.1.0-beta01, in favour of "existing platform APIs and direct use of Android
+Keystore" — and it shipped **no drop-in replacement**. Adopting it today means adopting a
+deprecated library, and doing the work properly means writing against the Keystore directly.
+
+**And the cost was never just the dependency.** Three things it would buy, none of them recorded
+before:
+
+- Tink lands in the APK, for one string.
+- A new crash-at-startup class. `SharedPreferencesSessionStore` is a `@Singleton` injected during
+  Hilt's first injection, so a Keystore or keyset mismatch — the state a device-to-device migration
+  produces — is not a failed read, it is an app that cannot start, recoverable only by uninstall.
+  That happens **even with `allowBackup="false"`**, because migration transfers are not the backup
+  path.
+- All 5 tests in `SharedPreferencesSessionStoreTest` go, because Robolectric has no AndroidKeyStore.
+  Trading a tested store for an untested one, to protect against an attacker who already has the
+  device.
+
+**The real mitigation for what G8 is actually about is G10, not encryption at rest.** The threat
+here is a stolen token being valid forever. Encrypting it raises the cost of the theft; expiring it
+bounds the damage of a theft that succeeded anyway. It also remains true, as this entry originally
+noted, that none of this would have helped against the threat G3 was about, since a token only
+exists after a real login.
+
+**G9 — `/v1/send` is a device-registration oracle. — OPEN, and deliberately so as of 2026-07-28.**
+Login was hardened so an unknown user and a wrong password are indistinguishable, but `send` still
+answers 404 `recipient_unregistered` for an account with no registered device and 200 for one with
+a device. An authenticated caller can therefore learn which accounts have a live install. Bounded —
+account *existence* is already discoverable by design, since you must be able to add someone by
+name, and `/v1/friends` and `/v1/block` say `no_such_user` outright.
+
+**This entry used to prescribe the fix, and the prescription was wrong.** It read: "the
+blocked-sender path shows the fix: return an indistinguishable success." Three reasons that is not
+guidance to follow here.
+
+- **It re-opens G25 for one of the exact cases G25 names.** Closing this at the response body means
+  answering `delivered:true` for a Yo that was not delivered. G25 exists because the app used to
+  claim delivery it had not confirmed, and "addressed to an account whose device never registered"
+  is on its own list of the cases that looked like success and were not. The two fixes are
+  individually reasonable and jointly incoherent: one of them has to lose, and it is not the one
+  that keeps the user honestly informed.
+- **It would not even work.** The deviceless path is two SQLite probes; the delivering path makes an
+  HTTPS round trip to FCM. That is a 50–500ms timing side channel that survives any change to the
+  response body, so the oracle would be closed on paper and open in practice — the worst of the
+  three states.
+- **It leaves a direct tell standing.** Folding only the deviceless case leaves the
+  `502 fcm_delivery_failed` path, which is exactly what a stale token after an uninstall/reinstall
+  produces, saying plainly that a device once existed.
+
+**And the blocked-sender sentence needs amending where it stands, in FR9.** Lying to the sender is
+correct there for a reason that does not generalise: for a block, *the sender is the adversary*, and
+the whole point is to tell them nothing. For a friend whose registration failed, the sender is not
+the adversary — they are the person who most needs to know, and the person best placed to tell the
+recipient to open the app. Same response shape, opposite ethics.
+
+Correcting the record on **G18** while it is in view: that change is **diagnostic only and has no
+user-visible effect whatsoever**. `YoBackendApi.sendYo`
+(`app/src/main/java/hr/theshop/yo/data/remote/YoBackendApi.kt:264`) returns
+`response.isSuccessful && JSONObject(response.body).optBoolean("delivered", false)` — it reads the
+`delivered` boolean and discards the rest of the body, `reason` included. So the string G18
+carefully split is read by curl and by the server log and by nothing the user will ever see. It was
+still worth doing; it is not worth citing as a change to how sending behaves.
 
 **G10 — Tokens never expire.** The `tokens` table has a `created_at` that nothing reads. There is
 no TTL, no "sign out everywhere", and no per-device labelling, so an exfiltrated token is valid
@@ -555,9 +681,23 @@ a defect, and it is a deliberate trade: the alternative was keeping a bootstrap 
 which is precisely G3. Rate limiting is the only control, and it resets when the process restarts,
 so it slows credential stuffing rather than preventing account creation at scale.
 
-**G12 — CI is unit tests only.** No ktlint/detekt, no `:app:lint`, and no instrumentation tests
-(which would need an emulator). The G6 class of bug is now caught; static-analysis and on-device
-regressions are not.
+**G12 — CI has no style linter and no instrumentation tests.** This entry used to read "CI is unit
+tests only … no ktlint/detekt, no `:app:lint`, and no instrumentation tests", and the middle clause
+is false. `.github/workflows/ci.yml:51` runs `./gradlew :app:lintDebug --no-daemon`, added in
+`b0f9b78` (PR #32), and it passes clean with **no baseline file and no `lint {}` block** suppressing
+anything — so Android's own static analysis is enforced on every push and every pull request, and
+has been for some time.
+
+What is genuinely still missing is narrower than the old wording implied:
+
+- **No ktlint and no detekt**, deliberately. Not one defect recorded in this document would have
+  been caught by a style or complexity linter. G30's live defect below is the current example: a
+  sender-authored hashtag interpolated into a notification body with no charset validation. That is
+  a domain rule about what a string is allowed to say, not a code smell, and no formatter has an
+  opinion about it.
+- **No instrumentation tests**, which would need an emulator. This is the real gap, and it is the
+  one the record keeps pointing at: G13, G22 and G23 each needed a real device or a real deployment
+  to see, and none of the three is visible to lint or to a JVM suite by construction.
 
 **G13 — Google sign-in works end to end. — RESOLVED 2026-07-26.** Proven on a physical S25 against
 the production backend over the public internet: picker → `404 username_required` → username
@@ -644,15 +784,55 @@ This discloses nothing new, which is why it does not worsen G9: `_handle_add_fri
 `_handle_block` already answer `no_such_user` for names that do not exist, so any authenticated
 caller could already enumerate accounts. The conflation bought no privacy, only a wrong message.
 
-**G19 — the FCM token APIs the app is built on are deprecated.** firebase-messaging 25.x marks
+**Scope, corrected 2026-07-28: this is a diagnostic change and nothing more.** The Android client
+never reads the string. See G9 for the detail and the line.
+
+**G19 — the FCM token APIs the app is built on are deprecated. — STILL DEFERRED, for entirely
+different reasons than this entry gave.** firebase-messaging 25.x marks
 `FirebaseMessaging.getToken()`, `deleteToken()`, `send()` and
 `FirebaseMessagingService.onNewToken()` deprecated in favour of `register()` / `unregister()` and
-`onRegistered()` / `onUnregistered()`. The replacement is not a rename: `register()` returns no
-token and delivers it asynchronously to the service instead, so registration stops being something
-the app can ask for and retry, and becomes something it can only wait for. That would rewrite the
-retry, the backoff and the `NOT RECEIVING YOS` state added for G17. Deprecated is not removed, and
-the current path is the one proven end-to-end on a handset, so it is suppressed with a comment for
-this release and migrated deliberately afterwards, together.
+`onRegistered()` / `onUnregistered()`.
+
+**The reason recorded here was false, and a wrong reason is self-perpetuating** — nobody re-derives
+a decision that already has an argument attached, so it is worth saying plainly which argument was
+wrong. This entry claimed that `register()` "returns no token and delivers it asynchronously to the
+service instead, so registration stops being something the app can ask for and retry, and becomes
+something it can only wait for", and that this "would rewrite the retry, the backoff and the
+`NOT RECEIVING YOS` state added for G17". None of that holds. Checked by disassembling the cached
+`firebase-messaging-25.1.1.aar` rather than by reading the release notes:
+
+- `register()` returns a `Task<Void>` completed by a `TaskCompletionSource` whose exception table
+  catches `IOException` — **structurally identical to `getToken()`**, which is the API the retry was
+  built around. Failure is observable exactly as it is today.
+- **Both funnel through the same `blockingRegister(boolean)`.** They are two façades over one
+  code path, not two mechanisms.
+- So the G17 retry and backoff transplant essentially unchanged. The value the old call returned is
+  not what the retry loop keyed on; the failure was.
+
+**The migration would in fact close a gap, not open one.** `onRegistered` fires on **every**
+successful `register()`, including a cache hit, whereas `onNewToken` fires only on token rotation.
+That launch-time silence is precisely what `RegisterDeviceUseCase` complains about in G17 — "nothing
+else in the app would ever ask again" — so the deprecated API is the one with the hole.
+
+**The real reasons to defer**, none of which this entry ever identified:
+
+1. **It is a one-way manifest switch with no runtime fallback.** Both APIs check the
+   `firebase_messaging_installation_id_enabled` meta-data flag, and **each throws
+   `IllegalStateException` if it is set the other way**. There is no path that tries the new API and
+   falls back to the old one, and that flag appears **nowhere in this repository today**. Migrating
+   means committing the whole app to one API in one release.
+2. **The stored identifier changes from an FCM token to the FID**, which rotates it for every
+   existing install. Every device re-registers, and anything sent to the old identifier in the
+   window is lost — for an app whose only surface is the notification, that is the failure mode that
+   looks exactly like G17.
+3. **The true V1 path wants Google Play services >= `261200000`** and silently falls back below
+   that, so the behaviour on older handsets is not the behaviour under test on a current one.
+4. **No removal version or date has been announced**, and Firebase's own documentation says both
+   patterns are "fully co-supported".
+
+The current path is the one proven end-to-end on a handset (§7.2), so it stays suppressed with a
+comment for this release and is migrated deliberately afterwards — on the strength of (1) and (2),
+which are real, and not on the strength of a retry rewrite that would never have been needed.
 
 **G20 — "ATTACH LOCATION" attached nothing the recipient could see. — RESOLVED 2026-07-27,
 verified on device.** `YoMessage` carried latitude and longitude and `MainViewModel.sendYo` filled
@@ -743,9 +923,11 @@ debug key is the failure that works perfectly in development and breaks for ever
 Blocked on `gcloud auth login` / `firebase login`; both CLI tokens are expired.
 
 The gaps below were found by the pre-release audit on 2026-07-28 and by the adversarial review that
-followed it. Five are resolved (G23, G24, G25, G26, G28); three are open and recorded rather than
-fixed — G27 cannot be closed from code at all, and G29 and G30 were deliberately deferred with
-reasons given.
+followed it. Five are resolved (G23, G24, G25, G26, G28). G27 cannot be closed from code at all and
+G29 is deliberately deferred with reasons given. **G30 is now partly closed** — the first mitigation
+it named shipped, along with a defect found while implementing it — and its trailing paragraph became
+G31. G32 and G33 were opened and closed in the same pass and are recorded because the reasoning is
+the useful part, not the diff.
 
 **G23 — `link` and `hashtag` were local-only. — RESOLVED 2026-07-28.** Both were written to Room and
 never transmitted: the sender saw an attachment, the recipient got a plain Yo. This is G20 exactly,
@@ -835,6 +1017,30 @@ changes the Room schema, and this database has **no migrations and no
 already exists. Verified rather than assumed: `app/schemas/.../2.json` is byte-identical after a
 full build, identityHash still `1536e7be5fe233a3141085fe9c550969`. A dead column is cheap; a crash
 loop on upgrade is not.
+
+**The schema bump is not the whole cost, and the omission changes the decision.** This paragraph
+originally implied that once a migration mechanism exists, dropping the column is a line of SQL in
+it. It is not, at this `minSdk`:
+
+- **`minSdk 24` means the platform SQLite is 3.9**, and `ALTER TABLE ... DROP COLUMN` did not land
+  until **3.35.0 (2021)**. On the oldest devices this app supports, the one-liner does not exist as
+  a statement.
+- So dropping it requires a **full table rebuild**: create the new table, `INSERT ... SELECT` the
+  surviving columns across, drop the old, rename the new.
+- **The failure modes differ in kind, and that is the part worth carrying.** A wrong `ADD COLUMN`
+  crashes loudly at open — you find out on the first launch, from anybody. A wrong `INSERT ...
+  SELECT` **succeeds** and silently corrupts user data: mismatched column order copies the wrong
+  values into the right column names and nothing complains, ever.
+
+**The deferral is genuinely free, which is the good news.** The rebuild SQL is version-independent:
+it is byte-for-byte the same statement whether it runs folded into the next migration that has to be
+written anyway, or on its own, later. Nothing is gained by doing it now and nothing is lost by not.
+
+**The current Room version is 2**, not 1 — `app/src/main/java/hr/theshop/yo/data/local/YoDatabase.kt:8`
+reads `version = 2`, and the exported schema is `app/schemas/.../2.json`. So the next bump is **2→3**,
+not 1→2. Worth naming while looking: **there is no exported `1.json`**, because the 1→2 bump also
+shipped with no migration. That is latent rather than harmless — but it is academic while the app is
+unreleased and no install exists to be broken by it, and it becomes real the day one does.
 
 **G25 — the send confirmation was unconditional. — RESOLVED 2026-07-28.** The band flashed `YO!` the
 instant it was tapped, before the request had gone anywhere. A Yo that was rate-limited, addressed
@@ -932,33 +1138,162 @@ The row is written on failure on purpose, incidentally — see G25 — because `
 only in that row and discarding it would destroy what the user typed at the moment they want to
 retry. The fix is a column, not a deletion.
 
-**G30 — anyone can send an attacker-controlled link to any username they can guess. — OPEN.**
+**G30 — anyone can send an attacker-controlled link to any username they can guess. — PARTLY CLOSED
+2026-07-28; the send rule itself is still open.**
 `POST /v1/send` requires **authentication but not friendship**, and signup is public (G11). So the
 cost of pushing a link into a stranger's notification shade is one signup and one guessed username —
 and usernames are guessable by design, since the whole social model is "Yo `<USERNAME>`" printed on
-a poster (FR9).
+a poster (FR9). That has not changed.
 
 `openableLink` confines the destination to `http`/`https` (G23), so this is not arbitrary-intent
-territory. What remains is ordinary phishing with a trust advantage: the notification body says
-`TAP TO OPEN LINK` and **never shows the host**, so the recipient taps without seeing where they are
-going, from a notification wearing a name they may recognise.
+territory. What remained was ordinary phishing with a trust advantage: the notification body said
+`TAP TO OPEN LINK` and **never showed the host**, so the recipient tapped without seeing where they
+were going, from a notification wearing a name they may recognise. **The body now names the host**,
+which is the half that shipped.
 
-Two cheap mitigations, neither applied yet:
+Two cheap mitigations were named. **The first shipped on 2026-07-28. The second is declined for
+now**, and the reasoning below is why.
 
-- **Show the host in the body.** `· example.com` instead of a bare `TAP TO OPEN LINK`. This is a
-  string change and it converts a blind tap into an informed one, which is most of the value.
-- **Require friendship to send.** This is the stronger control and it is nearly free, since the
-  friendship table already exists — but it is a product decision, not a bug fix: it would end
-  unilateral "Yo `<USERNAME>`" sends, which §5 records as deliberate historical fidelity. Blocking
-  is the existing answer, and blocking is reactive by construction: it works only after the first
-  message has already been delivered.
+**Shipped: the host is now in the notification body.**
+`From ADA  ·  TAP TO OPEN example.com` instead of a bare `TAP TO OPEN LINK`. It converts a blind tap
+into an informed one, which is most of the value and was correctly described as a string change.
+Five things about it were not string changes.
 
-Worth recording alongside this, and pre-existing rather than introduced here: the default
-`BaseHTTPRequestHandler` access log writes the full request line, so the container log contains
-entries like `DELETE /v1/block?username=BOB` next to the caller's IP. That is a record of who
-blocked whom, sitting somewhat awkwardly beside a privacy policy that says the service is not
-retained as a log of who you are. It has always been true; this change is simply the first to
-exercise those routes from the app.
+**A live defect was found while implementing it, and it is the reason the two halves had to ship
+together.** The hashtag was interpolated verbatim into the notification body with **no charset
+validation anywhere** — not on the attach sheet, not in the ViewModel, and not in the backend's
+`_optional_attachment`, which checked type and byte length and nothing else. So a sender could
+attach the hashtag `x  ·  TAP TO OPEN paypal.com` and forge **a second, attacker-chosen tap
+promise**, in someone else's notification shade, under a name they may recognise, using the app's
+own separator and its own wording. Showing the real host while leaving that open would have shipped
+a mitigation the attacker can simply rewrite: whichever host the app names honestly, the hashtag can
+name a better one directly beside it. They go together or not at all. `displayHashtag` now strips
+everything outside `[\p{L}\p{N}_-]` — `\p{L}` excludes format characters, so RTL overrides and
+zero-width joiners go with the spaces.
+
+**The exhaustive combination test that defends "at most one TAP TO OPEN" could never have caught
+it**, and that is worth more than the fix. The test enumerated every coherent combination of link,
+tappability and location — and **every single case passed `hashtag = null`**. It was exhaustive over
+the axes somebody had thought of, which is the failure mode exhaustive tests have. It now crosses
+**48 combinations**, including hostile hashtags, and asserts that no hashtag may name a destination
+whatever the sender typed.
+
+**The host is shown in its punycode form, deliberately.** `Uri.host` returns whatever the sender
+wrote and does **no IDN conversion at all**, so a Cyrillic homograph of `example.com` comes back
+looking exactly like `example.com` — and displaying it would have made the notification *more*
+convincing than saying nothing. Converted, the same host reads `xn--exmple-4nf.com`, which is
+visibly not the real thing. Showing the Unicode form would have been the bypass rather than the
+mitigation.
+
+**`IDN.toASCII` is not a sanitizer, and this was verified by execution rather than assumed.** On
+JDK 17 it passes spaces, newlines and underscores straight through, and will happily emit them
+*inside* an `xn--` label: `x  ·  TAP TO OPEN paypal.com` converts to
+`xn--x    tap to open paypal-2cb.com` — a "host" containing the app's own separator and its own tap
+wording, intact, after the conversion that was supposed to make it safe. Hence a strict `[a-z0-9.-]`
+post-filter applied *after* conversion. That filter has a second benefit: Android's IDN is
+ICU-backed and may not agree with the JDK's, so anything the two implementations disagree about
+fails the filter and degrades to the host-less wording. The behaviour is device-independent by
+construction rather than by hoping the two libraries match.
+
+**Truncation is from the LEFT, keeping whole labels.** The attack is
+`paypal.com.<sixty characters>.evil.com`. Right-truncation renders `paypal.com.aaaa…`, which names
+the wrong party and looks authoritative doing it — strictly worse than showing no host at all.
+Left-truncation keeps the labels that decide where the tap goes.
+
+**Declined for now: "require friendship to send".**
+The original entry called this "the stronger control and nearly free, since the friendship table
+already exists". It is **two different features wearing one name, and only one of them is a
+control**:
+
+- **"Sender must have added recipient" is worth nothing.** Adding is unilateral and unmetered (FR9),
+  so the attacker sends one extra `POST /v1/friends` first and is back exactly where they were. It
+  costs one request and buys the defender nothing.
+- **"Recipient must have added sender" is a real control** — and it is mutual consent under another
+  name, which §5 explicitly rejects as contradicting the original's social model. It is the friend
+  request, arrived at from the other direction.
+
+It also **breaks the normal path**, which is the part that decides it. A user who added somebody
+unilaterally — the ordinary case, the whole "Yo `<USERNAME>`" idiom — would tap their band, see the
+delivered animation, and have nothing arrive. Forever, with no feedback possible, because feedback
+is precisely the oracle this design forbids: telling the sender "they have not added you" is the
+same disclosure a block is designed never to make. And it would silently invalidate the
+reviewer-seeding instruction in RELEASE.md §9 item 11, which says to seed *a* friend — under this
+rule a friendship seeded in one direction leaves the reviewer's Yo failing exactly as before.
+
+Blocking remains the answer, with its known limit: it is reactive by construction and works only
+after the first message has landed.
+
+**G31 — the caller's IP is written to an access log by design. — RESOLVED 2026-07-28 by disclosure
+and redaction.** This was the trailing paragraph of G30, and it was **over-read in one direction and
+under-read in the other**.
+
+The over-read: it said the log was "a record of who blocked whom". The **blocker's** username was
+never in it, and could not have been — the actor is authenticated by a bearer *header*, and
+`BaseHTTPRequestHandler` does not log headers. What the line actually recorded was who was
+**blocked**, beside the **caller's IP**.
+
+The under-read is the part that mattered, and it is not about usernames at all. The live privacy
+policy made two claims the system broke regardless of who was named:
+
+- **"briefly."** The rate limiter holds an IP for 60–900 seconds. The access log held it until
+  30 MB of rotation, which at this volume is **months**.
+- **"to rate-limit sign-ups and sending."** That is a stated purpose limitation. A debugging log is
+  not that purpose, and a log that exists for a different reason than the one disclosed is the
+  problem whether or not anything sensitive is in the line.
+
+Fixed by overriding `log_message` to redact query-string **values** while keeping parameter names,
+so the line stays useful for debugging and stops recording who was acted on. `log_message` is the
+right override point rather than `log_request`: `log_error` funnels through it too, and that is the
+path that echoes a malformed request line back out of `send_error`. The live privacy policy has
+gained a sentence disclosing the access log, so the remaining fact — the caller's IP is written to a
+rotating log and then discarded — is **disclosed rather than contradicted**, which is the state this
+gap exists to reach.
+
+**G32 — the credential rate limiter was free to bypass from any IPv6 client. — RESOLVED
+2026-07-28.** The limiter keyed on the full client address. The smallest allocation a residential
+IPv6 customer receives is a **/64 — 2^64 addresses** — so an IPv6 caller had an effectively
+unlimited supply of fresh buckets and the limit was, for them, not a limit.
+
+What that limiter is doing at once is why this matters more than a rate-limit bug usually does. It
+is simultaneously **the signup-flood control, the login brute-force control, and the only cost
+control on the 600,000-iteration PBKDF2 that `/v1/signup` runs** (FR9) — the last of which makes an
+unmetered signup endpoint a CPU-exhaustion surface on a container capped at 0.5 CPU, not merely an
+account-creation one.
+
+`_limiter_key` now buckets IPv6 to its /64 and leaves IPv4 on the address, where one address is
+roughly one host. Checked before shipping it, because the fix is only sound if the input is real:
+**`YO_CLOUDFLARE_RANGES` in production already lists all seven of Cloudflare's IPv6 egress ranges**
+alongside the fifteen IPv4 ones, so `CF-Connecting-IP` is genuinely trusted for IPv6 peers and the
+key is the caller's own /64. Had those ranges been IPv4-only, every IPv6 user would have collapsed
+into one bucket keyed on Cloudflare's own address — turning a bypass into a global lockout, which is
+the failure FR9's limiter was designed around in the first place.
+
+**G33 — the `X-Forwarded-For` trust boundary: an audit finding refuted, and a real one underneath
+it. — RESOLVED 2026-07-28.** An audit claimed the rightmost `X-Forwarded-For` entry was trusted
+unconditionally and that the limiter was therefore bypassable in production.
+
+**That was measured against production on 2026-07-28 and refuted.** Twelve requests carrying twelve
+different forged `X-Forwarded-For` values all landed in **one** bucket: ten `400`s and then `429`.
+Traefik strips a client-supplied header and appends its own peer, so the forged chain never reached
+the application as anything but Traefik's own address. (The probe used a deliberately invalid
+password, because the limiter is consulted *before* validation — so it exercised the limiter fully
+and created no accounts.)
+
+**The real finding is underneath, and it is a documentation defect that became a code defect.**
+Production's safety lived **entirely in the proxy**, while `_client_address`'s own docstring promised
+something stronger: that if the `yo-cf-only` middleware were ever removed, "this falls back to the
+peer rather than reopening the spoof". That was false. The `X-Forwarded-For` override ran
+unconditionally, so removing the middleware — a Traefik label, one line, in a shared file — would
+have reopened exactly the spoof the docstring promised it would not. A comment asserting a safety
+property the code does not have is worse than no comment: it is the thing the next person reads
+instead of the code.
+
+The function now honours a forwarded chain **only when the socket peer is private or loopback**,
+i.e. only when a reverse proxy on this host authored it. A direct caller reaches the origin from a
+public address and has its header ignored, so the docstring's claim is true without Traefik. And a
+non-IP forwarded entry now falls back to the socket peer rather than becoming a rate-limit key of
+its own — otherwise a caller could mint unlimited buckets out of arbitrary strings, which is G32
+again by a different route.
 
 ---
 
@@ -991,11 +1326,29 @@ Two properties of the deployment matter to anyone reading this document for prod
 - **Exactly one replica, permanently.** The rate limiters are in-memory and the store is a non-WAL
   SQLite file, so a second replica halves every limit and invites `SQLITE_BUSY`. Horizontal scaling
   is not a configuration change here; it is a rewrite of FR9's limiter and the storage layer.
-- **A merge to `main` is no longer a deploy.** `backend/` is vendored into `lotar/claude` by an
-  explicit file list and baked into an image, so production is a snapshot taken at deploy time.
-  Under the old launchd agent the hazard was that branch-only code was absent from production;
-  the hazard is now the inverse and quieter — `main` can be *ahead* of the vendored copy and
-  nothing reports it.
+- **A merge to `main` is no longer a deploy.** `backend/` is copied into `lotar/claude` by hand and
+  baked into an image, so production is a snapshot taken at deploy time. Under the old launchd agent
+  the hazard was that branch-only code was absent from production; the hazard is now the inverse and
+  quieter — `main` can be *ahead* of the vendored copy and nothing reports it.
+
+  **"By an explicit file list" was wrong, and the correction inverts the documented hazard.** This
+  document and RELEASE.md §9 both said the vendoring runs off an explicit file list, and RELEASE.md
+  told a future operator to "check the vendored file list whenever the backend gains a module".
+  **There is no such list.** No script, no Makefile, no manifest, in either repository — only a
+  prose line in `modules/yo/CLAUDE.md` inside `lotar/claude` saying the directory is vendored by
+  one. The only machine-readable thing in the pipeline is that repo's `Dockerfile`, which does
+  `COPY backend/*.py ./` — **a glob**.
+
+  So a newly added backend module is **not** silently skipped, as the old text warned; the glob picks
+  up anything that reaches the vendored directory. The entire risk sits at the **manual copy step**
+  instead, and the remedy the old text prescribed pointed at nothing anybody could check. An
+  instruction that cannot be followed is worse than no instruction: it reads as a control and
+  discharges the reader's attention without doing anything.
+
+  **Current state, verified 2026-07-28.** All 7 vendored files are byte-identical to `yo-android`
+  `main`, and the six `.py` files inside the running production container hash-match them. So
+  production is genuinely running `main` as of that date — which is a fact about today, not a
+  property of the pipeline, and it is exactly the fact nothing reports.
 
 **The `photos` table is still there on the production database, and is deliberately left alone.**
 The code that created it is gone (G24) and a *fresh* database never gets one — there is a test

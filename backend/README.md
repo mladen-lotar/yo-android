@@ -44,9 +44,39 @@ position [0] is attacker-chosen, while it *rejects* a client-supplied `CF-Connec
 and writes that header itself. Trusting `CF-Connecting-IP` unconditionally was a measured bypass —
 15 signups against a limit of 10.
 
+**The forwarded chain is read only from a private or loopback socket peer** — only a reverse proxy
+on this host may author it. A direct caller arrives from a public address and has its header
+ignored, and a non-IP entry falls back to the socket peer rather than becoming a rate-limit bucket of
+its own. This was tightened on 2026-07-28: production was never spoofable, which was measured —
+twelve forged `X-Forwarded-For` values landed in one bucket, ten `400`s then `429`, because Traefik
+strips a client-supplied header and appends its own peer — but that safety lived entirely in the
+proxy, while `_client_address`'s docstring claimed the function fell back to the peer on its own. It
+does now. See `docs/PRD.md` G33.
+
+**IPv6 buckets on the /64, IPv4 on the address.** The smallest allocation a residential IPv6
+customer receives is a /64, so keying on the full address gave any IPv6 client an unlimited supply
+of fresh buckets against the limiter that is simultaneously the signup-flood control, the login
+brute-force control, and the only cost control on the 600,000-iteration PBKDF2 in `/v1/signup`. If
+you set `YO_CLOUDFLARE_RANGES`, list the IPv6 ranges too: with IPv4-only ranges, `CF-Connecting-IP`
+is not trusted for IPv6 peers and every IPv6 user collapses into one bucket keyed on Cloudflare's own
+address. See `docs/PRD.md` G32.
+
 The value has a twin at the edge: an allowlist on the proxy is what guarantees the peer is really
 Cloudflare. They are one trust boundary written down twice, so **change them together**; widening
 one alone either breaks routing or reopens the bypass.
+
+## The access log
+
+`log_message` is overridden to strip query-string **values** while keeping parameter names, so the
+log records `DELETE /v1/block?username=` and not who was blocked. It is overridden there rather than
+in `log_request` because `log_error` funnels through it too, and that is the path that echoes a
+malformed request line back out of `send_error`.
+
+The caller's IP is still written, by design, and the privacy policy discloses it. What it did not
+disclose before 2026-07-28 was the *duration* or the *purpose*: the policy said IPs are kept
+"briefly" and "to rate-limit sign-ups and sending", while the rate limiter holds one for 60–900
+seconds and the access log held it until 30 MB of rotation — months, at this volume — for debugging,
+which is not the stated purpose. See `docs/PRD.md` G31.
 
 The SQLite registry defaults to `backend/yo.db`. Use
 `--database /path/to/yo.db` to select another file. The server binds to
@@ -80,10 +110,16 @@ until its next maintenance window, so the payload sets
 
 ## API
 
-`GET /healthz` and the `/install` pages are unauthenticated — an invitee has no credential by
-definition. `POST /v1/signup`, `POST /v1/login` and `POST /v1/google` are public because they *mint*
-credentials; all three are rate limited per caller IP. Everything else needs
+`GET /healthz`, the `/install`, `/privacy` and `/delete-account` pages and the `/install/yo.apk`
+download are unauthenticated — an invitee has no credential by definition. `POST /v1/signup`,
+`POST /v1/login` and `POST /v1/google` are public because they *mint* credentials; all three are
+rate limited per caller IP, and `POST /v1/broadcast` shares that same limiter. Everything else needs
 `Authorization: Bearer <token>` (`X-Yo-Token: <token>` is accepted too).
+
+`/install/yo.apk` is the only public route that serves a binary
+(`application/vnd.android.package-archive`), and it is dispatched before the authentication gate. It
+is served only when `YO_APK_PATH` is set. The trailing-slash forms `/install/`, `/privacy/` and
+`/delete-account/` are accepted as aliases.
 
 Create an account. Usernames are canonically uppercase, 2–32 of `A-Z`, `0-9`, `_`; passwords are
 8–256 characters, stored as PBKDF2-HMAC-SHA256:
@@ -183,6 +219,11 @@ When a Yo cannot be delivered, `reason` says which of two different things went 
 They were one string until 2026-07-26, which meant a real friend whose registration had failed was
 reported to the sender as a nonexistent user.
 
+**The distinction is diagnostic only.** The Android client reads the `delivered` boolean and
+discards the rest of the body, `reason` included (`YoBackendApi.kt:264`), so this string reaches
+`curl` and the server log and nothing a user sees. Worth having; not worth citing as a change to
+how sending behaves. See `docs/PRD.md` G18.
+
 A Yo may also carry an optional `link` and `hashtag`. Both are forwarded to the recipient in the
 push and **neither is stored**:
 
@@ -248,8 +289,25 @@ curl -X POST http://127.0.0.1:8790/v1/broadcast \
   -H 'X-Yo-Client-Id: fedex' \
   -H "X-Yo-Client-Key: $YO_CLIENT_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"message":"Package update"}'
+  -d '{}'
 ```
+
+**A broadcast carries no message, and sending one is now a 400.** This example used to read
+`-d '{"message":"Package update"}'`, which documented a field that did not work: `message` was
+validated as a string and then never passed to `send_yo`, so the caller was told their text had gone
+to every subscriber when no subscriber could ever see it. A Yo is the whole content - the fan-out
+sends the client id as the sender and nothing else - so the field is **refused** rather than
+silently dropped. Delivering it would be a product change, not a fix.
+
+The route also **shares the credential rate limiter** with `/v1/signup`, `/v1/login` and
+`/v1/google`. It was the one credential-checking route with no limiter at all, so a client key could
+be guessed at line rate while a password could not. It shares their bucket rather than getting its
+own, so the limit cannot be dodged by moving between routes.
+
+The fan-out is **serial and synchronous** - one HTTPS call to FCM per subscriber, inside the
+request. That is fine at zero subscribers and is not fine at scale: see `docs/PRD.md` FR7 for the
+three things (a cap or async fan-out, a user-facing unsubscribe, an idempotency key) that have to
+exist before any client is provisioned.
 
 ## Tests
 
