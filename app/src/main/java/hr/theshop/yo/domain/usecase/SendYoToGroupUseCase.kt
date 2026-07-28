@@ -1,6 +1,7 @@
 package hr.theshop.yo.domain.usecase
 
 import hr.theshop.yo.domain.model.YoMessage
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.repository.GroupRepository
 import javax.inject.Inject
 
@@ -17,7 +18,7 @@ class SendYoToGroupUseCase @Inject constructor(
         sender: String,
         groupId: String,
         extras: YoMessage.() -> YoMessage = { this },
-    ): List<YoMessage> {
+    ): List<YoSendOutcome> {
         val group = groupRepository.getGroup(groupId) ?: return emptyList()
         return group.memberUsernames.map { member ->
             sendYoUseCase(sender = sender, recipient = member, extras = extras)

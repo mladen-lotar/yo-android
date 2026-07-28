@@ -5,10 +5,13 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import hr.theshop.yo.data.local.YoDatabase
 import hr.theshop.yo.domain.model.YoMessage
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.repository.YoRemoteDeliveryPort
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -31,11 +34,11 @@ class YoRepositoryImplTest {
                     hashtag = "#hello",
                     latitude = 45.815,
                     longitude = 15.982,
-                    photoUri = "content://photos/message-1",
                 )
 
-            repository.saveSent(message)
+            val outcome = repository.saveSent(message)
 
+            assertEquals(YoSendOutcome.Delivered, outcome)
             assertEquals(listOf(message), repository.observeHistory().first())
             assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
         } finally {
@@ -43,48 +46,94 @@ class YoRepositoryImplTest {
         }
     }
 
+    // The local row surviving is only half the contract. Asserting the row alone is what let a
+    // send that the server refused look identical to one it accepted, all the way up to the band
+    // flashing "YO!": the failure had nowhere to be reported, so nothing reported it.
     @Test
-    fun `saveSent keeps the local message when remote delivery returns false`() = runTest {
-        val database = createDatabase()
-        try {
-            val remoteDeliveryPort = FakeYoRemoteDeliveryPort(deliveryResult = false)
-            val repository = YoRepositoryImpl(database.yoDao(), remoteDeliveryPort)
-            val message =
-                YoMessage(
-                    id = "message-false",
-                    sender = "me",
-                    recipient = "Ada",
-                    timestamp = 1_000L,
-                )
+    fun `saveSent keeps the local message and reports NotDelivered when the server says no`() =
+        runTest {
+            val database = createDatabase()
+            try {
+                val remoteDeliveryPort = FakeYoRemoteDeliveryPort(deliveryResult = false)
+                val repository = YoRepositoryImpl(database.yoDao(), remoteDeliveryPort)
+                val message =
+                    YoMessage(
+                        id = "message-false",
+                        sender = "me",
+                        recipient = "Ada",
+                        timestamp = 1_000L,
+                    )
 
-            repository.saveSent(message)
+                val outcome = repository.saveSent(message)
 
-            assertEquals(listOf(message), repository.observeHistory().first())
-            assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
-        } finally {
-            database.close()
+                assertEquals(YoSendOutcome.NotDelivered, outcome)
+                assertEquals(listOf(message), repository.observeHistory().first())
+                assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
+            } finally {
+                database.close()
+            }
         }
-    }
 
     @Test
-    fun `saveSent keeps the local message when remote delivery throws`() = runTest {
+    fun `saveSent keeps the local message and reports Unreachable when delivery throws`() =
+        runTest {
+            val database = createDatabase()
+            try {
+                val remoteDeliveryPort =
+                    FakeYoRemoteDeliveryPort(deliveryFailure = IllegalStateException("offline"))
+                val repository = YoRepositoryImpl(database.yoDao(), remoteDeliveryPort)
+                val message =
+                    YoMessage(
+                        id = "message-throw",
+                        sender = "me",
+                        recipient = "Ada",
+                        timestamp = 1_000L,
+                    )
+
+                val outcome = repository.saveSent(message)
+
+                assertEquals(YoSendOutcome.Unreachable, outcome)
+                // The link and hashtag exist only in this row, so discarding it on a failed send
+                // would destroy what the user typed at the moment they want to retry.
+                assertEquals(listOf(message), repository.observeHistory().first())
+                assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
+            } finally {
+                database.close()
+            }
+        }
+
+    // Cancellation is not a delivery failure - it means the caller's scope is already gone. A
+    // `runCatching`, or a `catch (e: Throwable)` without this case in front of it, turns it into
+    // YoSendOutcome.Unreachable, which resumes a dead coroutine and breaks structured
+    // concurrency. This is the assertion that tells those two implementations apart.
+    @Test
+    fun `saveSent propagates cancellation rather than reporting a failed send`() = runTest {
         val database = createDatabase()
         try {
-            val remoteDeliveryPort =
-                FakeYoRemoteDeliveryPort(deliveryFailure = IllegalStateException("offline"))
+            val cancellation = CancellationException("scope gone")
+            val remoteDeliveryPort = FakeYoRemoteDeliveryPort(deliveryFailure = cancellation)
             val repository = YoRepositoryImpl(database.yoDao(), remoteDeliveryPort)
             val message =
                 YoMessage(
-                    id = "message-throw",
+                    id = "message-cancelled",
                     sender = "me",
                     recipient = "Ada",
                     timestamp = 1_000L,
                 )
 
-            repository.saveSent(message)
+            var outcome: YoSendOutcome? = null
+            val thrown =
+                try {
+                    outcome = repository.saveSent(message)
+                    null
+                } catch (e: CancellationException) {
+                    e
+                }
 
+            assertSame(cancellation, thrown)
+            assertEquals(null, outcome)
+            // The row is still written: saveSent persists before it ever tries to deliver.
             assertEquals(listOf(message), repository.observeHistory().first())
-            assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
         } finally {
             database.close()
         }

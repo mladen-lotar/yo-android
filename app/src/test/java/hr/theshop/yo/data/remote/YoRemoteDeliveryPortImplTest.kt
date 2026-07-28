@@ -1,62 +1,37 @@
 package hr.theshop.yo.data.remote
 
 import hr.theshop.yo.domain.model.YoMessage
-import hr.theshop.yo.domain.photo.PhotoEncoder
-import hr.theshop.yo.domain.photo.PhotoPayload
-import hr.theshop.yo.testing.StubYoBackendApi
-import kotlinx.coroutines.CancellationException
+import hr.theshop.yo.testing.FakeYoBackendApi
+import hr.theshop.yo.testing.SendCall
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class YoRemoteDeliveryPortImplTest {
     @Test
-    fun `deliver sends the text Yo and uploads an encoded photo`() = runTest {
+    fun `deliver sends the Yo and reports what the backend said`() = runTest {
         val backendApi = FakeYoBackendApi(sendResult = false)
-        val payload = PhotoPayload(base64Data = "encoded-photo", mimeType = "image/jpeg")
-        val photoEncoder = FakePhotoEncoder(payload = payload)
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
-        val message =
-            YoMessage(
-                id = "message-1",
-                sender = "me",
-                recipient = "Ada",
-                photoUri = "content://photos/message-1",
-            )
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
-        val delivered = deliveryPort.deliver(message)
+        val delivered =
+            deliveryPort.deliver(YoMessage(id = "message-1", sender = "me", recipient = "Ada"))
 
         assertFalse(delivered)
         assertEquals(listOf(SendCall("Ada")), backendApi.sends)
-        assertEquals(listOf("content://photos/message-1"), photoEncoder.encodedUris)
-        assertEquals(
-            listOf(UploadCall("message-1", "encoded-photo", "image/jpeg", "Ada")),
-            backendApi.uploads,
-        )
     }
 
     @Test
-    fun `deliver without a photo never encodes or uploads`() = runTest {
+    fun `deliver reports success when the backend confirms it`() = runTest {
         val backendApi = FakeYoBackendApi()
-        val photoEncoder = FakePhotoEncoder()
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
         val delivered =
-            deliveryPort.deliver(
-                YoMessage(
-                    id = "message-2",
-                    sender = "me",
-                    recipient = "Lin",
-                ),
-            )
+            deliveryPort.deliver(YoMessage(id = "message-2", sender = "me", recipient = "Lin"))
 
         assertTrue(delivered)
         assertEquals(listOf(SendCall("Lin")), backendApi.sends)
-        assertTrue(photoEncoder.encodedUris.isEmpty())
-        assertTrue(backendApi.uploads.isEmpty())
     }
 
     // The regression this guards is gap G20: an attached location was written to local history
@@ -65,7 +40,7 @@ class YoRemoteDeliveryPortImplTest {
     @Test
     fun `deliver forwards an attached location to the backend`() = runTest {
         val backendApi = FakeYoBackendApi()
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, FakePhotoEncoder())
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
         deliveryPort.deliver(
             YoMessage(
@@ -80,190 +55,85 @@ class YoRemoteDeliveryPortImplTest {
         assertEquals(listOf(SendCall("Ada", 45.815, 15.982)), backendApi.sends)
     }
 
+    // Gap G23, and the exact repeat of G20 one attachment over: link and hashtag were written to
+    // Room, rendered back to the sender as attached, and never named in the sendYo call, so the
+    // recipient's notification could not possibly carry them.
     @Test
-    fun `deliver sends no coordinates when no location was attached`() = runTest {
+    fun `deliver forwards an attached link and hashtag to the backend`() = runTest {
         val backendApi = FakeYoBackendApi()
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, FakePhotoEncoder())
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
-        deliveryPort.deliver(YoMessage(id = "message-9", sender = "me", recipient = "Ada"))
+        deliveryPort.deliver(
+            YoMessage(
+                id = "message-10",
+                sender = "me",
+                recipient = "Ada",
+                link = "https://example.com/live",
+                hashtag = "worldcup",
+            ),
+        )
 
-        assertEquals(listOf(SendCall("Ada", null, null)), backendApi.sends)
-    }
-
-    @Test
-    fun `deliver skips upload when a photo cannot be encoded`() = runTest {
-        val backendApi = FakeYoBackendApi()
-        val photoEncoder = FakePhotoEncoder(payload = null)
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
-
-        val delivered =
-            deliveryPort.deliver(
-                YoMessage(
-                    id = "message-3",
-                    sender = "me",
-                    recipient = "Grace",
-                    photoUri = "content://photos/missing",
-                ),
-            )
-
-        assertTrue(delivered)
-        assertEquals(listOf("content://photos/missing"), photoEncoder.encodedUris)
-        assertTrue(backendApi.uploads.isEmpty())
-    }
-
-    @Test
-    fun `deliver keeps the text result when photo upload throws`() = runTest {
-        val backendApi = FakeYoBackendApi(uploadFailure = IllegalStateException("offline"))
-        val photoEncoder =
-            FakePhotoEncoder(
-                payload = PhotoPayload(base64Data = "encoded-photo", mimeType = "image/jpeg"),
-            )
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
-
-        val delivered =
-            deliveryPort.deliver(
-                YoMessage(
-                    id = "message-4",
-                    sender = "me",
-                    recipient = "Katherine",
-                    photoUri = "content://photos/message-4",
-                ),
-            )
-
-        assertTrue(delivered)
         assertEquals(
-            listOf(UploadCall("message-4", "encoded-photo", "image/jpeg", "Katherine")),
-            backendApi.uploads,
+            listOf(
+                SendCall(
+                    recipient = "Ada",
+                    link = "https://example.com/live",
+                    hashtag = "worldcup",
+                ),
+            ),
+            backendApi.sends,
         )
     }
 
     @Test
-    fun `deliver keeps the text result when photo encoding throws`() = runTest {
+    fun `deliver forwards every attachment at once`() = runTest {
         val backendApi = FakeYoBackendApi()
-        val photoEncoder = FakePhotoEncoder(failure = IllegalArgumentException("bad uri"))
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
-        val delivered =
-            deliveryPort.deliver(
-                YoMessage(
-                    id = "message-5",
-                    sender = "me",
-                    recipient = "Margaret",
-                    photoUri = "content://photos/message-5",
+        deliveryPort.deliver(
+            YoMessage(
+                id = "message-11",
+                sender = "me",
+                recipient = "Ada",
+                link = "https://example.com/live",
+                hashtag = "worldcup",
+                latitude = 45.815,
+                longitude = 15.982,
+            ),
+        )
+
+        assertEquals(
+            listOf(
+                SendCall(
+                    recipient = "Ada",
+                    latitude = 45.815,
+                    longitude = 15.982,
+                    link = "https://example.com/live",
+                    hashtag = "worldcup",
                 ),
-            )
-
-        assertTrue(delivered)
-        assertEquals(listOf(SendCall("Margaret")), backendApi.sends)
-        assertTrue(backendApi.uploads.isEmpty())
+            ),
+            backendApi.sends,
+        )
     }
 
     @Test
-    fun `deliver propagates cancellation from photo encoding`() = runTest {
-        val cancellation = CancellationException("encoding cancelled")
+    fun `deliver sends no attachments when the message carries none`() = runTest {
         val backendApi = FakeYoBackendApi()
-        val photoEncoder = FakePhotoEncoder(failure = cancellation)
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
-        val failure =
-            try {
-                deliveryPort.deliver(
-                    YoMessage(
-                        id = "message-6",
-                        sender = "me",
-                        recipient = "Radia",
-                        photoUri = "content://photos/message-6",
-                    ),
-                )
-                null
-            } catch (e: CancellationException) {
-                e
-            }
+        deliveryPort.deliver(YoMessage(id = "message-9", sender = "me", recipient = "Ada"))
 
-        assertSame(cancellation, failure)
+        assertEquals(
+            listOf(
+                SendCall(
+                    recipient = "Ada",
+                    latitude = null,
+                    longitude = null,
+                    link = null,
+                    hashtag = null,
+                ),
+            ),
+            backendApi.sends,
+        )
     }
-
-    @Test
-    fun `deliver propagates cancellation from photo upload`() = runTest {
-        val cancellation = CancellationException("upload cancelled")
-        val backendApi = FakeYoBackendApi(uploadFailure = cancellation)
-        val photoEncoder =
-            FakePhotoEncoder(
-                payload = PhotoPayload(base64Data = "encoded-photo", mimeType = "image/jpeg"),
-            )
-        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi, photoEncoder)
-
-        val failure =
-            try {
-                deliveryPort.deliver(
-                    YoMessage(
-                        id = "message-7",
-                        sender = "me",
-                        recipient = "Hedy",
-                        photoUri = "content://photos/message-7",
-                    ),
-                )
-                null
-            } catch (e: CancellationException) {
-                e
-            }
-
-        assertSame(cancellation, failure)
-    }
-
-    private class FakeYoBackendApi(
-        private val sendResult: Boolean = true,
-        private val uploadFailure: Throwable? = null,
-    ) : StubYoBackendApi() {
-        override suspend fun deleteAccount(): Boolean = true
-
-        val sends = mutableListOf<SendCall>()
-        val uploads = mutableListOf<UploadCall>()
-
-        override suspend fun sendYo(
-            recipient: String,
-            latitude: Double?,
-            longitude: Double?,
-        ): Boolean {
-            sends += SendCall(recipient, latitude, longitude)
-            return sendResult
-        }
-
-        override suspend fun uploadPhoto(
-            messageId: String,
-            base64Data: String,
-            mimeType: String,
-            recipient: String?,
-        ): Boolean {
-            uploads += UploadCall(messageId, base64Data, mimeType, recipient)
-            uploadFailure?.let { throw it }
-            return true
-        }
-    }
-
-    private class FakePhotoEncoder(
-        private val payload: PhotoPayload? = null,
-        private val failure: Throwable? = null,
-    ) : PhotoEncoder {
-        val encodedUris = mutableListOf<String>()
-
-        override suspend fun encodeForUpload(photoUri: String): PhotoPayload? {
-            encodedUris += photoUri
-            failure?.let { throw it }
-            return payload
-        }
-    }
-
-    private data class SendCall(
-        val recipient: String,
-        val latitude: Double? = null,
-        val longitude: Double? = null,
-    )
-
-    private data class UploadCall(
-        val messageId: String,
-        val base64Data: String,
-        val mimeType: String,
-        val recipient: String?,
-    )
 }

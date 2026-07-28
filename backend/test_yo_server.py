@@ -2,6 +2,7 @@ import io
 import ipaddress
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from email.message import Message
@@ -16,9 +17,8 @@ from yo_db import YoDatabase
 from yo_server import (
     CREDENTIAL_ATTEMPTS,
     CREDENTIAL_WINDOW_SECONDS,
-    MAX_PHOTO_BYTES,
-    PHOTO_ATTEMPTS,
-    PHOTO_WINDOW_SECONDS,
+    MAX_HASHTAG_BYTES,
+    MAX_LINK_BYTES,
     SEND_ATTEMPTS,
     SEND_WINDOW_SECONDS,
     RateLimiter,
@@ -38,13 +38,25 @@ class RecordingFCMClient:
         # Coordinates are recorded separately so the existing (token, sender) assertions - about
         # twenty of them, none concerned with location - keep saying what they were written to say.
         self.location_calls = []
+        # Same reasoning again for the link and hashtag attachments: a third list rather than a
+        # wider `calls` tuple, so every assertion keeps testing exactly what it names.
+        self.attachment_calls = []
         self.result = True
         self.error = None
         self.fail_tokens = set()
 
-    def send_yo(self, fcm_token, sender, latitude=None, longitude=None):
+    def send_yo(
+        self,
+        fcm_token,
+        sender,
+        latitude=None,
+        longitude=None,
+        link=None,
+        hashtag=None,
+    ):
         self.calls.append((fcm_token, sender))
         self.location_calls.append((fcm_token, sender, latitude, longitude))
+        self.attachment_calls.append((fcm_token, sender, link, hashtag))
         if self.error is not None:
             raise self.error
         if fcm_token in self.fail_tokens:
@@ -73,9 +85,9 @@ class YoServerTestCase(unittest.TestCase):
     """Shared harness: a real sqlite database plus a SimpleNamespace standing in for the server.
 
     The handler only ever touches server.database / fcm_client / password_iterations /
-    credential_limiter / send_limiter / photo_limiter, so a namespace is enough and avoids
-    binding a socket. Every limiter the handler reads must be listed here, or the tests that
-    exercise that route fail with AttributeError rather than a useful assertion.
+    credential_limiter / send_limiter, so a namespace is enough and avoids binding a socket.
+    Every limiter the handler reads must be listed here, or the tests that exercise that route
+    fail with AttributeError rather than a useful assertion.
     """
 
     def setUp(self):
@@ -94,7 +106,6 @@ class YoServerTestCase(unittest.TestCase):
                 CREDENTIAL_WINDOW_SECONDS,
             ),
             send_limiter=RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS),
-            photo_limiter=RateLimiter(PHOTO_ATTEMPTS, PHOTO_WINDOW_SECONDS),
             # Unconfigured by default, matching a deployment with no YO_GOOGLE_CLIENT_ID.
             # GoogleSignInTest installs a stub.
             google_verifier=None,
@@ -675,20 +686,10 @@ class TokenAuthTest(YoServerTestCase):
         routes = (
             ("GET", "/v1/friends", None),
             ("GET", "/v1/blocked", None),
-            ("GET", "/v1/photo?message_id=message-1", None),
             ("POST", "/v1/register", {"fcm_token": "token"}),
             ("POST", "/v1/send", {"recipient": "BOB"}),
             ("POST", "/v1/friends", {"username": "BOB"}),
             ("POST", "/v1/block", {"username": "BOB"}),
-            (
-                "POST",
-                "/v1/photo",
-                {
-                    "message_id": "message-1",
-                    "mime_type": "image/jpeg",
-                    "data": "base64-data",
-                },
-            ),
             ("DELETE", "/v1/friends?username=BOB", None),
             ("DELETE", "/v1/block?username=BOB", None),
             ("DELETE", "/v1/session", None),
@@ -1074,6 +1075,258 @@ class SendLocationTest(YoServerTestCase):
         self.assertEqual([], self.fcm_client.calls)
 
 
+class SendAttachmentTest(YoServerTestCase):
+    """Gap G23: the app let you attach a link or a hashtag, wrote it to its own local history and
+    then sent a bare Yo, so the sender was shown an attachment the recipient could never receive.
+
+    The same defect class as G20 one field along. The push is the recipient's only surface for
+    these - nothing about a received Yo is stored on their device - so an attachment that misses
+    the payload is an attachment nobody will ever see.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.alice_token = self.signup("ALICE")
+        self.signup_with_device("BOB", "bob-token")
+
+    def send(self, **attachments):
+        body = {"recipient": "BOB"}
+        body.update(attachments)
+        return self.request("POST", "/v1/send", body, token=self.alice_token)
+
+    def test_an_attached_link_reaches_the_push(self):
+        status, body = self.send(link="https://example.com/a")
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(
+            [("bob-token", "ALICE", "https://example.com/a", None)],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_an_attached_hashtag_reaches_the_push(self):
+        status, body = self.send(hashtag="#yo")
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(
+            [("bob-token", "ALICE", None, "#yo")],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_a_link_and_a_hashtag_travel_together(self):
+        self.send(link="https://example.com/a", hashtag="#yo")
+
+        self.assertEqual(
+            [("bob-token", "ALICE", "https://example.com/a", "#yo")],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_a_send_with_neither_carries_neither(self):
+        """A plain Yo must stay plain: a field that defaults into the payload would put an
+        attachment on the recipient's screen that the sender never made."""
+        self.send()
+
+        self.assertEqual(
+            [("bob-token", "ALICE", None, None)],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_a_blank_attachment_is_absent_rather_than_an_empty_string(self):
+        """Otherwise the recipient's app sees the key, believes something was attached, and
+        offers to open nothing."""
+        for blank in ("", "   ", "\t\n "):
+            with self.subTest(blank=blank):
+                self.fcm_client.attachment_calls.clear()
+
+                status, _ = self.send(link=blank, hashtag=blank)
+
+                self.assertEqual(200, status)
+                self.assertEqual(
+                    [("bob-token", "ALICE", None, None)],
+                    self.fcm_client.attachment_calls,
+                )
+
+    def test_surrounding_whitespace_is_trimmed_off(self):
+        self.send(link="  https://example.com/a  ", hashtag=" #yo ")
+
+        self.assertEqual(
+            [("bob-token", "ALICE", "https://example.com/a", "#yo")],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_a_non_string_attachment_is_rejected_not_silently_dropped(self):
+        """The whole point of G23: an attachment that vanishes on the way is indistinguishable
+        to the sender from one that arrived, so a malformed one has to come back as an error."""
+        # True is in this list because bool subclasses int, and a bare `if value` test would let
+        # it through; a dict and a list are what a confused client sends instead of a string.
+        for key in ("link", "hashtag"):
+            for value in (7, True, 1.5, ["https://example.com/a"], {"url": "x"}):
+                with self.subTest(key=key, value=value):
+                    status, body = self.send(**{key: value})
+
+                    self.assertEqual(400, status)
+                    self.assertEqual("bad_request", body["error"])
+
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_an_over_long_attachment_is_rejected(self):
+        cases = (
+            ("link", "h" * (MAX_LINK_BYTES + 1)),
+            ("hashtag", "#" * (MAX_HASHTAG_BYTES + 1)),
+        )
+        for key, value in cases:
+            with self.subTest(key=key):
+                status, body = self.send(**{key: value})
+
+                self.assertEqual(400, status)
+                self.assertEqual("bad_request", body["error"])
+
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_the_limit_counts_bytes_and_not_characters(self):
+        """FCM's data payload is capped in BYTES. A code-point bound would let this through, and
+        Google would then reject the push - surfacing to the sender as a 502 that no retry can
+        clear, for a link the app itself declared acceptable."""
+        # Well under MAX_LINK_BYTES as characters, well over it as UTF-8.
+        link = "\U0001f600" * (MAX_LINK_BYTES // 3)
+        self.assertLess(len(link), MAX_LINK_BYTES)
+        self.assertGreater(len(link.encode("utf-8")), MAX_LINK_BYTES)
+
+        status, body = self.send(link=link)
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_a_multibyte_attachment_within_the_byte_limit_is_accepted(self):
+        """The byte bound must not become a blanket ban on non-ASCII: a hashtag in a language
+        that needs multiple bytes per character is ordinary use, not an attack."""
+        hashtag = "šđčćž" * 4
+
+        status, _ = self.send(hashtag=hashtag)
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [("bob-token", "ALICE", None, hashtag)],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_an_attachment_exactly_at_the_limit_is_accepted(self):
+        """The bound is inclusive, so the rejection above is the length above the limit rather
+        than an off-by-one that also refuses a legal link."""
+        link = "h" * MAX_LINK_BYTES
+        hashtag = "#" * MAX_HASHTAG_BYTES
+
+        status, _ = self.send(link=link, hashtag=hashtag)
+
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [("bob-token", "ALICE", link, hashtag)],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_an_attachment_is_never_written_to_the_database(self):
+        """The privacy policy claims a link and a hashtag pass through without being stored, so
+        the schema is asserted rather than trusted. If a future change starts persisting either,
+        the live policy becomes false the moment it deploys."""
+        marker = "https://example.invalid/never-stored-3f9a2c"
+        hashtag_marker = "#never-stored-3f9a2c"
+
+        status, _ = self.send(link=marker, hashtag=hashtag_marker)
+        self.assertEqual(200, status)
+
+        connection = sqlite3.connect(self.database_path)
+        self.addCleanup(connection.close)
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        ]
+        self.assertNotEqual([], tables, "the schema was empty, so this proved nothing")
+        for table in tables:
+            with self.subTest(table=table):
+                columns = [
+                    row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
+                ]
+                self.assertEqual(
+                    [],
+                    [name for name in columns if name in ("link", "hashtag")],
+                )
+                stored = " ".join(
+                    str(value)
+                    for row in connection.execute(f'SELECT * FROM "{table}"')
+                    for value in row
+                )
+                self.assertNotIn(marker, stored)
+                self.assertNotIn(hashtag_marker, stored)
+
+
+class RemovedPhotoRoutesTest(YoServerTestCase):
+    """The photo upload was write-only: the app had no way to fetch one and the push carried no
+    message id, so no recipient could ever retrieve what was stored for them. It is gone, along
+    with its table, and this is what keeps it gone.
+
+    Every request here carries a valid token on purpose. Authentication runs before path
+    matching, so an unauthenticated probe answers 401 for any unknown path and would pass just
+    as happily whether or not the routes still existed.
+    """
+
+    def test_uploading_a_photo_is_no_longer_a_route(self):
+        token = self.signup("ALICE")
+
+        status, body = self.request(
+            "POST",
+            "/v1/photo",
+            {"message_id": "message-1", "mime_type": "image/jpeg", "data": "d"},
+            token=token,
+        )
+
+        self.assertEqual(404, status)
+        self.assertEqual({"error": "not_found"}, body)
+
+    def test_fetching_a_photo_is_no_longer_a_route(self):
+        token = self.signup("ALICE")
+
+        status, body = self.request(
+            "GET",
+            "/v1/photo?message_id=message-1",
+            token=token,
+        )
+
+        self.assertEqual(404, status)
+        self.assertEqual({"error": "not_found"}, body)
+
+    def test_an_unauthenticated_probe_could_not_have_told_them_apart(self):
+        """States the trap the two tests above are written around, so nobody later 'simplifies'
+        them into a pair that would pass against a server still serving photos."""
+        for method, path, body in (
+            ("GET", "/v1/photo?message_id=message-1", None),
+            ("POST", "/v1/photo", {"message_id": "message-1"}),
+        ):
+            with self.subTest(method=method):
+                status, response = self.request(method, path, body, token=None)
+
+                self.assertEqual(401, status)
+                self.assertEqual({"error": "unauthorized"}, response)
+
+    def test_the_photos_table_is_no_longer_created(self):
+        """It was never pruned, so leaving the schema behind leaves unbounded storage of data
+        the privacy policy no longer describes."""
+        connection = sqlite3.connect(self.database_path)
+        self.addCleanup(connection.close)
+
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+        self.assertNotIn("photos", tables)
+
+
 class SendTest(YoServerTestCase):
     def test_send_calls_fcm_client_for_registered_recipient(self):
         alice_token = self.signup("ALICE")
@@ -1279,180 +1532,6 @@ class SendTest(YoServerTestCase):
 
         self.assertEqual(400, status)
         self.assertEqual("bad_request", body["error"])
-
-
-class PhotoTest(YoServerTestCase):
-    def test_photo_upload_then_fetch_round_trips(self):
-        alice_token = self.signup("ALICE")
-
-        status, body = self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": "base64-data",
-            },
-            token=alice_token,
-        )
-
-        self.assertEqual(200, status)
-        self.assertEqual({"stored": True}, body)
-
-        status, body = self.request(
-            "GET",
-            "/v1/photo?message_id=message-1",
-            token=alice_token,
-        )
-
-        self.assertEqual(200, status)
-        self.assertEqual(
-            {"mime_type": "image/jpeg", "data": "base64-data"},
-            body,
-        )
-
-    def test_only_the_owner_and_the_recipient_can_fetch_a_photo(self):
-        alice_token = self.signup("ALICE")
-        bob_token = self.signup("BOB")
-        mallory_token = self.signup("MALLORY")
-        self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": "base64-data",
-                "recipient": "BOB",
-            },
-            token=alice_token,
-        )
-
-        for name, token in (("owner", alice_token), ("recipient", bob_token)):
-            with self.subTest(role=name):
-                status, body = self.request(
-                    "GET",
-                    "/v1/photo?message_id=message-1",
-                    token=token,
-                )
-                self.assertEqual(200, status)
-                self.assertEqual("base64-data", body["data"])
-
-        status, body = self.request(
-            "GET",
-            "/v1/photo?message_id=message-1",
-            token=mallory_token,
-        )
-        # 404 rather than 403: a third party must not learn that the id exists at all.
-        self.assertEqual(404, status)
-        self.assertEqual({"error": "not_found"}, body)
-
-    def test_a_different_owner_cannot_overwrite_an_existing_message_id(self):
-        alice_token = self.signup("ALICE")
-        mallory_token = self.signup("MALLORY")
-        self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": "alice-data",
-            },
-            token=alice_token,
-        )
-
-        status, body = self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": "mallory-data",
-            },
-            token=mallory_token,
-        )
-
-        self.assertEqual(403, status)
-        self.assertEqual({"error": "forbidden"}, body)
-        self.assertEqual(
-            "alice-data",
-            self.server.database.get_photo("message-1")[1],
-        )
-
-    def test_the_owner_may_overwrite_their_own_message_id(self):
-        alice_token = self.signup("ALICE")
-        for data in ("first-data", "second-data"):
-            status, _ = self.request(
-                "POST",
-                "/v1/photo",
-                {
-                    "message_id": "message-1",
-                    "mime_type": "image/jpeg",
-                    "data": data,
-                },
-                token=alice_token,
-            )
-            self.assertEqual(200, status)
-
-        self.assertEqual(
-            "second-data",
-            self.server.database.get_photo("message-1")[1],
-        )
-
-    def test_photo_upload_rejects_oversized_payload(self):
-        alice_token = self.signup("ALICE")
-
-        status, body = self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": "A" * (MAX_PHOTO_BYTES + 1),
-            },
-            token=alice_token,
-        )
-
-        self.assertEqual(400, status)
-        self.assertEqual({"error": "photo_too_large"}, body)
-        self.assertIsNone(self.server.database.get_photo("message-1"))
-
-    def test_photo_upload_rejects_oversized_utf8_payload(self):
-        # Mostly-ASCII data with a small multi-byte-UTF-8 suffix: the Python str
-        # length (code-point count) stays just under MAX_PHOTO_BYTES -- so the old
-        # len(data) check would have incorrectly accepted this -- while the actual
-        # UTF-8-encoded byte length (each "é" costs 2 bytes) crosses over
-        # MAX_PHOTO_BYTES, which the fixed len(data.encode("utf-8")) check must
-        # reject. The JSON-escaped wire size for this payload stays comfortably
-        # under MAX_BODY_BYTES so the request reaches _handle_photo_upload at all.
-        alice_token = self.signup("ALICE")
-        multi_byte_chars = 2_000
-        ascii_chars = (MAX_PHOTO_BYTES - 1_000) - multi_byte_chars
-        data = ("a" * ascii_chars) + ("é" * multi_byte_chars)
-
-        status, body = self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": data,
-            },
-            token=alice_token,
-        )
-
-        self.assertEqual(400, status)
-        self.assertEqual({"error": "photo_too_large"}, body)
-        self.assertIsNone(self.server.database.get_photo("message-1"))
-
-    def test_photo_fetch_missing_message_id_returns_404(self):
-        alice_token = self.signup("ALICE")
-
-        for path in ("/v1/photo", "/v1/photo?message_id=missing"):
-            with self.subTest(path=path):
-                status, body = self.request("GET", path, token=alice_token)
-
-                self.assertEqual(404, status)
-                self.assertEqual({"error": "not_found"}, body)
 
 
 class BroadcastTest(YoServerTestCase):
@@ -1749,6 +1828,43 @@ class PolicyPageTest(StaticPageTestCase):
 
         self.assertIn(b"/delete-account", body)
 
+    def test_the_privacy_policy_says_a_location_is_carried_and_never_written_down(self):
+        """The load-bearing claim behind the Play data-safety declaration, and until now the one
+        sentence on the page with no test under it. It states that an attached position is a
+        single fix that travels inside the notification and is never stored; if that wording ever
+        drifts away from the code, the declaration filed with Google becomes untrue."""
+        _, _, body = self.raw_request("GET", "/privacy")
+
+        self.assertIn(b"What passes through without being stored", body)
+        self.assertIn(b"not written to our database", body)
+        self.assertIn(b"There is no continuous tracking", body)
+        self.assertIn(b"one fix, when you ask for it, for one message", body)
+
+    def test_neither_page_mentions_photos_any_more(self):
+        """The upload route and its table are gone. A policy still describing them is a false
+        policy - which is the exact state the removal was meant to end, not to recreate."""
+        for path in ("/privacy", "/delete-account"):
+            with self.subTest(path=path):
+                _, _, body = self.raw_request("GET", path)
+
+                self.assertNotIn(b"photo", body.lower())
+
+    def test_both_pages_fence_the_contact_address_against_cloudflare(self):
+        """Cloudflare's email obfuscation rewrites a bare mailto into a /cdn-cgi/l/
+        email-protection link that resolves only with JavaScript. That address is the only
+        deletion route for somebody who cannot open the app, so it has to survive a reader that
+        runs no scripts - which the email_off fence is what guarantees."""
+        fenced = (
+            b'<!--email_off--><a href="mailto:mladen@the-shop.io">'
+            b"mladen@the-shop.io</a><!--/email_off-->"
+        )
+        for path in ("/privacy", "/delete-account"):
+            with self.subTest(path=path):
+                _, _, body = self.raw_request("GET", path)
+
+                self.assertIn(fenced, body)
+                self.assertNotIn(b"/cdn-cgi/l/email-protection", body)
+
     def test_both_pages_are_reachable_with_a_trailing_slash(self):
         for path in ("/privacy/", "/delete-account/"):
             status, _, _ = self.raw_request("GET", path)
@@ -1852,39 +1968,6 @@ class DeleteAccountTest(YoServerTestCase):
         self.assertEqual(404, status)
         self.assertEqual("recipient_not_found", body["reason"])
         self.assertEqual([], self.fcm_client.calls)
-
-    def test_photos_the_user_uploaded_are_deleted(self):
-        alice = self.signup("ALICE")
-        self.request(
-            "POST",
-            "/v1/photo",
-            {"message_id": "message-1", "mime_type": "image/jpeg", "data": "d"},
-            token=alice,
-        )
-
-        self.request("DELETE", "/v1/account", token=alice)
-
-        self.assertIsNone(self.server.database.get_photo("message-1"))
-
-    def test_photos_received_from_someone_else_survive(self):
-        """They are the sender's data, and the sender did not ask to be forgotten."""
-        alice = self.signup("ALICE")
-        bob = self.signup("BOB")
-        self.request(
-            "POST",
-            "/v1/photo",
-            {
-                "message_id": "message-1",
-                "mime_type": "image/jpeg",
-                "data": "d",
-                "recipient": "BOB",
-            },
-            token=alice,
-        )
-
-        self.request("DELETE", "/v1/account", token=bob)
-
-        self.assertIsNotNone(self.server.database.get_photo("message-1"))
 
     def test_a_deleted_google_account_is_unlinked_not_orphaned(self):
         """Otherwise the identity still points at a username that no longer exists, and the

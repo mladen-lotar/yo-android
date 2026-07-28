@@ -2,8 +2,11 @@
 
 Yo Android is a native Android reimplementation of the original Yo app (2014): one tap sends the
 word “Yo” to a chosen friend as a push notification, with the same small set of extensions the real
-app grew — links, hashtags, one-shot location, groups, and photos — plus a public broadcast API for
+app grew — links, hashtags, one-shot location, and groups — plus a public broadcast API for
 third-party clients. Sends are delivered over FCM and mirrored to local Room history.
+
+Photo attachment shipped and was **withdrawn on 2026-07-28**: it was upload-only, so no recipient
+could ever see one. See PRD G24 — that entry is worth reading before proposing to add it back.
 
 The app is deliberately small. Before adding anything, read **[docs/PRD.md](docs/PRD.md)** — it
 records what the original product actually was, which features were intentionally left out and why,
@@ -20,6 +23,10 @@ and nothing else. Usernames are uppercase, 2–32 characters of `A–Z`, `0–9`
 Your friend list starts empty. Add people by username from **ADD FRIEND** in the menu; adding is
 unilateral, as it was in Yo, and **BLOCK** rather than approval is the control on unwanted Yos. A
 blocked sender still sees an ordinary "delivered", so blocking never notifies the person blocked.
+
+**Long-press a friend** to block or remove them, and open **BLOCKED** in the menu to see who is
+blocked and tap to unblock. Until 2026-07-28 both actions existed in the client and the backend and
+were reachable from nothing — see PRD G26.
 
 The backend issues a bearer token per device at sign-in. No shared API key is compiled into the
 app, so extracting the APK yields no credentials.
@@ -103,6 +110,11 @@ sign-in.
 Plain HTTP only works in debug builds (`usesCleartextTraffic` is set in the debug manifest); release
 builds require HTTPS. See [backend/README.md](backend/README.md) to run the server.
 
+**Running it from this checkout is development, not production.** Production is a separate
+deployment: `backend/` is vendored into the `lotar/claude` repository as `modules/yo` and runs there
+as a Docker container behind that host's Traefik, serving `https://yo.the-shop.io`. Merging here
+does not deploy it — see [docs/RELEASE.md](docs/RELEASE.md) §8.
+
 ## Push
 
 Yos are delivered over FCM, and both halves are off until configured — the app builds and runs
@@ -146,7 +158,13 @@ against an Android client in the same project. Full walkthrough: PRD §7.1.
 ## Account deletion
 
 Menu, then **DELETE ACCOUNT**. It erases the account, its sessions on every device, friends and
-blocks in both directions, the FCM token, uploaded photos, and the local Yo history and groups.
-Photos other people sent are left alone - they belong to the sender. The backend route is
-`DELETE /v1/account`; a web request page for people who cannot open the app is served at
-`/delete-account`, and the privacy policy at `/privacy`.
+blocks in both directions, the FCM token, and the local Yo history and groups. It used to erase
+uploaded photos too; there are none to erase since the photo feature was removed on 2026-07-28
+(PRD G24). The backend route is `DELETE /v1/account`; a web request page for people who cannot open
+the app is served at `/delete-account`, and the privacy policy at `/privacy`.
+
+Both of those pages fence their contact address in `<!--email_off-->`. Cloudflare's Scrape Shield
+otherwise rewrites the `mailto:` into a JavaScript-only link, which leaves a non-JS client — an
+automated policy re-check, a text-mode reviewer — looking at a dead anchor reading
+`[email protected]`, on the one page that exists for people who cannot use the app.
+See RELEASE.md §8.9.

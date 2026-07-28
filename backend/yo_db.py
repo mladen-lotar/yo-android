@@ -2,13 +2,10 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Tuple, Union
+from typing import Iterator, List, Optional, Union
 
 
 PathValue = Union[str, os.PathLike]
-
-# (mime_type, data_base64, owner, recipient)
-PhotoRecord = Tuple[str, str, Optional[str], Optional[str]]
 
 
 class YoDatabase:
@@ -45,20 +42,6 @@ class YoDatabase:
                 )
                 """
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS photos(
-                    message_id TEXT PRIMARY KEY,
-                    mime_type TEXT NOT NULL,
-                    data_base64 TEXT NOT NULL,
-                    created_at INTEGER
-                )
-                """
-            )
-            # Photos predate per-user credentials, so the ownership columns are added rather
-            # than declared. CREATE TABLE IF NOT EXISTS never alters an existing table.
-            self._add_column_if_missing(connection, "photos", "owner", "TEXT")
-            self._add_column_if_missing(connection, "photos", "recipient", "TEXT")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS accounts(
@@ -165,9 +148,6 @@ class YoDatabase:
         user owns would leave them in other people's friend lists: a name that can be tapped,
         that answers `recipient_not_found`, and that cannot be removed by its owner because the
         account behind it no longer exists.
-
-        Photos this user *received* are not touched. They belong to whoever sent them, and are
-        removed when that sender deletes their own account.
         """
         with self._connect() as connection:
             existed = connection.execute(
@@ -181,7 +161,6 @@ class YoDatabase:
             connection.execute("DELETE FROM identities WHERE username = ?", (username,))
             connection.execute("DELETE FROM devices WHERE username = ?", (username,))
             connection.execute("DELETE FROM subscriptions WHERE username = ?", (username,))
-            connection.execute("DELETE FROM photos WHERE owner = ?", (username,))
             connection.execute(
                 "DELETE FROM friendships WHERE owner = ? OR friend = ?",
                 (username, username),
@@ -376,65 +355,6 @@ class YoDatabase:
                 (username,),
             ).fetchone()
         return None if row is None else row[0]
-
-    def store_photo(
-        self,
-        message_id: str,
-        mime_type: str,
-        data_base64: str,
-        owner: Optional[str] = None,
-        recipient: Optional[str] = None,
-        created_at: Optional[int] = None,
-    ) -> None:
-        timestamp = int(time.time()) if created_at is None else created_at
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO photos(
-                    message_id,
-                    mime_type,
-                    data_base64,
-                    owner,
-                    recipient,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
-                    mime_type = excluded.mime_type,
-                    data_base64 = excluded.data_base64,
-                    owner = excluded.owner,
-                    recipient = excluded.recipient,
-                    created_at = excluded.created_at
-                """,
-                (message_id, mime_type, data_base64, owner, recipient, timestamp),
-            )
-
-    def get_photo(self, message_id: str) -> Optional[PhotoRecord]:
-        """Returns (mime_type, data_base64, owner, recipient); the last two may be None
-        for photos stored before ownership was recorded."""
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT mime_type, data_base64, owner, recipient
-                FROM photos
-                WHERE message_id = ?
-                """,
-                (message_id,),
-            ).fetchone()
-        return None if row is None else (row[0], row[1], row[2], row[3])
-
-    @staticmethod
-    def _add_column_if_missing(
-        connection: sqlite3.Connection,
-        table: str,
-        column: str,
-        declaration: str,
-    ) -> None:
-        existing = {
-            row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-        if column not in existing:
-            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def upsert_api_client(
         self,

@@ -112,6 +112,8 @@ class FCMClient:
         sender: str,
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
+        link: Optional[str] = None,
+        hashtag: Optional[str] = None,
     ) -> bool:
         service_account_path, project_id = self._configuration()
         access_token = self._access_token(service_account_path)
@@ -128,6 +130,13 @@ class FCMClient:
             # the API outright. Six decimals matches what the app formats and parses.
             data["latitude"] = format_coordinate(latitude)
             data["longitude"] = format_coordinate(longitude)
+        # The notification is the recipient's only surface for these - received Yos are never
+        # written to their device - so an attachment that does not ride this payload is one the
+        # recipient can never see, however faithfully the sender's own history records it.
+        if link:
+            data["link"] = link
+        if hashtag:
+            data["hashtag"] = hashtag
         payload: Dict[str, object] = {
             "message": {
                 "token": fcm_token,

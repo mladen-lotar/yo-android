@@ -35,7 +35,13 @@ class YoFirebaseMessagingService : FirebaseMessagingService() {
             return
         }
         val sender = message.data["sender"]?.takeIf(String::isNotBlank) ?: return
-        YoNotifier.postYoNotification(this, sender, coordinatesFrom(message))
+        YoNotifier.postYoNotification(
+            context = this,
+            sender = sender,
+            coordinates = coordinatesFrom(message),
+            link = message.data["link"],
+            hashtag = message.data["hashtag"],
+        )
     }
 
     /**

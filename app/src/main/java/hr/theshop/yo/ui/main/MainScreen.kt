@@ -4,12 +4,10 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -45,7 +43,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -54,8 +51,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import hr.theshop.yo.BuildConfig
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,10 +59,8 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import hr.theshop.yo.data.location.MapIntentFactory
-import hr.theshop.yo.data.photo.decodeSampledBitmap
 import hr.theshop.yo.domain.location.LocationLink
 import hr.theshop.yo.domain.model.Group
 import hr.theshop.yo.data.remote.AddFriendOutcome
@@ -78,15 +71,7 @@ import hr.theshop.yo.ui.theme.YoLabel
 import hr.theshop.yo.ui.theme.YoPalette
 import hr.theshop.yo.ui.theme.YoRowText
 import hr.theshop.yo.ui.theme.YoRowTextSmall
-import java.io.File
-import java.util.UUID
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
-
-private const val THUMBNAIL_MAX_EDGE_PX = 512
-private const val CAPTURED_PHOTOS_DIRECTORY = "captured-photos"
 
 /** How long a band reads "YO!" after a send. The original documented no confirmation at all. */
 private const val SENT_FLASH_MILLIS = 900L
@@ -129,16 +114,22 @@ fun MainScreen(
     val addFriendOutcome by viewModel.addFriendOutcome.collectAsState()
     val deletingAccount by viewModel.deletingAccount.collectAsState()
     val deleteAccountFailed by viewModel.deleteAccountFailed.collectAsState()
+    val sendInFlightTo by viewModel.sendInFlightTo.collectAsState()
+    val sendDeliveredTo by viewModel.sendDeliveredTo.collectAsState()
+    val sendFailure by viewModel.sendFailure.collectAsState()
+    val blocked by viewModel.blocked.collectAsState()
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
     val context = LocalContext.current
-    var lastSentTo by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(lastSentTo) {
-        if (lastSentTo != null) {
+    // The flash now waits for the server. It used to fire on tap, which meant a Yo that was rate
+    // limited, addressed to a friend whose device never registered, or lost to a dead network was
+    // celebrated exactly like one that arrived (gap G25).
+    LaunchedEffect(sendDeliveredTo) {
+        if (sendDeliveredTo != null) {
             delay(SENT_FLASH_MILLIS)
-            lastSentTo = null
+            viewModel.clearSendDelivered()
         }
     }
 
@@ -162,13 +153,15 @@ fun MainScreen(
 
             bandRows(
                 targets = targets,
-                lastSentTo = lastSentTo,
+                deliveredTo = sendDeliveredTo,
+                inFlightTo = sendInFlightTo,
                 onSend = { target ->
                     when (target) {
-                        is SendTarget.Friend -> viewModel.sendYo(recipient = target.username)
-                        is SendTarget.YoGroup -> viewModel.sendYoToGroup(target.group.id)
+                        is SendTarget.Friend ->
+                            viewModel.sendYo(recipient = target.username, label = target.label)
+                        is SendTarget.YoGroup ->
+                            viewModel.sendYoToGroup(target.group.id, label = target.label)
                     }
-                    lastSentTo = target.label
                 },
                 onAttach = { attachTarget = it },
             )
@@ -230,6 +223,22 @@ fun MainScreen(
                     )
                 }
             }
+
+            // Same slot and same idiom as the push band above, for the same reason: name the
+            // consequence, and offer the one action that helps. Silence here was the whole bug -
+            // a Yo that never arrived left no trace anywhere in the UI.
+            sendFailure?.let { failure ->
+                item(key = "send-error") {
+                    Text(
+                        text = "COULDN'T YO ${failure.label} - TAP TO RETRY",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = sendInFlightTo == null) { viewModel.retrySend() }
+                            .padding(vertical = 14.dp),
+                    )
+                }
+            }
         }
 
         MenuButton(
@@ -257,7 +266,7 @@ fun MainScreen(
                 targets.indexOfFirst { it.label == target.label }.coerceAtLeast(0),
             ),
             onDismiss = { attachTarget = null },
-            onSend = { link, hashtag, attachLocation, photoUri ->
+            onSend = { link, hashtag, attachLocation ->
                 when (target) {
                     is SendTarget.Friend ->
                         viewModel.sendYo(
@@ -265,13 +274,21 @@ fun MainScreen(
                             link = link,
                             hashtag = hashtag,
                             attachLocation = attachLocation,
-                            photoUri = photoUri,
+                            label = target.label,
                         )
                     // Group sends fan out through the shared pipeline; per-Yo attachments were a
                     // single-recipient affordance, so a group Yo stays a plain Yo.
-                    is SendTarget.YoGroup -> viewModel.sendYoToGroup(target.group.id)
+                    is SendTarget.YoGroup ->
+                        viewModel.sendYoToGroup(target.group.id, label = target.label)
                 }
-                lastSentTo = target.label
+                attachTarget = null
+            },
+            onRemoveFriend = {
+                (target as? SendTarget.Friend)?.let { viewModel.removeFriend(it.username) }
+                attachTarget = null
+            },
+            onBlock = {
+                (target as? SendTarget.Friend)?.let { viewModel.blockFriend(it.username) }
                 attachTarget = null
             },
         )
@@ -285,6 +302,10 @@ fun MainScreen(
             onCreateGroup = { sheet = Sheet.CreateGroup },
             onInvite = { sheet = Sheet.Invite },
             onAddFriend = { sheet = Sheet.AddFriend },
+            onBlocked = {
+                viewModel.refreshBlocked()
+                sheet = Sheet.Blocked
+            },
             onLogOut = {
                 sheet = null
                 viewModel.logOut()
@@ -323,6 +344,11 @@ fun MainScreen(
             onRefreshContacts = viewModel::refreshContacts,
             inviteMessageFor = viewModel::inviteMessageFor,
         )
+        Sheet.Blocked -> BlockedSheet(
+            blocked = blocked,
+            onDismiss = { sheet = null },
+            onUnblock = viewModel::unblock,
+        )
         Sheet.History -> HistorySheet(history = history, onDismiss = { sheet = null })
         Sheet.CreateGroup -> CreateGroupSheet(
             friends = friends,
@@ -336,7 +362,7 @@ fun MainScreen(
     }
 }
 
-private enum class Sheet { Menu, History, CreateGroup, Invite, AddFriend, DeleteAccount }
+private enum class Sheet { Menu, History, CreateGroup, Invite, AddFriend, Blocked, DeleteAccount }
 
 /** A send target — a person or a group. Both render as an identical colour band. */
 private sealed interface SendTarget {
@@ -358,7 +384,8 @@ private sealed interface SendTarget {
  */
 private fun LazyListScope.bandRows(
     targets: List<SendTarget>,
-    lastSentTo: String?,
+    deliveredTo: String?,
+    inFlightTo: String?,
     onSend: (SendTarget) -> Unit,
     onAttach: (SendTarget) -> Unit,
 ) {
@@ -367,7 +394,14 @@ private fun LazyListScope.bandRows(
         item(key = "band-${if (isGroup) "group" else "friend"}-${target.label}") {
             Band(
                 color = YoPalette.colorForIndex(index),
-                label = if (lastSentTo == target.label) "YO!" else target.label,
+                // A send is a network round trip of up to ten seconds. Without the pending state
+                // an honest flash would show nothing at all on tap over a slow connection, which
+                // reads as a dead button.
+                label = when (target.label) {
+                    deliveredTo -> "YO!"
+                    inFlightTo -> "..."
+                    else -> target.label
+                },
                 onClick = { onSend(target) },
                 onLongClick = { onAttach(target) },
             )
@@ -480,6 +514,7 @@ private fun MenuSheet(
     onCreateGroup: () -> Unit,
     onInvite: () -> Unit,
     onAddFriend: () -> Unit,
+    onBlocked: () -> Unit,
     onLogOut: () -> Unit,
     onPrivacy: () -> Unit,
     onDeleteAccount: () -> Unit,
@@ -514,8 +549,17 @@ private fun MenuSheet(
                 onClick = onCreateGroup,
                 onLongClick = onCreateGroup,
             )
+            // The other half of BLOCK. Without a route back, blocking someone by mistake is
+            // permanent from inside the app even though the server has always supported undoing it.
             Band(
                 color = YoPalette.colorForIndex(4),
+                label = "BLOCKED",
+                onClick = onBlocked,
+                onLongClick = onBlocked,
+                clickLabel = "See who you have blocked",
+            )
+            Band(
+                color = YoPalette.colorForIndex(5),
                 label = if (username.isEmpty()) "LOG OUT" else "LOG OUT $username",
                 onClick = onLogOut,
                 onLongClick = onLogOut,
@@ -525,7 +569,7 @@ private fun MenuSheet(
             // it is the one colour here that reads as "this one is different". Deleting an account
             // is the only irreversible thing the app can do.
             Band(
-                color = YoPalette.colorForIndex(5),
+                color = YoPalette.colorForIndex(6),
                 label = "PRIVACY",
                 onClick = onPrivacy,
                 onLongClick = onPrivacy,
@@ -569,7 +613,7 @@ private fun DeleteAccountSheet(
             )
             Text(
                 text =
-                    "THIS ERASES YOUR ACCOUNT, YOUR FRIENDS, YOUR HISTORY AND YOUR PHOTOS. " +
+                    "THIS ERASES YOUR ACCOUNT, YOUR FRIENDS AND YOUR HISTORY. " +
                         "YOU DISAPPEAR FROM OTHER PEOPLE'S LISTS. IT CANNOT BE UNDONE.",
                 style = YoBody,
                 modifier = Modifier
@@ -808,6 +852,65 @@ private fun Context.openMap(latitude: Double, longitude: Double, label: String) 
     runCatching { startActivity(intent) }
 }
 
+/**
+ * Everyone this account has blocked, each row tapping to undo it. A blocked sender is told nothing
+ * - the server answers their Yo as delivered on purpose, so the block is not a notification for
+ * the person blocked - which means this list is the only place either party can see it exists.
+ */
+@Composable
+private fun BlockedSheet(
+    blocked: List<String>,
+    onDismiss: () -> Unit,
+    onUnblock: (String) -> Unit,
+) {
+    YoSheet(onDismiss = onDismiss) {
+        LazyColumn(modifier = Modifier.fillMaxWidth()) {
+            item(key = "blocked-title") {
+                Text(
+                    text = "BLOCKED",
+                    style = YoLabel,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp, bottom = 16.dp),
+                )
+            }
+            if (blocked.isEmpty()) {
+                item(key = "blocked-empty") {
+                    Text(
+                        text = "NOBODY",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 12.dp),
+                    )
+                }
+            } else {
+                item(key = "blocked-hint") {
+                    Text(
+                        text = "TAP SOMEONE TO UNBLOCK THEM",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 14.dp),
+                    )
+                }
+            }
+            itemsIndexed(blocked, key = { _, name -> name }) { index, name ->
+                Band(
+                    color = YoPalette.colorForIndex(index),
+                    label = name.uppercase(),
+                    onClick = { onUnblock(name) },
+                    onLongClick = { onUnblock(name) },
+                    clickLabel = "Unblock $name",
+                )
+            }
+            item(key = "blocked-bottom") {
+                Spacer(modifier = Modifier.height(28.dp))
+            }
+        }
+    }
+}
+
 @Composable
 private fun HistorySheet(
     history: List<YoMessage>,
@@ -877,16 +980,6 @@ private fun HistoryRow(message: YoMessage) {
             .padding(horizontal = 20.dp, vertical = 7.dp),
     ) {
         Text(text = line, style = YoBody)
-        message.photoUri?.let { photoUri ->
-            Spacer(modifier = Modifier.height(6.dp))
-            PhotoThumbnail(
-                photoUri = Uri.parse(photoUri),
-                contentDescription = "Photo sent to ${message.recipient}",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(120.dp),
-            )
-        }
     }
 }
 
@@ -895,42 +988,17 @@ private fun AttachSheet(
     target: SendTarget,
     accent: Color,
     onDismiss: () -> Unit,
-    onSend: (link: String, hashtag: String, attachLocation: Boolean, photoUri: String?) -> Unit,
+    onSend: (link: String, hashtag: String, attachLocation: Boolean) -> Unit,
+    onRemoveFriend: () -> Unit,
+    onBlock: () -> Unit,
 ) {
-    val context = LocalContext.current
     var link by rememberSaveable { mutableStateOf("") }
     var hashtag by rememberSaveable { mutableStateOf("") }
     var attachLocation by rememberSaveable { mutableStateOf(false) }
-    var photoUri by rememberSaveable { mutableStateOf<Uri?>(null) }
-    var pendingCaptureUri by rememberSaveable { mutableStateOf<Uri?>(null) }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
     ) { granted -> attachLocation = granted }
-    val takePictureLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.TakePicture(),
-    ) { captured ->
-        if (captured) photoUri = pendingCaptureUri
-        pendingCaptureUri = null
-    }
-    val cameraPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) {
-            createCapturedPhotoUri(context)?.let { uri ->
-                pendingCaptureUri = uri
-                runCatching { takePictureLauncher.launch(uri) }
-                    .onFailure { pendingCaptureUri = null }
-            }
-        }
-    }
-    val choosePhotoLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent(),
-    ) { uri ->
-        uri?.let { sourceUri ->
-            copyPhotoToCache(context, sourceUri)?.let { cachedUri -> photoUri = cachedUri }
-        }
-    }
 
     YoSheet(onDismiss = onDismiss) {
         Column(
@@ -978,41 +1046,37 @@ private fun AttachSheet(
                         }
                     },
                 )
-                Spacer(modifier = Modifier.height(10.dp))
-                Row(modifier = Modifier.fillMaxWidth()) {
-                    PillRow(
-                        label = "CAMERA",
-                        color = YoPalette.colorForIndex(6),
-                        onClick = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
-                        modifier = Modifier.weight(1f),
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    PillRow(
-                        // Wisteria is skipped here: at #8E44AD it sits too close to the Amethyst
-                        // sheet background to read as a distinct control.
-                        label = "GALLERY",
-                        color = YoPalette.colorForIndex(4),
-                        onClick = { choosePhotoLauncher.launch("image/*") },
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                photoUri?.let { uri ->
-                    Spacer(modifier = Modifier.height(12.dp))
-                    PhotoThumbnail(
-                        photoUri = uri,
-                        contentDescription = "Attached photo",
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp),
-                    )
-                }
             }
 
             Spacer(modifier = Modifier.height(20.dp))
             // The wordmark is "Yo" — Yo's guidelines explicitly forbid "YO", so the send control
             // that carries the brand name keeps its mixed case even though rows are uppercase.
             SendButton(label = "Yo", color = accent) {
-                onSend(link, hashtag, attachLocation, photoUri?.toString())
+                onSend(link, hashtag, attachLocation)
+            }
+
+            // Both endpoints and both view-model calls already existed; nothing in the UI reached
+            // them, so the app shipped with no way to stop someone contacting you. Long-press on
+            // the person is where this belongs - it is the only per-friend surface there is.
+            if (target is SendTarget.Friend) {
+                Spacer(modifier = Modifier.height(22.dp))
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    PillRow(
+                        label = "REMOVE",
+                        color = YoPalette.colorForIndex(4),
+                        onClick = onRemoveFriend,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    PillRow(
+                        label = "BLOCK",
+                        color = YoPalette.colorForIndex(6),
+                        onClick = onBlock,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = "BLOCKING IS UNDONE FROM THE MENU", style = YoLabel)
             }
         }
     }
@@ -1161,74 +1225,3 @@ private fun SendButton(
     }
 }
 
-@Composable
-private fun PhotoThumbnail(
-    photoUri: Uri,
-    contentDescription: String,
-    modifier: Modifier = Modifier,
-) {
-    val context = LocalContext.current
-    val bitmap by produceState<Bitmap?>(
-        initialValue = null,
-        key1 = photoUri,
-    ) {
-        value = null
-        value =
-            try {
-                withContext(Dispatchers.IO) {
-                    decodeSampledBitmap(context, photoUri, THUMBNAIL_MAX_EDGE_PX)
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Exception) {
-                null
-            }
-    }
-
-    bitmap?.let {
-        Image(
-            bitmap = it.asImageBitmap(),
-            contentDescription = contentDescription,
-            modifier = modifier,
-            contentScale = ContentScale.Crop,
-        )
-    }
-}
-
-private fun createCapturedPhotoUri(context: Context): Uri? =
-    runCatching {
-        val directory = capturedPhotosDirectory(context)
-        val file = File(directory, "${UUID.randomUUID()}.jpg")
-        if (!file.createNewFile()) {
-            return@runCatching null
-        }
-        FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            file,
-        )
-    }.getOrNull()
-
-private fun copyPhotoToCache(
-    context: Context,
-    sourceUri: Uri,
-): Uri? =
-    runCatching {
-        val directory = capturedPhotosDirectory(context)
-        val file = File(directory, "${UUID.randomUUID()}.jpg")
-        context.contentResolver.openInputStream(sourceUri)?.use { input ->
-            file.outputStream().use { output ->
-                input.copyTo(output)
-            }
-        } ?: return@runCatching null
-        FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            file,
-        )
-    }.getOrNull()
-
-private fun capturedPhotosDirectory(context: Context): File =
-    File(context.cacheDir, CAPTURED_PHOTOS_DIRECTORY).apply {
-        check(exists() || mkdirs())
-    }

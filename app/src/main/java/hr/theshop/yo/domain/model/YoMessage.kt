@@ -11,5 +11,4 @@ data class YoMessage(
     val hashtag: String? = null,
     val latitude: Double? = null,
     val longitude: Double? = null,
-    val photoUri: String? = null,
 )
