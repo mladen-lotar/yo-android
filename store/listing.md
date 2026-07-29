@@ -60,8 +60,8 @@ WHAT IT DOES NOT DO
   list can show names you recognise. Only a name and a local id are ever read - never a phone
   number, never an email address - and none of it is sent to us or to anybody else. Invitations
   go through whichever messaging app you pick, and Yo never learns who you chose.
-- No account is required to be linked to anything. Sign up with a username and a password, or
-  continue with Google, whichever you prefer.
+- No account is required to be linked to anything. Sign up with a username and a password. No
+  email address, no phone number, no verification step.
 
 LOCATION, PRECISELY
 
@@ -91,7 +91,17 @@ and none of your old friends or history will appear here.
 
 Privacy policy: https://yo.the-shop.io/privacy
 ```
-2,803 characters, inside the 4000 limit. Recount with:
+**The description deliberately does not mention Google sign-in.** It read "sign up with a username
+and a password, or continue with Google, whichever you prefer" until 2026-07-29. That advertised a
+path which fails for every account outside `the-shop.hr` while the OAuth consent screen stays
+`orgInternalOnly` (PRD G27) — including the reviewer's, who is told two sections below not to use
+it. A store listing promising a feature the installer cannot use is its own rejection reason, and
+the App access note calling the same feature unusable makes the pair self-contradictory.
+
+If G27 is ever closed, the clause can go back. Until then the honest copy is the one that only
+names the path that works. Note the character count below shifts when this is edited.
+
+Inside the 4000 limit. Recount with:
 `python3 -c "import re,pathlib;print(len(re.findall(r'\`\`\`\n(.*?)\`\`\`',pathlib.Path('store/listing.md').read_text(),re.S)[2].rstrip()))"`
 
 ## App access (for the Play reviewer)

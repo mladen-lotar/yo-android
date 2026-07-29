@@ -20,6 +20,8 @@ in the notification body, and a charset rule had to ship with it — and G31, G3
 §4 also gained a public endpoint it had always omitted, and §7's "explicit file list" turned out not
 to exist.
 
+Revised again 2026-07-29: §7 is rewritten because the arrangement it described is gone - the hand-maintained copy of `backend/` in `lotar/claude` was replaced by a pinned git submodule, so the drift this document spent two revisions describing can no longer be expressed. The store description dropped its Google sign-in clause for as long as G27 stays open.
+
 This document is the single source of truth for *what this app is meant to be*. It exists because
 the specification previously lived only in closed GitHub issues, so a reader of the checkout saw a
 ten-line README and could not tell which absent features were deliberate.
@@ -1300,8 +1302,8 @@ again by a different route.
 ## 7. Deployment state (as of 2026-07-28)
 
 **The backend runs on a server, not on a laptop, since 2026-07-28.** It is a Docker container
-`yo-backend` on the `the-shop` host, at `/root/claude/modules/yo`, vendored into the **`lotar/claude`**
-repository — not `evh-claude` — and fronted by that host's shared Traefik. The hostname
+`yo-backend` on the `the-shop` host, at `/root/claude/modules/yo`, where this repository is a git
+**submodule** of **`lotar/claude`** — not `evh-claude` — fronted by that host's shared Traefik. The hostname
 `https://yo.the-shop.io` did not change across the move, which is why every installed APK kept
 working with no rebuild and no Play update.
 
@@ -1326,29 +1328,34 @@ Two properties of the deployment matter to anyone reading this document for prod
 - **Exactly one replica, permanently.** The rate limiters are in-memory and the store is a non-WAL
   SQLite file, so a second replica halves every limit and invites `SQLITE_BUSY`. Horizontal scaling
   is not a configuration change here; it is a rewrite of FR9's limiter and the storage layer.
-- **A merge to `main` is no longer a deploy.** `backend/` is copied into `lotar/claude` by hand and
-  baked into an image, so production is a snapshot taken at deploy time. Under the old launchd agent
-  the hazard was that branch-only code was absent from production; the hazard is now the inverse and
-  quieter — `main` can be *ahead* of the vendored copy and nothing reports it.
+- **A merge to `main` is still not a deploy, but it is now impossible to be unsure what is deployed.**
+  As of 2026-07-29 this repository is a **git submodule** of `lotar/claude`, at `modules/yo/src`,
+  pinned to a commit. The image is built from that submodule. Deploying is: move the gitlink, land
+  it, `git submodule update --init` on the host, rebuild.
 
-  **"By an explicit file list" was wrong, and the correction inverts the documented hazard.** This
-  document and RELEASE.md §9 both said the vendoring runs off an explicit file list, and RELEASE.md
-  told a future operator to "check the vendored file list whenever the backend gains a module".
-  **There is no such list.** No script, no Makefile, no manifest, in either repository — only a
-  prose line in `modules/yo/CLAUDE.md` inside `lotar/claude` saying the directory is vendored by
-  one. The only machine-readable thing in the pipeline is that repo's `Dockerfile`, which does
-  `COPY backend/*.py ./` — **a glob**.
+  **What this replaced, and why it mattered.** Until then `backend/` was **copied by hand** into
+  `lotar/claude`. Both this document and RELEASE.md §9 described that copy as running off "an
+  explicit file list", and RELEASE.md told a future operator to "check the vendored file list
+  whenever the backend gains a module". **There was no such list** — no script, no Makefile, no
+  manifest, in either repository. The only machine-readable thing in the pipeline was that repo's
+  `Dockerfile` doing `COPY backend/*.py ./`, **a glob**.
 
-  So a newly added backend module is **not** silently skipped, as the old text warned; the glob picks
-  up anything that reaches the vendored directory. The entire risk sits at the **manual copy step**
-  instead, and the remedy the old text prescribed pointed at nothing anybody could check. An
-  instruction that cannot be followed is worse than no instruction: it reads as a control and
-  discharges the reader's attention without doing anything.
+  That inverted the hazard the text warned about. A newly added module was *not* silently skipped —
+  the glob picked up whatever reached the directory. The entire risk sat at the **manual copy step**,
+  and the prescribed remedy pointed at nothing anybody could check. An instruction that cannot be
+  followed is worse than none: it reads as a control and discharges the reader's attention without
+  doing anything.
 
-  **Current state, verified 2026-07-28.** All 7 vendored files are byte-identical to `yo-android`
-  `main`, and the six `.py` files inside the running production container hash-match them. So
-  production is genuinely running `main` as of that date — which is a fact about today, not a
-  property of the pipeline, and it is exactly the fact nothing reports.
+  The submodule removes the copy step altogether, so the drift stops being something to detect and
+  becomes something that cannot be **expressed** — the deployed commit is the recorded commit, and
+  `git -C modules/yo/src log -1` on the host answers "what is production built from" exactly.
+
+  **It substitutes a quieter failure, which is worth naming rather than celebrating.** A plain
+  `git pull` on the host moves the gitlink but leaves `src/` checked out at the *previous* commit,
+  so a rebuild produces the previous release with a green healthcheck and passing checks.
+  `git submodule update --init modules/yo/src` is mandatory, and hashing `/app/*.py` against this
+  repository is what catches it. Verified that way at the 2026-07-29 cutover: all six modules inside
+  the running container hash-match `main`.
 
 **The `photos` table is still there on the production database, and is deliberately left alone.**
 The code that created it is gone (G24) and a *fresh* database never gets one — there is a test

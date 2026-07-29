@@ -15,6 +15,14 @@ referenced. Section 6's argument for declaring precise location contradicts the 
 item 7 told a future operator to check a vendored file list that does not exist anywhere. All five
 are corrected below rather than quietly rewritten.
 
+**Revised 29 July 2026.** The backend stopped being a hand-maintained copy: this repository is now
+a git **submodule** of `lotar/claude` at `modules/yo/src`, pinned to a commit, and the image builds
+from it. Section 9 item 7 carries the new deploy sequence and the new failure mode, which is quieter
+than the one it replaced - a plain `git pull` on the host moves the gitlink but leaves the submodule
+at the previous commit, so a rebuild silently ships the previous release. The store description also
+stopped advertising Google sign-in, which fails for every account outside `the-shop.hr` while G27 is
+open - including the reviewer's, whom this document already tells not to use it.
+
 ## 1. What Play requires, and where it stands
 
 | Requirement | State |
@@ -740,29 +748,47 @@ from this that are worth carrying forward:
    **The lesson attached to this item has now inverted, and the new form is the dangerous one.**
    It used to read: the launchd job runs `yo_server.py` straight out of the main checkout with no
    deploy step, so anything branch-only is simply absent from production. That is no longer how
-   production is fed. `backend/` is copied into `lotar/claude` and built into an image, so
-   production is a snapshot taken at deploy time. The failure mode is therefore the opposite one:
-   `yo-android` `main` can be *ahead* of the vendored copy, and nothing anywhere reports the drift -
-   the container keeps serving old code perfectly happily. A merge to `main` is no longer a deploy.
-   Redeploying is a separate, deliberate step.
+   production is fed. This repository is a submodule of `lotar/claude` and is built into an image,
+   so production is a snapshot taken at deploy time. The failure mode is therefore the opposite one:
+   `yo-android` `main` can be *ahead* of the pinned commit, and the container keeps serving the older
+   code perfectly happily. A merge to `main` is not a deploy. Redeploying is a separate, deliberate
+   step - but unlike the hand-copied arrangement this replaced, the deployed commit is now recorded
+   rather than assumed.
 
-   **The instruction that used to end this item was impossible to follow, so it is deleted.** It
-   said `backend/` is vendored "by an explicit file list", that a **newly added** file is therefore
-   silently not vendored at all, and that "the vendored file list has to be checked whenever the
-   backend gains a module". **There is no file list.** No script, no Makefile, no manifest, in either
-   repository - only a prose line in `modules/yo/CLAUDE.md` in `lotar/claude` asserting that one
-   exists. The only machine-readable step is that repo's `Dockerfile`, which does
-   `COPY backend/*.py ./` - **a glob**.
+   **There is no copy any more, as of 29 July 2026.** This repository is a **git submodule** of
+   `lotar/claude` at `modules/yo/src`, pinned to a commit, and the image is built from it.
 
-   That inverts the hazard as well as the remedy. A newly added module is **not** skipped; the glob
-   picks up whatever reaches the vendored directory. The whole risk is the **manual copy** into that
-   directory, which no list would have guarded either. Checking a file list that does not exist is
-   worse than checking nothing, because it reads like a control and stops the reader looking further.
+   Deploying is now:
 
-   **What to actually do:** after copying, diff the vendored directory against `yo-android` `main`
-   and confirm the running container matches. Verified that way on 28 July 2026 - all 7 vendored
-   files byte-identical to `main`, and the six `.py` files inside the running container hash-matching
-   them, so production is genuinely running `main` as of that date.
+   ```sh
+   # in lotar/claude
+   cd modules/yo/src && git fetch && git checkout <sha> && cd -
+   git add modules/yo/src && git commit    # the gitlink IS the deploy record
+   # on the host
+   cd /root/claude && git pull && git submodule update --init modules/yo/src
+   cd /root/claude/modules/yo && docker compose -f compose.prod.yml up -d --build
+   ```
+
+   **What this replaced.** The instruction that used to end this item was impossible to follow. It
+   said `backend/` was vendored "by an explicit file list", that a newly added file was therefore
+   silently not vendored, and that "the vendored file list has to be checked whenever the backend
+   gains a module". **There was no file list** - no script, no Makefile, no manifest, in either
+   repository, only a prose line asserting one existed. The only machine-readable step was a
+   `COPY backend/*.py ./` **glob**, which inverted both the hazard and the remedy: a new module was
+   never skipped, and the whole risk sat in the manual copy, which no list would have guarded.
+   Checking a list that does not exist is worse than checking nothing, because it reads like a
+   control and stops the reader looking further.
+
+   **The new failure mode, which is quieter than the one it replaced.** A plain `git pull` on the
+   host moves the gitlink but leaves `src/` checked out at the *previous* commit. The rebuild then
+   produces the previous release: image builds, container starts, healthcheck passes, and every
+   check that does not hash the running code says the deploy worked. **`git submodule update
+   --init` is mandatory**, and `git -C modules/yo/src log --oneline -1` on the host is the one-line
+   check that catches it.
+
+   **What to actually verify:** hash `/app/*.py` inside the running container against this
+   repository. Done that way at the 29 July 2026 cutover - all six modules matched, the build
+   context fell to 1.17 kB, and the database content digest was unchanged across the switch.
 8. `./gradlew :app:testDebugUnitTest` and `python3 -m unittest discover` in `backend/`.
 9. `./gradlew :app:bundleRelease`, upload the `.aab` and `mapping.txt`.
 10. Fill in the data safety form (section 6) and the content rating questionnaire.

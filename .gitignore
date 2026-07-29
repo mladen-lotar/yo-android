@@ -18,3 +18,7 @@ __pycache__/
 backend/yo.db*
 backend/*.db
 backend/*.db-journal
+# Agent worktrees and scratch state. These are whole checkouts of this repo living inside it;
+# untracked and unignored, they showed up in every `git status` and were one `git add -A` from
+# being committed as a nested copy of the project.
+.claude/
