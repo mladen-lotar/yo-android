@@ -1314,10 +1314,11 @@ Worth naming how it got in: the plan for G30 said *client sanitise and server re
 the three pieces shipped. A partial implementation of a rule reads as complete right up until
 somebody types the ordinary thing.
 
-**G35 — the three failure rows can sit below the fold. — OPEN.** `COULDN'T LOAD FRIENDS`,
-`NOT RECEIVING YOS` and `COULDN'T YO <NAME>` are all appended as items *after* every 89dp band in
-the same `LazyColumn`. With roughly seven or more friends and groups they are off-screen on a normal
-handset. The delivered flash is drawn on the band itself, so success is always visible and only
+**G35 — the three failure rows can sit below the fold. — OPEN, now MEASURED on hardware.**
+`COULDN'T LOAD FRIENDS`, `NOT RECEIVING YOS` and `COULDN'T YO <NAME>` are all appended as items
+*after* every 89dp band in the same `LazyColumn`. Measured on a Galaxy S23 (1080x2340, density 480,
+so scale 3.0 and an 89dp band is 267px) against 2,120px of usable height between the status and
+navigation bars: **seven bands fit, and at eight the failure rows are pushed off-screen.** The delivered flash is drawn on the band itself, so success is always visible and only
 failure can scroll away — which quietly re-opens G25 for exactly the accounts that use the app most.
 Pinning them above the bands, or floating them, is the fix; it is layout work that wants a device to
 judge, and no unit test can see it (the same class as G22).
@@ -1331,6 +1332,19 @@ request became an affirmative claim that you have blocked no one — on the one 
 purpose is the safety control FR9 names. `loadFriends` already distinguished a failed load from an
 empty one, and that asymmetry is what identified this rather than any judgement about severity. The
 sheet now reads `COULDN'T LOAD THIS LIST`, and the flag clears once the server answers.
+
+**G37 — the eighth menu band renders 80px of its 267px. — OPEN, cosmetic.** Found on a Galaxy S23,
+29 July 2026. The menu sheet holds eight 89dp bands plus a drag handle, which overflows the sheet's
+maximum height, so `DELETE ACCOUNT` — the last one — is clipped to roughly the top third of its
+band, and the sheet does not scroll to reveal the rest.
+
+**It is reachable, and that was verified rather than assumed**: tapping the visible strip opens the
+deletion confirmation sheet. So this is not G22 repeating — that was a control with a ~30px live
+target under the navigation bar, and this one has ~80px and works. But it is the same *shape*, on
+the same screen, protecting the same Play requirement, and it arrived the same way: a band was added
+(BLOCKED, G26) without anyone asking what the eighth band does to a sheet sized for seven.
+
+Worth fixing before the count grows again — a ninth band would push `DELETE ACCOUNT` out entirely.
 
 ---
 

@@ -111,19 +111,37 @@ the-shop.hr organisation, so the declaration must be **All functionality is rest
 username/password demo account, and must say so:
 
 ```
-Sign in with the username and password below using SIGN UP / LOG IN on the first screen.
-Do NOT use CONTINUE WITH GOOGLE - Google sign-in is currently restricted to our organisation's
-accounts and will fail for you.
+Username: YODEMO1
+Password: YomyoU4NTT1pe8ik
 
-The demo account already has one friend so the main screen is populated. Tap the coloured band
-to send a Yo; long-press it to attach a link, a hashtag or a location, or to block/remove.
+Sign in with LOG IN on the first screen. Do NOT use CONTINUE WITH GOOGLE - Google sign-in is
+currently restricted to our organisation's accounts and will fail for you.
+
+The account already has three friends, so the main screen is populated. Tap a coloured band to
+send a Yo. Long-press a band to attach a link, a hashtag or a location, or to remove or block
+that person. The red button at the bottom right opens the menu, which holds the privacy policy,
+the blocked list, and account deletion.
 ```
 
-Two things must be true before this is submitted, or the reviewer sees a broken app:
-1. the demo account has at least one friend, in BOTH directions - `list_friends` selects on
-   `owner` only, so a single `add_friend` call populates one side and leaves the other empty;
-2. the friend has registered a device at least once, otherwise `POST /v1/send` answers 404
-   `recipient_unregistered` and the reviewer's Yo visibly fails.
+**Both preconditions are now satisfied, verified on a Galaxy S23 on 29 July 2026.**
+
+| | |
+|---|---|
+| Username | `YODEMO1` |
+| Password | `YomyoU4NTT1pe8ik` |
+| Friends visible on the home screen | `ADA`, `LEO`, `YODEMO2` |
+
+1. ~~the demo account has at least one friend, in BOTH directions~~ - done. `list_friends`
+   selects on `owner` only, so a single `add_friend` populates one side and leaves the other
+   empty; `YODEMO1` and `YODEMO2` are friends both ways.
+2. ~~the friend has registered a device~~ - done, and this was the part that could only be
+   closed with a handset. `YODEMO2` had no `devices` row, so `POST /v1/send` answered 404
+   `recipient_unregistered` and a reviewer's first tap would have visibly failed. Signing in as
+   `YODEMO2` on a real device registered an FCM token; `YODEMO1 -> YODEMO2` now returns
+   `{"delivered":true}` and the push was observed arriving. Both directions were then verified.
+
+**These are real accounts in the production database and must be deleted after launch**, the same
+way `GTEST` was (PRD section 7.1). Four to remove: `YODEMO1`, `YODEMO2`, `ADA`, `LEO`.
 
 ## Category and contact
 
