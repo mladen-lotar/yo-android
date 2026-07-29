@@ -35,7 +35,7 @@ open - including the reviewer's, whom this document already tells not to use it.
 | In-app account deletion | Done - menu, DELETE ACCOUNT band |
 | Web account-deletion URL | Done - served at `/delete-account` |
 | 512x512 icon, 1024x500 feature graphic | Done - `store/`, regenerate with `tools/generate-store-assets.py`. Icon is now **32-bit RGBA**; the 24-bit version Play rejects was shipped until 28 Jul 2026, see section 7 |
-| Phone screenshots (min 2) | **Outstanding** - both are **RGB, and Play's spec is no-alpha, so the mode is right**; but `sc-menu.png` predates the BLOCKED band and shows 7 of the app's 8 menu rows. Needs a recapture on a handset, see section 7 |
+| Phone screenshots (min 2) | Done (29 Jul 2026) - **recaptured on a Galaxy S23 from a release build of HEAD**, 1080x2340 RGB. The menu shot now shows all 8 rows including BLOCKED; the home shot shows three friend bands rather than one |
 | Release artifact matches HEAD | **Outstanding** - the `.aab` must be **rebuilt from HEAD before upload**; the one previously on disk predates the CAMERA removal, see section 4 |
 | Data safety declaration | Answers prepared in section 6; must be typed into the Console |
 | Content rating questionnaire | **Answers done, entry outstanding** - fully derived in `store/listing.md`; the questionnaire itself is Console-only |
@@ -49,7 +49,7 @@ open - including the reviewer's, whom this document already tells not to use it.
 | FCM for `hr.theshop.yo` | Done - app + both SHA-1s in `yo-theshop` |
 | Google sign-in for `hr.theshop.yo` | Done - all clients in `yo-theshop` (G16 closed); not yet re-verified on device |
 | OAuth consent screen off `orgInternalOnly` | **Outstanding** - Console only, blocks every non-`the-shop.hr` account |
-| App access - credentials for the reviewer | **Half done** - the declaration and the instructions text are drafted in `store/listing.md`; the demo **account itself still does not exist** and cannot be a Google one. See section 9 item 11 |
+| App access - credentials for the reviewer | Done (29 Jul 2026) - `YODEMO1` / `YomyoU4NTT1pe8ik`, three friends visible, and `YODEMO2` now has a registered device so a reviewer's Yo actually delivers. Credentials and instructions in `store/listing.md`. **Four accounts to delete after launch** |
 | Closed testing, 12 testers x 14 days | **Unknown** - see section 9 |
 
 ## 2. Toolchain
