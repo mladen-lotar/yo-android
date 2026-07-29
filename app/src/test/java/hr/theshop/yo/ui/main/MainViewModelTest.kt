@@ -260,6 +260,53 @@ class MainViewModelTest {
         collectorJob.cancel()
     }
 
+    /**
+     * The space is the whole point. The backend refuses a hashtag outside `[\w-]+` with a 400,
+     * because the value lands in the recipient's notification beside the app's own "TAP TO OPEN"
+     * wording and could otherwise forge a tap target. That rule is right. What was wrong was
+     * sending whatever was typed: "world cup" - two words, on a keyboard with a space bar - failed
+     * the ENTIRE Yo, showed "COULDN'T YO ADA - TAP TO RETRY", and every retry re-issued the same
+     * rejected request forever. The security rule stays; the server's 400 is simply now
+     * unreachable from our own client.
+     */
+    @Test
+    fun `sendYo normalizes a hashtag the server would refuse instead of failing the whole Yo`() =
+        runTest {
+            val repository = FakeYoRepository()
+            val viewModel = createViewModel(repository = repository)
+            val collectorJob = launch { viewModel.history.collect {} }
+            dispatcher.scheduler.advanceUntilIdle()
+
+            viewModel.sendYo("Alice", link = null, hashtag = "world cup", attachLocation = false)
+            dispatcher.scheduler.advanceUntilIdle()
+
+            assertEquals("worldcup", viewModel.history.value.single().hashtag)
+
+            collectorJob.cancel()
+        }
+
+    @Test
+    fun `a hashtag cannot smuggle the notification body's own wording`() = runTest {
+        val repository = FakeYoRepository()
+        val viewModel = createViewModel(repository = repository)
+        val collectorJob = launch { viewModel.history.collect {} }
+        dispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.sendYo(
+            "Alice",
+            link = null,
+            hashtag = "x  \u00b7  TAP TO OPEN paypal.com",
+            attachLocation = false,
+        )
+        dispatcher.scheduler.advanceUntilIdle()
+
+        val sent = viewModel.history.value.single().hashtag
+        assertEquals("xTAPTOOPENpaypalcom", sent)
+        assertFalse(sent!!.contains(" "))
+
+        collectorJob.cancel()
+    }
+
     @Test
     fun `sendYo strips a leading hashtag character from user-entered hashtag text`() = runTest {
         val repository = FakeYoRepository()
@@ -1049,6 +1096,31 @@ class MainViewModelTest {
         dispatcher.scheduler.advanceUntilIdle()
 
         assertEquals(listOf("LIN"), viewModel.blocked.value)
+    }
+
+    /**
+     * Keeping the previous list is right; rendering it as an ANSWER is not. An empty list and a
+     * failed fetch both drew "NOBODY" - an affirmative claim that you have blocked no one - on
+     * the one screen whose entire job is the safety control. `loadFriends` already distinguished
+     * the two cases, and that asymmetry is what identified this rather than any judgement call.
+     */
+    @Test
+    fun `a failed blocked read is reported rather than rendered as nobody`() = runTest {
+        val backendApi = FakeYoBackendApi(friends = listOf("ADA"))
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertFalse(viewModel.blockedLoadFailed.value)
+
+        backendApi.fetchBlockedFailure = IOException("offline")
+        viewModel.refreshBlocked()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.blockedLoadFailed.value)
+        // And it clears once the server answers again, so the warning cannot outlive its cause.
+        backendApi.fetchBlockedFailure = null
+        viewModel.refreshBlocked()
+        dispatcher.scheduler.advanceUntilIdle()
+        assertFalse(viewModel.blockedLoadFailed.value)
     }
 
     // The direct contract: a cancelled read is NOT a failed read, and must propagate rather than

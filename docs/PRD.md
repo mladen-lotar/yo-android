@@ -1297,6 +1297,41 @@ non-IP forwarded entry now falls back to the socket peer rather than becoming a 
 its own — otherwise a caller could mint unlimited buckets out of arbitrary strings, which is G32
 again by a different route.
 
+**G34 — a hashtag the server refuses failed the whole Yo, and the retry could never succeed. —
+RESOLVED 2026-07-29.** G30's charset rule was added to the backend on 2026-07-28 and the matching
+sanitiser was added to the *display* path in `YoNotifier`, but **not to the send path**. So the
+client transmitted whatever was typed, and `world cup` — two words, on a keyboard with a space bar
+— was rejected with a 400 that failed the entire Yo rather than the attachment. The band read
+`COULDN'T YO <NAME> - TAP TO RETRY`, and G25's retry re-issued the identical rejected request
+forever, so the one affordance offered was the one thing that could not work.
+
+`MainViewModel.normalizeHashtag` now strips disallowed characters before sending, so `world cup`
+travels as `worldcup`. The server rule is unchanged and unrelaxed — it is simply unreachable from
+our own client, which is what defence in depth is supposed to mean. Validation the user cannot see,
+on a field they cannot get right, is not a control.
+
+Worth naming how it got in: the plan for G30 said *client sanitise and server reject*, and two of
+the three pieces shipped. A partial implementation of a rule reads as complete right up until
+somebody types the ordinary thing.
+
+**G35 — the three failure rows can sit below the fold. — OPEN.** `COULDN'T LOAD FRIENDS`,
+`NOT RECEIVING YOS` and `COULDN'T YO <NAME>` are all appended as items *after* every 89dp band in
+the same `LazyColumn`. With roughly seven or more friends and groups they are off-screen on a normal
+handset. The delivered flash is drawn on the band itself, so success is always visible and only
+failure can scroll away — which quietly re-opens G25 for exactly the accounts that use the app most.
+Pinning them above the bands, or floating them, is the fix; it is layout work that wants a device to
+judge, and no unit test can see it (the same class as G22).
+
+Recorded alongside it: **`COULDN'T LOAD FRIENDS` offers no retry**, unlike the push row and the send
+row beside it, so it is a dead end whose only escape is adding a friend by name.
+
+**G36 — a failed blocked-list fetch rendered as `NOBODY`. — RESOLVED 2026-07-29.** `loadBlocked`
+kept the previous value on failure and the sheet drew `NOBODY` for an empty list, so a failed
+request became an affirmative claim that you have blocked no one — on the one screen whose whole
+purpose is the safety control FR9 names. `loadFriends` already distinguished a failed load from an
+empty one, and that asymmetry is what identified this rather than any judgement about severity. The
+sheet now reads `COULDN'T LOAD THIS LIST`, and the flag clears once the server answers.
+
 ---
 
 ## 7. Deployment state (as of 2026-07-28)

@@ -118,6 +118,7 @@ fun MainScreen(
     val sendDeliveredTo by viewModel.sendDeliveredTo.collectAsState()
     val sendFailure by viewModel.sendFailure.collectAsState()
     val blocked by viewModel.blocked.collectAsState()
+    val blockedLoadFailed by viewModel.blockedLoadFailed.collectAsState()
 
     var attachTarget by remember { mutableStateOf<SendTarget?>(null) }
     var sheet by remember { mutableStateOf<Sheet?>(null) }
@@ -346,6 +347,7 @@ fun MainScreen(
         )
         Sheet.Blocked -> BlockedSheet(
             blocked = blocked,
+            loadFailed = blockedLoadFailed,
             onDismiss = { sheet = null },
             onUnblock = viewModel::unblock,
         )
@@ -860,6 +862,7 @@ private fun Context.openMap(latitude: Double, longitude: Double, label: String) 
 @Composable
 private fun BlockedSheet(
     blocked: List<String>,
+    loadFailed: Boolean,
     onDismiss: () -> Unit,
     onUnblock: (String) -> Unit,
 ) {
@@ -877,7 +880,11 @@ private fun BlockedSheet(
             if (blocked.isEmpty()) {
                 item(key = "blocked-empty") {
                     Text(
-                        text = "NOBODY",
+                        // "NOBODY" is an assertion, and it must only be made when the server
+                        // actually said so. A failed fetch used to render it too, telling the
+                        // user they had blocked no one on the one screen that exists to show
+                        // exactly that - the friends list already drew this distinction.
+                        text = if (loadFailed) "COULDN'T LOAD THIS LIST" else "NOBODY",
                         style = YoLabel,
                         modifier = Modifier
                             .fillMaxWidth()

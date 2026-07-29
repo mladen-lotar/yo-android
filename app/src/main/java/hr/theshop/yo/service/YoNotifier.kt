@@ -56,14 +56,6 @@ object YoNotifier {
     fun yoNotificationBody(sender: String): String = "From ${sender.uppercase()}"
 
     /**
-     * A Yo carrying a location has to say so. The notification is the recipient's ONLY surface
-     * for it - received Yos are not written to this device's history - so a body identical to a
-     * plain Yo gives no reason to tap, and the location is lost the moment the shade is swiped.
-     */
-    fun yoLocationNotificationBody(sender: String): String =
-        "${yoNotificationBody(sender)}  ·  TAP TO OPEN MAP"
-
-    /**
      * The same reasoning as the location body, for the other two attachments. A hashtag is shown
      * inline because there is nothing to open; a link earns a tap hint because there is.
      */
