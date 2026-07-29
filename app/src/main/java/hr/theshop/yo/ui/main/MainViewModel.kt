@@ -60,6 +60,9 @@ class MainViewModel @Inject constructor(
     private val _blocked = MutableStateFlow<List<String>>(emptyList())
     val blocked: StateFlow<List<String>> = _blocked.asStateFlow()
 
+    private val _blockedLoadFailed = MutableStateFlow(false)
+    val blockedLoadFailed: StateFlow<Boolean> = _blockedLoadFailed.asStateFlow()
+
     private val _addFriendOutcome = MutableStateFlow<AddFriendOutcome?>(null)
     val addFriendOutcome: StateFlow<AddFriendOutcome?> = _addFriendOutcome.asStateFlow()
 
@@ -267,16 +270,21 @@ class MainViewModel @Inject constructor(
      * be asserted by reading it.
      */
     internal suspend fun loadBlocked() {
-        _blocked.value =
-            try {
-                backendApi.fetchBlocked()
-            } catch (e: CancellationException) {
-                // Not a failed load. A plain runCatching would swallow it here exactly as it
-                // used to in saveSent, and this is the one screen that undoes a one-way door.
-                throw e
-            } catch (e: Throwable) {
-                _blocked.value
-            }
+        try {
+            _blocked.value = backendApi.fetchBlocked()
+            _blockedLoadFailed.value = false
+        } catch (e: CancellationException) {
+            // Not a failed load. A plain runCatching would swallow it here exactly as it
+            // used to in saveSent, and this is the one screen that undoes a one-way door.
+            throw e
+        } catch (e: Throwable) {
+            // The list keeps its previous value, but the screen must SAY the fetch failed.
+            // Without this the sheet rendered "NOBODY" - an affirmative claim that you have
+            // blocked no one - out of a failed request, on the one surface whose whole job is
+            // the safety control. loadFriends already distinguished the two; this did not, and
+            // the asymmetry was the evidence rather than a judgement call.
+            _blockedLoadFailed.value = true
+        }
     }
 
     /** Drops the token server-side first, so a stolen copy of it dies with the logout. */
@@ -340,13 +348,35 @@ class MainViewModel @Inject constructor(
             sendYoUseCase(sender = username, recipient = recipient) {
                 copy(
                     link = normalizeLink(link),
-                    hashtag = hashtag?.takeIf { it.isNotBlank() }?.trimStart('#')?.takeIf { it.isNotBlank() },
+                    hashtag = normalizeHashtag(hashtag),
                     latitude = coords?.latitude,
                     longitude = coords?.longitude,
                 )
             }
         }
     }
+
+    /**
+     * A hashtag the backend will accept, or null.
+     *
+     * The server refuses anything outside `[\w-]+` with a 400, because a hashtag is interpolated
+     * into the recipient's notification body beside the app's own "TAP TO OPEN" wording and could
+     * otherwise forge a tap target. That rule is right and stays. What was wrong was leaving the
+     * client to send whatever was typed: a space is the most ordinary thing a person puts in a
+     * two-word tag, and it failed the ENTIRE Yo - not the hashtag, the Yo - with
+     * `COULDN'T YO <NAME> - TAP TO RETRY` and a retry that re-issued the identical doomed request
+     * forever. Validation the user cannot see, on a field they cannot get right, is not a control.
+     *
+     * So "world cup" is sent as "worldcup" rather than rejected. It is the reading the user meant,
+     * it matches what every other product does with a hashtag, and it keeps the security rule
+     * intact by making the server's 400 unreachable from our own client instead of by relaxing it.
+     */
+    internal fun normalizeHashtag(raw: String?): String? =
+        raw?.takeIf { it.isNotBlank() }
+            ?.trimStart('#')
+            ?.replace(HASHTAG_DISALLOWED, "")
+            ?.take(MAX_HASHTAG_CHARS)
+            ?.takeIf { it.isNotEmpty() }
 
     /**
      * "example.com" is what people type, and the recipient's notification only ever opens http or
@@ -446,5 +476,15 @@ class MainViewModel @Inject constructor(
     private companion object {
         /** RFC 3986 scheme: letter, then letters/digits/+/-/. up to the colon. */
         val SCHEME_PREFIX = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+        /**
+         * The inverse of the server's `\A[\w-]+\Z`, stated the same way here so the two cannot
+         * disagree about the same string. `\p{L}` excludes format characters, so an RTL override
+         * or a zero-width joiner goes with the spaces.
+         */
+        val HASHTAG_DISALLOWED = Regex("[^\\p{L}\\p{N}_-]")
+
+        /** Well inside the server's 140-BYTE cap even for multibyte scripts. */
+        const val MAX_HASHTAG_CHARS = 32
     }
 }
