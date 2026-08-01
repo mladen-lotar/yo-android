@@ -367,15 +367,32 @@ fun MainScreen(
 private enum class Sheet { Menu, History, CreateGroup, Invite, AddFriend, Blocked, DeleteAccount }
 
 /** A send target — a person or a group. Both render as an identical colour band. */
-private sealed interface SendTarget {
+internal sealed interface SendTarget {
     val label: String
+
+    /**
+     * Stable AND unique, which the label is not.
+     *
+     * Two groups may share a name - nothing stops it, and `GroupRepositoryImplTest` has a test
+     * asserting that creating a duplicate name yields a distinct group, so it is a deliberate
+     * contract rather than an oversight. Keying the LazyColumn on the label therefore produced
+     * duplicate keys, which Compose treats as a fatal error: the home screen crashed on every
+     * launch, and because groups are local and survive logout, the only ways out were Clear Data,
+     * reinstall, or account deletion - whose UI is behind the screen that is crash-looping.
+     *
+     * A group's identity is its id. A friend's is their username, which the server guarantees is
+     * unique. The label is what the band SAYS, and was never identity.
+     */
+    val key: String
 
     data class Friend(val username: String) : SendTarget {
         override val label: String get() = username
+        override val key: String get() = "friend-$username"
     }
 
     data class YoGroup(val group: Group) : SendTarget {
         override val label: String get() = group.name
+        override val key: String get() = "group-${group.id}"
     }
 }
 
@@ -393,7 +410,7 @@ private fun LazyListScope.bandRows(
 ) {
     targets.forEachIndexed { index, target ->
         val isGroup = target is SendTarget.YoGroup
-        item(key = "band-${if (isGroup) "group" else "friend"}-${target.label}") {
+        item(key = "band-${target.key}") {
             Band(
                 color = YoPalette.colorForIndex(index),
                 // A send is a network round trip of up to ten seconds. Without the pending state

@@ -675,6 +675,35 @@ so the Firebase service-account key was being copied into the build context. Fix
 pushed to a registry here, so the exposure was local to the build - but a private key in a build
 context is one `COPY .` away from a layer, and layers are forever.
 
+### 8.10 Backups outlive deletion, and the served pages now say so
+
+Found 1 August 2026. `delete_account` erases rows from the live SQLite file, and nothing else -
+which is correct and is all it can do. The privacy policy and the deletion page went further and
+said **"Then it is gone, in full and immediately"** and **"Nothing is retained after deletion"**,
+and backups make both false: a snapshot taken before somebody left still holds their username,
+PBKDF2 password hash, Google subject id, FCM token, friends and blocks. Proven by taking a
+snapshot with the same `Connection.backup()` mechanism after a deletion returned 200 and finding
+the deleted user still in it.
+
+This is a claim problem, not a backup problem - backups are correct and necessary. Both pages now
+disclose the exception and commit to a **30-day** expiry, which is the honest version of what a
+service with backups can promise.
+
+**One thing must be closed before that wording is deployed, or the new text is false too.**
+
+| Copy | Retention | State |
+|---|---|---|
+| Host, `/root/backups/yo` | `find ... -mtime +7 -delete`, in the same cron line as the snapshot | **Correct.** Not yet exercised - backups only began 28 Jul, so nothing has aged out |
+| Laptop, `~/backups/yo` | **none** | **Unbounded.** 92 files and growing |
+
+The laptop job is `com.yo.db-backup-pull`, and its command is a bare
+`rsync -a --ignore-existing ...` with no deletion step, so it accumulates every hourly snapshot
+the host has ever taken and drops none. (It runs **daily at 07:30** as documented - the file count
+comes from rsync collecting the host's *hourly* files, not from the job running hourly.) Add a
+prune to that plist - `find "$HOME/backups/yo" -name 'yo-*.db' -mtime +30 -delete` - before
+deploying the new page text. It is deliberately left undone here because it deletes files on a
+machine outside this repository, which is the operator's call and not a code change.
+
 ### 8.9 The edge was breaking the only no-app deletion route
 
 Found 28 July 2026, and it is the kind of defect that only exists in production - the pages are

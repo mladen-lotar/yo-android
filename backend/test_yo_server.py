@@ -109,6 +109,9 @@ class YoServerTestCase(unittest.TestCase):
             ),
             send_limiter=RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS),
             lookup_limiter=RateLimiter(LOOKUP_ATTEMPTS, LOOKUP_WINDOW_SECONDS),
+            # Zero, so the equal-cost sleep on the blocked path does not add a tenth
+            # of a second to every block test. The PROPERTY is asserted separately.
+            delivery_cost=yo_server.DeliveryCostEstimator(initial_seconds=0.0),
             # Unconfigured by default, matching a deployment with no YO_GOOGLE_CLIENT_ID.
             # GoogleSignInTest installs a stub.
             google_verifier=None,
@@ -2374,6 +2377,166 @@ class LookupRateLimitTest(YoServerTestCase):
             {"/v1/friends", "/v1/block", "/v1/register"},
             set(yo_server.LOOKUP_LIMITED_PATHS),
         )
+
+
+class TokenOutlivingItsAccountTest(YoServerTestCase):
+    """A token must never name an account that is not there.
+
+    Sign-in reads the account, spends ~300 ms on PBKDF2, and only then writes the token. A
+    DELETE /v1/account inside that window completed first and reaped the tokens that existed at
+    that moment; the new one landed afterwards. Measured before the fix: with the delete fired 0,
+    5, 15 or 30 ms after the login, a live token survived 40 times out of 40.
+
+    The consequence is not a stray row. Nothing prunes tokens, and a deleted username is free to
+    claim again, so the stale session silently becomes a session on whoever registers that name
+    next.
+    """
+
+    def _account(self, username="ALICE"):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_a_token_cannot_be_issued_for_an_account_that_is_gone(self):
+        """The race, without the race: the state the loser of it would have written."""
+        self.assertFalse(
+            self.server.database.store_token("some-token-hash", "NOBODY"),
+            "storing a token for an account that does not exist must not succeed",
+        )
+        self.assertIsNone(self.server.database.username_for_token("some-token-hash"))
+
+    def test_a_token_written_before_a_delete_stops_authenticating_after_it(self):
+        """Belt to the other's braces: the JOIN makes this true for rows already in the table,
+        however they got there, not only for rows written from now on."""
+        token = self._account()
+        self.assertEqual(200, self.request("GET", "/v1/friends", token=token)[0])
+
+        self.server.database.delete_account("ALICE")
+
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=token)[0])
+
+    def test_a_stale_token_does_not_transfer_to_whoever_claims_the_name_next(self):
+        """The whole reason this is not merely an orphan row."""
+        attacker = self._account("GHOST")
+        # Simulate the losing login: a token row for an account that is about to vanish.
+        self.server.database.delete_account("GHOST")
+        self.server.database.store_token(yo_auth.hash_token("stale-token"), "GHOST")
+
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "GHOST", "password": "different-pass-9"}
+        )
+        self.assertEqual(201, status, "the freed username is claimable, by design")
+
+        self.assertEqual(
+            401,
+            self.request("GET", "/v1/friends", token="stale-token")[0],
+            "the old token must not authenticate as the new owner",
+        )
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=attacker)[0])
+
+    def test_an_ordinary_sign_in_is_unaffected(self):
+        token = self._account()
+        status, body = self.request("GET", "/v1/friends", token=token)
+
+        self.assertEqual(200, status)
+        self.assertEqual([], body["friends"])
+
+
+class LogoutForgetsTheDeviceTest(YoServerTestCase):
+    """Signing out has to mean the handset stops receiving the account's Yos."""
+
+    def _account(self, username):
+        _, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        return body["token"]
+
+    def test_logging_out_removes_the_registration(self):
+        token = self._account("CAROL")
+        self.request("POST", "/v1/register", {"fcm_token": "CAROL-PHONE"}, token=token)
+        self.assertEqual("CAROL-PHONE", self.server.database.get_fcm_token("CAROL"))
+
+        self.assertEqual(200, self.request("DELETE", "/v1/session", token=token)[0])
+
+        self.assertIsNone(
+            self.server.database.get_fcm_token("CAROL"),
+            "a signed-out phone must stop receiving the account's Yos",
+        )
+
+    def test_a_yo_to_a_signed_out_account_is_not_delivered_to_the_old_handset(self):
+        """The observable consequence, which is the part that matters: the sender's name, and any
+        location, link or hashtag they attached, were arriving on a phone its owner had signed
+        out of - and on a phone that was sold or handed on, that is one person's messages being
+        delivered to another."""
+        carol = self._account("CAROL")
+        self.request("POST", "/v1/register", {"fcm_token": "CAROL-PHONE"}, token=carol)
+        self.request("DELETE", "/v1/session", token=carol)
+        bob = self._account("BOB")
+
+        status, body = self.request(
+            "POST", "/v1/send", {"recipient": "CAROL"}, token=bob
+        )
+
+        self.assertEqual(404, status)
+        self.assertEqual("recipient_unregistered", body["reason"])
+        self.assertEqual([], self.fcm_client.calls)
+
+
+class BlockedSendCostTest(YoServerTestCase):
+    """A block answers 200 delivered:true and sends nothing. That has to include the clock.
+
+    Measured before the fix: blocked p50 0.79 ms, delivered p50 116.69 ms, ranges disjoint by
+    110 ms. The one control whose threat model explicitly names the sender as the adversary
+    announced itself to that adversary in the timing, while the body was byte-identical.
+
+    Asserted as "the blocked path consults the delivery-cost estimator" rather than by measuring
+    wall-clock time, which would be a flaky test on a loaded machine. The estimator's own
+    arithmetic is asserted separately.
+    """
+
+    def _account(self, username):
+        _, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        return body["token"]
+
+    def test_a_blocked_send_spends_what_a_delivery_would_have(self):
+        alice = self._account("ALICE")
+        bob = self._account("BOB")
+        self.request("POST", "/v1/register", {"fcm_token": "BOB-PHONE"}, token=bob)
+        self.request("POST", "/v1/block", {"username": "ALICE"}, token=bob)
+
+        with mock.patch.object(self.server.delivery_cost, "sleep_to_match") as matched:
+            status, body = self.request(
+                "POST", "/v1/send", {"recipient": "BOB"}, token=alice
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        matched.assert_called_once()
+        self.assertEqual([], self.fcm_client.calls, "nothing may actually be sent")
+
+    def test_a_real_delivery_teaches_the_estimator_what_one_costs(self):
+        alice = self._account("ALICE")
+        bob = self._account("BOB")
+        self.request("POST", "/v1/register", {"fcm_token": "BOB-PHONE"}, token=bob)
+
+        with mock.patch.object(self.server.delivery_cost, "observe") as observed:
+            self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice)
+
+        observed.assert_called_once()
+        self.assertGreaterEqual(observed.call_args[0][0], 0.0)
+
+    def test_the_estimator_follows_what_it_is_told(self):
+        """Self-calibrating rather than a constant, because the right delay depends on how far
+        the server is from Google - a laptop pays ~117 ms, the production host perhaps 60-75."""
+        estimator = yo_server.DeliveryCostEstimator(initial_seconds=0.0)
+        for _ in range(200):
+            estimator.observe(0.070)
+
+        self.assertAlmostEqual(0.070, estimator.estimate(), places=3)
 
 
 class MalformedNumberTest(YoServerTestCase):

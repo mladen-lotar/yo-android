@@ -165,6 +165,53 @@ class RateLimiter:
             del self._hits[key]
 
 
+class DeliveryCostEstimator:
+    """A running estimate of what delivering a Yo costs, so refusing to can cost the same.
+
+    A block answers `200 {"delivered":true}` and sends nothing, which is deliberate: telling a
+    sender they were blocked turns the block into a notification for the person who was blocked.
+    The body was identical. The timing was not, and it is not close - a blocked send is two SQLite
+    probes while a delivered one is an HTTPS round trip to Google. Measured on this codebase:
+    blocked p50 0.79 ms, delivered p50 116.69 ms, ranges disjoint by 110 ms. Against production's
+    own jitter (yo.the-shop.io /healthz p50 42 ms, IQR 4 ms) a min-of-three classifier separates
+    them essentially perfectly, and the sender is allowed 60 sends a minute.
+
+    So the one control whose threat model explicitly names the sender as the adversary announced
+    itself to that adversary. This is the same defect the login path had, in the same week -
+    identical bodies mistaken for indistinguishability - and yo_auth already states the rule:
+    the equal-cost path is the security property, not a detail.
+
+    Self-calibrating rather than a hardcoded constant, because the right delay is a property of
+    where the server is sitting. A laptop behind a home connection pays ~117 ms to reach FCM; the
+    Hetzner host, far closer to Google, pays perhaps 60-75 ms. A constant tuned on one is wrong on
+    the other, and wrong in the direction of leaking again.
+    """
+
+    # Weight on each new observation. Low enough that one slow outlier does not move the estimate
+    # much, high enough to follow a real change in where FCM is being reached from.
+    _SMOOTHING = 0.2
+
+    def __init__(self, initial_seconds: float = 0.12):
+        self._seconds = initial_seconds
+        self._lock = threading.Lock()
+
+    def observe(self, seconds: float) -> None:
+        with self._lock:
+            self._seconds = (self._seconds * (1 - self._SMOOTHING)) + (
+                seconds * self._SMOOTHING
+            )
+
+    def estimate(self) -> float:
+        with self._lock:
+            return self._seconds
+
+    def sleep_to_match(self, started: float) -> None:
+        """Spend whatever is left of a delivery's typical cost."""
+        remaining = self.estimate() - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+
 def _configured_apk_path() -> Optional[Path]:
     """The APK to hand out at /install/yo.apk, or None if none is configured."""
     configured = os.environ.get("YO_APK_PATH", "").strip()
@@ -316,7 +363,13 @@ the sign-in token if you choose "continue with Google". Nothing is shared with a
 nothing is sold.</p>
 
 <h2>How long we keep it</h2>
-<p>Until you delete your account. Then it is gone, in full and immediately.</p>
+<p>Until you delete your account. Deleting it removes everything above from the live service
+straight away.</p>
+<p>Backups are the one exception, and we would rather say so than leave you to assume otherwise:
+the database is backed up regularly so that a disk failure does not lose everyone's accounts, and
+a backup taken before you left still contains what you had at that moment. Those copies expire on
+their own within 30 days and are never used to bring an account back. Nothing is restored from
+them except to recover the service after a failure.</p>
 
 <h2>Deleting your account</h2>
 <p>In the app: menu, then DELETE ACCOUNT. This erases your account, your friends, your blocks,
@@ -358,7 +411,9 @@ normally far sooner.</p>
   <li>Your notification token, so no further Yo can reach you.</li>
   <li>Your Yo history and groups held on your own phone.</li>
 </ul>
-<p>Nothing is retained after deletion, and none of it can be undone.</p>
+<p>None of it can be undone, and nothing is kept in the live service afterwards. Backups taken
+before you left still hold what you had at that moment; they expire on their own within 30 days
+and are never used to restore an account.</p>
 """
 
 
@@ -391,6 +446,7 @@ class YoHTTPServer(ThreadingHTTPServer):
         )
         self.send_limiter = RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS)
         self.lookup_limiter = RateLimiter(LOOKUP_ATTEMPTS, LOOKUP_WINDOW_SECONDS)
+        self.delivery_cost = DeliveryCostEstimator()
 
 
 class YoRequestHandler(BaseHTTPRequestHandler):
@@ -494,7 +550,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             if parsed.path == "/v1/session":
-                self._handle_logout()
+                self._handle_logout(username)
                 return
             if parsed.path == "/v1/friends":
                 self._handle_remove_friend(username, parsed.query)
@@ -816,12 +872,35 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         self._issue_token(HTTPStatus.CREATED, username)
 
     def _issue_token(self, status: HTTPStatus, username: str) -> None:
+        """Hand out a session, unless the account stopped existing while we were working.
+
+        Both callers - password sign-in and Google sign-in - read the account, then spend real
+        time (a ~300 ms PBKDF2, or a Google token verification), and only then arrive here. A
+        DELETE /v1/account inside that window completes first and reaps the tokens that exist at
+        that moment; this one is written afterwards. store_token now refuses to write a token for
+        an absent account, so the loser of that race is told its credentials are no longer good
+        rather than being handed a session on a deleted account.
+        """
         token = yo_auth.new_token()
-        self.server.database.store_token(yo_auth.hash_token(token), username)
+        if not self.server.database.store_token(yo_auth.hash_token(token), username):
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_credentials"})
+            return
         self._write_json(status, {"token": token, "username": username})
 
-    def _handle_logout(self) -> None:
+    def _handle_logout(self, username: str) -> None:
+        """End the session AND stop delivering to the handset that had it.
+
+        Revoking the token alone left the `devices` row in place, so a signed-out phone kept
+        receiving the account's Yos - sender name, location, link and all. See delete_device.
+
+        Note for whoever next seeds the Play reviewer accounts: this deliberately changes a
+        behaviour RELEASE.md used to rely on. `YODEMO2`'s device row was created by signing in on
+        a handset and signing out again, on the observation that registrations survived logout.
+        They no longer do. Leave the demo friend signed in, or re-register it, or the reviewer's
+        first Yo answers `recipient_unregistered` and visibly fails.
+        """
         self.server.database.delete_token(yo_auth.hash_token(self._bearer_token()))
+        self.server.database.delete_device(username)
         self._write_json(HTTPStatus.OK, {"ended": True})
 
     def _handle_delete_account(self, username: str) -> None:
@@ -993,6 +1072,10 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         return value
 
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
+        # Taken before any work, so the blocked path can be made to cost what the delivering path
+        # costs INCLUDING everything they share. Timing from a later point would leave the
+        # difference in the validation and the lookups.
+        started = time.monotonic()
         recipient = self._target_username(body, key="recipient")
         latitude, longitude = self._optional_coordinates(body)
         link = self._optional_attachment(body, "link", MAX_LINK_BYTES)
@@ -1006,6 +1089,12 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if self.server.database.is_blocked(recipient, sender):
             # Indistinguishable from a delivered Yo on purpose: telling the sender they were
             # blocked turns the block into a notification for the person who was blocked.
+            #
+            # "Indistinguishable" has to include the clock. The body was always identical and the
+            # timing never was - two SQLite probes against an HTTPS round trip to Google, which
+            # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
+            # DeliveryCostEstimator; this spends what a delivery would have spent.
+            self.server.delivery_cost.sleep_to_match(started)
             self._write_json(HTTPStatus.OK, {"delivered": True})
             return
         fcm_token = self.server.database.get_fcm_token(recipient)
@@ -1060,6 +1149,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        # What a real delivery cost, which is what a block must be made to cost. Recorded only on
+        # this path: the failure paths answer a different status and are not what is being matched.
+        self.server.delivery_cost.observe(time.monotonic() - started)
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
 
     def _handle_broadcast(
