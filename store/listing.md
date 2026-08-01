@@ -131,25 +131,33 @@ that person. The red button at the bottom right opens the menu, which holds the 
 the blocked list, and account deletion.
 ```
 
-**Both preconditions are now satisfied, verified on a Galaxy S23 on 29 July 2026.**
+### Seeding these accounts - do this immediately before submitting, not earlier
 
-| | |
-|---|---|
-| Username | `YODEMO1` |
-| Password | not recorded here - see the warning above |
-| Friends visible on the home screen | `ADA`, `LEO`, `YODEMO2` |
+The 29 July seeding is **void**: those accounts are being removed, and the trick used to create
+them no longer works. Re-seed from scratch, in this order.
 
-1. ~~the demo account has at least one friend, in BOTH directions~~ - done. `list_friends`
-   selects on `owner` only, so a single `add_friend` populates one side and leaves the other
-   empty; `YODEMO1` and `YODEMO2` are friends both ways.
-2. ~~the friend has registered a device~~ - done, and this was the part that could only be
-   closed with a handset. `YODEMO2` had no `devices` row, so `POST /v1/send` answered 404
-   `recipient_unregistered` and a reviewer's first tap would have visibly failed. Signing in as
-   `YODEMO2` on a real device registered an FCM token; `YODEMO1 -> YODEMO2` now returns
-   `{"delivered":true}` and the push was observed arriving. Both directions were then verified.
+| # | Step | Why it is not optional |
+|---|---|---|
+| 1 | Sign up `YODEMO1` and `YODEMO2`. Generate the passwords, put them in a password manager | Never in this repository - it is public, and that has already gone wrong once (RELEASE.md §4c) |
+| 2 | Add friends in **both** directions: `YODEMO1` adds `YODEMO2`, and `YODEMO2` adds `YODEMO1` | `list_friends` selects on `owner` only, so a one-way add leaves the other screen blank |
+| 3 | Optionally sign up `ADA` and `LEO` and have `YODEMO1` add them | A new account's home screen is deliberately empty (FR9); a reviewer who signs in to nothing has been shown a working app that looks broken |
+| 4 | Sign in as `YODEMO2` on a handset **and leave it signed in** | This is the step that changed - see below |
+| 5 | Send `YODEMO1` -> `YODEMO2` once and confirm `{"delivered":true}` | The only proof the reviewer's first tap will not visibly fail |
 
-**These are real accounts in the production database and must be deleted after launch**, the same
-way `GTEST` was (PRD section 7.1). Four to remove: `YODEMO1`, `YODEMO2`, `ADA`, `LEO`.
+**Step 4 is the one that used to be a footnote and is now the whole problem.** `YODEMO2`'s
+registration was previously created by signing in on a phone and signing out again, on the
+observed fact that a `devices` row survived logout. That was a **defect**, fixed on 2026-08-01: a
+signed-out handset kept receiving the account's Yos - sender name, location, links and all - which
+on a phone that was sold or handed on delivers one person's messages to another. `DELETE
+/v1/session` now clears the row.
+
+So the demo friend must remain signed in somewhere for the registration to exist. A spare handset
+or an emulator is fine; it only has to have signed in and not signed out. If nothing is signed in
+as `YODEMO2`, `POST /v1/send` answers `404 recipient_unregistered` and the reviewer sees
+`COULDN'T YO YODEMO2` on their first tap.
+
+**Whatever is seeded is a real account in the production database and must be removed after
+launch**, the same way `GTEST` was (PRD section 7.1).
 
 ## Category and contact
 

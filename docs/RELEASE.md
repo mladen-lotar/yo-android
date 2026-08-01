@@ -49,7 +49,7 @@ open - including the reviewer's, whom this document already tells not to use it.
 | FCM for `hr.theshop.yo` | Done - app + both SHA-1s in `yo-theshop` |
 | Google sign-in for `hr.theshop.yo` | Done - all clients in `yo-theshop` (G16 closed); not yet re-verified on device |
 | OAuth consent screen off `orgInternalOnly` | **Outstanding** - Console only, blocks every non-`the-shop.hr` account |
-| App access - credentials for the reviewer | Account ready (29 Jul 2026) - `YODEMO1`, three friends visible, and `YODEMO2` has a registered device so a reviewer's Yo actually delivers. Instructions in `store/listing.md`; **the password is not in this repository and must not be added** - see §4c. **Four accounts to delete after launch** |
+| App access - credentials for the reviewer | **Outstanding, and must be done immediately before submitting.** The 29 Jul seeding is void: the accounts are being removed, and the logout behaviour it relied on was a defect that is now fixed. Full re-seed procedure in `store/listing.md`; **the password is not in this repository and must not be added** - see §4c |
 | Closed testing, 12 testers x 14 days | **Unknown** - see section 9 |
 
 ## 2. Toolchain
@@ -694,15 +694,25 @@ service with backups can promise.
 | Copy | Retention | State |
 |---|---|---|
 | Host, `/root/backups/yo` | `find ... -mtime +7 -delete`, in the same cron line as the snapshot | **Correct.** Not yet exercised - backups only began 28 Jul, so nothing has aged out |
-| Laptop, `~/backups/yo` | **none** | **Unbounded.** 92 files and growing |
+| Laptop, `~/backups/yo` | `find ... -mtime +30 -delete` | **Fixed 1 Aug 2026.** Was unbounded |
 
-The laptop job is `com.yo.db-backup-pull`, and its command is a bare
-`rsync -a --ignore-existing ...` with no deletion step, so it accumulates every hourly snapshot
-the host has ever taken and drops none. (It runs **daily at 07:30** as documented - the file count
-comes from rsync collecting the host's *hourly* files, not from the job running hourly.) Add a
-prune to that plist - `find "$HOME/backups/yo" -name 'yo-*.db' -mtime +30 -delete` - before
-deploying the new page text. It is deliberately left undone here because it deletes files on a
-machine outside this repository, which is the operator's call and not a code change.
+The laptop job is `com.yo.db-backup-pull`, and its command was a bare
+`rsync -a --ignore-existing ...` with no deletion step, so it accumulated every hourly snapshot the
+host had ever taken and dropped none. (It runs **daily at 07:30** as documented - the file count
+came from rsync collecting the host's *hourly* files, not from the job running hourly.) The prune
+now runs after the pull, separated by `;` rather than `&&` so retention still happens on a day the
+pull fails - an obligation should not be conditional on a network hop.
+
+Two things about applying it, both of which have bitten before:
+
+- **`launchctl kickstart -k` would not have picked it up.** It restarts the job from the *loaded*
+  configuration, so a plist edit is silently ignored. `bootout` then `bootstrap`, and then read
+  `launchctl print gui/$UID/com.yo.db-backup-pull` to confirm what launchd actually holds - the
+  file on disk is not evidence.
+- **Verified as a no-op on the day it landed**: `find ... -mtime +30 -print` matched 0 of 92 files,
+  because the oldest is 28 July. This is preventive, and the first thing it ever deletes will be
+  in late August. A retention rule that silently deletes on the day you add it is one you have not
+  finished reading.
 
 ### 8.9 The edge was breaking the only no-app deletion route
 
@@ -894,5 +904,18 @@ from this that are worth carrying forward:
     directions, because `list_friends` selects on `owner` only, and the friend must have registered a
     device at least once or the reviewer's Yo visibly fails with `recipient_unregistered`.
 
-    Whatever is seeded, note it here when it is created, and remember it is a real account in the
-    production database: it needs deleting after launch, the same way `GTEST` was (PRD §7.1).
+    Whatever is seeded, remember it is a real account in the production database: it needs
+    deleting after launch, the same way `GTEST` was (PRD §7.1). **Note that it was created - do
+    not note its password.** This document and `store/listing.md` are both public (§4c).
+
+    **The seeding instruction that used to be here no longer works, and the reason is a fix.** It
+    said to sign in as the demo friend on any handset and sign out again, because a `devices` row
+    survived logout. That behaviour was a defect: a signed-out phone kept receiving the account's
+    Yos, with the sender's name and any attached location or link, so a handset that was sold or
+    handed on delivered one person's messages to another. `DELETE /v1/session` now clears the row
+    (2026-08-01). The demo friend must therefore stay signed in somewhere - a spare handset or an
+    emulator is enough - or `POST /v1/send` answers `404 recipient_unregistered` and the
+    reviewer's first tap visibly fails.
+
+    `store/listing.md` carries the step-by-step re-seed, including the both-directions friendship
+    and the single delivery check that proves the flow before a reviewer meets it.
