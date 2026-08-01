@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  # First, because it is the cheapest and because the thing it catches is the one that cannot be
+  # undone by a later commit. This repository is PUBLIC and published a live production password
+  # for three days (docs/RELEASE.md section 4c); removing a secret from HEAD does not unpublish
+  # it, so the only useful moment to catch one is before it merges.
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scan tracked files for credentials
+        run: python3 tools/scan-secrets.py
+
   android:
     name: Android unit tests + lint
     runs-on: ubuntu-latest
