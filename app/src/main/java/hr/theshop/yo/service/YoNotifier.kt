@@ -16,6 +16,7 @@ import androidx.core.content.ContextCompat
 import hr.theshop.yo.R
 import hr.theshop.yo.data.location.MapIntentFactory
 import hr.theshop.yo.domain.location.LocationCoordinates
+import hr.theshop.yo.domain.model.HashtagRule
 import java.net.IDN
 import java.util.Locale
 
@@ -27,16 +28,34 @@ object YoNotifier {
 
     private const val MAX_HOST_CHARS = 32
 
+    /**
+     * Shown instead of a sender whose name survives no character of the display rule. It cannot
+     * arise from a real username, and saying "somebody" is better than saying nothing or than
+     * rendering whatever arrived.
+     */
+    private const val UNRENDERABLE_SENDER = "SOMEONE"
+
+    /**
+     * One id for every Yo notification, distinguished by a per-sender TAG.
+     *
+     * The id used to be `sender.hashCode()`, which is not unique and is trivially made to
+     * collide: `String.hashCode` is a 32-bit sum, and among two-character usernames alone -
+     * `[A-Z0-9_]{2,32}` - there are 340 colliding pairs, of which `AO` and `B0` is one. Posting a
+     * notification with an id already in use REPLACES it, so anyone could pick a username
+     * colliding with one of your friends and have their Yo silently overwrite that friend's. For
+     * an app whose entire product is the notification, suppressing a specific person's
+     * notification is the most damaging thing a stranger can do, and it cost them one signup.
+     *
+     * A tag is a string and does not collide. Same sender still replaces their own previous Yo,
+     * which is the behaviour that was actually wanted.
+     */
+    private const val NOTIFICATION_ID = 1
+
     // Deliberately strict, and applied AFTER IDN conversion. IDN.toASCII is not a sanitiser: it
     // passes spaces, newlines and underscores straight through, and will emit them inside an
     // xn-- label, so "·  TAP TO OPEN MAP.evil.com" survives it intact. Anything this rejects
     // degrades to the host-less wording rather than being shown.
     private val SAFE_HOST = Regex("[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
-
-    // A hashtag is sender-authored text placed between the app's own separators. Without this it
-    // could carry "  ·  TAP TO OPEN paypal.com" and forge a second tap promise. \p{L} excludes
-    // format characters, so RTL overrides and zero-width joiners go with the spaces.
-    private val HASHTAG_DISALLOWED = Regex("[^\\p{L}\\p{N}_-]")
 
     fun yoSoundUri(context: Context): Uri =
         Uri.parse("android.resource://${context.packageName}/${R.raw.yo}")
@@ -53,7 +72,7 @@ object YoNotifier {
     /** AMETHYST #9B59B6 — "the main purple" in Yo's own guidelines. Tints the notification accent. */
     const val ACCENT_COLOR = 0xFF9B59B6.toInt()
 
-    fun yoNotificationBody(sender: String): String = "From ${sender.uppercase()}"
+    fun yoNotificationBody(sender: String): String = "From ${displaySender(sender)}"
 
     /**
      * The same reasoning as the location body, for the other two attachments. A hashtag is shown
@@ -102,13 +121,26 @@ object YoNotifier {
     /**
      * The hashtag as it may be SHOWN. The sender chose this text and it lands between the app's
      * own separators, so anything that could impersonate them is removed rather than escaped.
+     *
+     * One statement of the rule, shared with the send path - see [HashtagRule].
      */
-    internal fun displayHashtag(raw: String?): String? =
-        raw?.takeIf(String::isNotBlank)
-            ?.trimStart('#')
-            ?.replace(HASHTAG_DISALLOWED, "")
-            ?.take(32)
-            ?.takeIf(String::isNotEmpty)
+    internal fun displayHashtag(raw: String?): String? = HashtagRule.sanitize(raw)
+
+    /**
+     * The sender as it may be SHOWN, or a neutral stand-in when it cannot be shown at all.
+     *
+     * Every other field in this body is filtered because it is sender-authored, and this one was
+     * not, because it could only ever have come from `validate_username` server-side. That stopped
+     * being true at `/v1/broadcast`, which sends the registered CLIENT ID as the sender - and
+     * nothing validated a client id anywhere, so `From WORLDCUP  ·  TAP TO OPEN evil.com` was a
+     * registration away. The backend now refuses such an id at registration and again at use; this
+     * is the third place it dies, and the only one that does not require trusting the payload.
+     *
+     * `uppercase()` is locale-independent by construction in Kotlin, so a Turkish handset does not
+     * render `ISTANBUL` as `İSTANBUL`.
+     */
+    internal fun displaySender(raw: String): String =
+        HashtagRule.sanitize(raw)?.uppercase(Locale.ROOT) ?: UNRENDERABLE_SENDER
 
     /**
      * The link's host as it may be SHOWN, or null when it cannot be shown safely.
@@ -239,7 +271,7 @@ object YoNotifier {
                 .apply { (mapIntent ?: linkIntent)?.let(::setContentIntent) }
                 .build()
 
-        NotificationManagerCompat.from(context).notify(sender.hashCode(), notification)
+        NotificationManagerCompat.from(context).notify(sender, NOTIFICATION_ID, notification)
     }
 
     private fun linkPendingIntent(
@@ -253,9 +285,11 @@ object YoNotifier {
         }
         return PendingIntent.getActivity(
             context,
-            // Offset from the map intent's request code so a Yo with a link cannot reuse the
-            // PendingIntent of an earlier Yo that carried a location.
-            sender.hashCode() + 1,
+            // Distinguished from the map intent by a suffix rather than by "+ 1". The offset
+            // form aliased ACROSS senders as well as within one: hashCode(A) + 1 == hashCode(B)
+            // holds for 986 pairs of two-character usernames alone, so one sender's link intent
+            // shared a request code with another sender's map intent.
+            requestCode(sender, "link"),
             target,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
@@ -280,11 +314,21 @@ object YoNotifier {
 
         return PendingIntent.getActivity(
             context,
-            sender.hashCode(),
+            requestCode(sender, "map"),
             target,
             // UPDATE_CURRENT because the request code is per sender: without it a second Yo from
             // the same person would reuse the first one's extras and pin their old position.
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
     }
+
+    /**
+     * A request code for one sender's intent of one kind.
+     *
+     * A PendingIntent request code is an `int`, so collisions can never be eliminated - but they
+     * can stop being CONSTRUCTIBLE, which is the part that matters. The separator is a NUL because
+     * it cannot occur in a sender or a kind, so `requestCode("AB", "link")` cannot be spelled as
+     * some other sender's `requestCode(_, "map")` by choosing a name.
+     */
+    private fun requestCode(sender: String, kind: String): Int = "$sender\u0000$kind".hashCode()
 }

@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -59,6 +60,7 @@ private val ROW_HEIGHT = 89.dp
 fun AuthScreen(viewModel: AuthViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
     var username by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
 
@@ -102,7 +104,20 @@ fun AuthScreen(viewModel: AuthViewModel = hiltViewModel()) {
                     capitalize = false,
                     isPassword = true,
                     imeAction = ImeAction.Done,
-                    onSubmit = submitSignUp,
+                    // Done dismisses the keyboard and submits NOTHING, deliberately.
+                    //
+                    // This screen offers two actions and the keyboard cannot know which one is
+                    // meant. It used to call submitSignUp, so a returning user pressing the
+                    // keyboard's own submit key was answered "THAT NAME IS TAKEN" for entirely
+                    // correct credentials - a wrong error for the ordinary case, from the most
+                    // natural gesture on the screen - and every attempt spent one of the ten
+                    // credential requests per fifteen minutes that signup, login, Google
+                    // sign-in and broadcast all share.
+                    //
+                    // Guessing LOG IN instead would only move which half of the users it is
+                    // wrong for. Dismissing the keyboard uncovers both bands and lets the person
+                    // say which they meant, which is the one behaviour that is never wrong.
+                    onSubmit = { focusManager.clearFocus() },
                     modifier = Modifier.padding(top = 8.dp),
                 )
             }

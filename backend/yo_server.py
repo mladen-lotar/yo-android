@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from traceback import format_exc
 from typing import Any, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
@@ -38,12 +39,50 @@ MAX_HASHTAG_BYTES = 140
 # #世界 both pass while spaces, control characters and the separator itself do not.
 HASHTAG_PATTERN = re.compile(r"\A[\w-]+\Z")
 
+# A broadcast client id is delivered to every subscriber as the SENDER, landing in exactly the
+# position a username lands in - the app renders "From <SENDER>" with no charset filter of its
+# own, because until now that field could only ever have come from validate_username. Nothing
+# validated a client id anywhere: register_client.py stored whatever --client-id was given. So a
+# client registered as "WORLDCUP  ·  TAP TO OPEN evil.com" forges a second tap promise in every
+# subscriber's shade - G30's hashtag forgery, in the one route that never got the rule. It is
+# admin-only and production holds zero clients, so this closes it before it can ever be true
+# rather than after.
+#
+# Case is NOT constrained and the id is NOT uppercased on the way in, deliberately. The historical
+# clients this route exists for are named `fedex` and `worldcup` (PRD FR7), the app renders the
+# sender through `uppercase()` anyway, and normalising at registration while the caller keeps
+# sending what they typed would simply break the lookup. What matters is the character SET: no
+# whitespace, no `·`, no dot, no control character - nothing that can imitate the app's own
+# separators or its "TAP TO OPEN" wording. `-` is allowed because it cannot.
+CLIENT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{2,32}\Z")
+
 # Signup and login are necessarily public - an invitee has no credentials by definition - so
 # they are the abuse surface that replaces the old shared key. Sends are limited per account.
 CREDENTIAL_ATTEMPTS = 10
 CREDENTIAL_WINDOW_SECONDS = 900
 SEND_ATTEMPTS = 60
 SEND_WINDOW_SECONDS = 60
+
+# Adding a friend and blocking both answer `no_such_user` for a name nobody holds, which makes
+# either one an account-existence probe. That disclosure is deliberate and cannot be removed -
+# you have to be able to add somebody by typing their name (FR9). The RATE was not deliberate:
+# nothing limited these routes at all, so a single signup bought an unmetered sweep of the whole
+# username space at line rate, which is the reconnaissance half of G30's "push a link into any
+# username you can guess". Registering a device sits in the same bucket because it is the other
+# authenticated write with no limit. A person adds a handful of friends in a lifetime of using
+# this app and registers once per launch, so this is nowhere near a real user.
+LOOKUP_ATTEMPTS = 30
+LOOKUP_WINDOW_SECONDS = 60
+
+# An FCM registration token is ~150-200 characters. Nothing bounded it, so any authenticated
+# caller could store up to MAX_BODY_BYTES of arbitrary text per write, repeatedly and unmetered,
+# into a non-WAL SQLite file that journal_mode=delete rewrites on every transaction - on a disk
+# shared with every other container on the host. This is the shape G24 removed /v1/photo for,
+# left standing one route away.
+MAX_FCM_TOKEN_BYTES = 4096
+
+# The authenticated writes that are metered per account. /v1/send has its own, tighter budget.
+LOOKUP_LIMITED_PATHS = ("/v1/friends", "/v1/block", "/v1/register")
 
 # How many allowed requests between sweeps of the rate limiter's idle keys.
 _SWEEP_EVERY = 256
@@ -126,6 +165,53 @@ class RateLimiter:
             del self._hits[key]
 
 
+class DeliveryCostEstimator:
+    """A running estimate of what delivering a Yo costs, so refusing to can cost the same.
+
+    A block answers `200 {"delivered":true}` and sends nothing, which is deliberate: telling a
+    sender they were blocked turns the block into a notification for the person who was blocked.
+    The body was identical. The timing was not, and it is not close - a blocked send is two SQLite
+    probes while a delivered one is an HTTPS round trip to Google. Measured on this codebase:
+    blocked p50 0.79 ms, delivered p50 116.69 ms, ranges disjoint by 110 ms. Against production's
+    own jitter (yo.the-shop.io /healthz p50 42 ms, IQR 4 ms) a min-of-three classifier separates
+    them essentially perfectly, and the sender is allowed 60 sends a minute.
+
+    So the one control whose threat model explicitly names the sender as the adversary announced
+    itself to that adversary. This is the same defect the login path had, in the same week -
+    identical bodies mistaken for indistinguishability - and yo_auth already states the rule:
+    the equal-cost path is the security property, not a detail.
+
+    Self-calibrating rather than a hardcoded constant, because the right delay is a property of
+    where the server is sitting. A laptop behind a home connection pays ~117 ms to reach FCM; the
+    Hetzner host, far closer to Google, pays perhaps 60-75 ms. A constant tuned on one is wrong on
+    the other, and wrong in the direction of leaking again.
+    """
+
+    # Weight on each new observation. Low enough that one slow outlier does not move the estimate
+    # much, high enough to follow a real change in where FCM is being reached from.
+    _SMOOTHING = 0.2
+
+    def __init__(self, initial_seconds: float = 0.12):
+        self._seconds = initial_seconds
+        self._lock = threading.Lock()
+
+    def observe(self, seconds: float) -> None:
+        with self._lock:
+            self._seconds = (self._seconds * (1 - self._SMOOTHING)) + (
+                seconds * self._SMOOTHING
+            )
+
+    def estimate(self) -> float:
+        with self._lock:
+            return self._seconds
+
+    def sleep_to_match(self, started: float) -> None:
+        """Spend whatever is left of a delivery's typical cost."""
+        remaining = self.estimate() - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+
 def _configured_apk_path() -> Optional[Path]:
     """The APK to hand out at /install/yo.apk, or None if none is configured."""
     configured = os.environ.get("YO_APK_PATH", "").strip()
@@ -137,6 +223,16 @@ def _configured_apk_path() -> Optional[Path]:
 
 # Styled from Yo's own values: Amethyst #9B59B6, Montserrat Bold, white centred type, the mixed-case
 # "Yo" wordmark and the tagline "It's that simple." See docs/PRD.md section 4.1.
+#
+# NO WEBFONT LINK, deliberately. This page used to pull Montserrat from fonts.googleapis.com, which
+# made every visitor's browser announce its IP address to Google before it had agreed to anything -
+# and this is the page every INVITE lands on, so its visitors are by definition people who do not
+# have the app and have accepted no policy. The served privacy policy says Google receives data in
+# exactly two narrow roles, push and sign-in verification, and "Nothing is shared with anyone else":
+# a third-party font request is a third role the document denies. The publisher is Croatian, so
+# that is GDPR-relevant and not merely untidy (LG Munchen I, 3 O 17493/20). Montserrat still renders
+# for anyone who has it installed; everyone else gets the declared fallback and an identical layout.
+# If the face is ever wanted for certain, self-host the woff2 - do not re-add a third-party link.
 INSTALL_PAGE_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -144,7 +240,6 @@ INSTALL_PAGE_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#9b59b6">
 <title>Yo - It's that simple.</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Montserrat:700,400">
 <style>
   html, body { height: 100%; margin: 0; }
   body {
@@ -268,7 +363,13 @@ the sign-in token if you choose "continue with Google". Nothing is shared with a
 nothing is sold.</p>
 
 <h2>How long we keep it</h2>
-<p>Until you delete your account. Then it is gone, in full and immediately.</p>
+<p>Until you delete your account. Deleting it removes everything above from the live service
+straight away.</p>
+<p>Backups are the one exception, and we would rather say so than leave you to assume otherwise:
+the database is backed up regularly so that a disk failure does not lose everyone's accounts, and
+a backup taken before you left still contains what you had at that moment. Those copies expire on
+their own within 30 days and are never used to bring an account back. Nothing is restored from
+them except to recover the service after a failure.</p>
 
 <h2>Deleting your account</h2>
 <p>In the app: menu, then DELETE ACCOUNT. This erases your account, your friends, your blocks,
@@ -310,7 +411,9 @@ normally far sooner.</p>
   <li>Your notification token, so no further Yo can reach you.</li>
   <li>Your Yo history and groups held on your own phone.</li>
 </ul>
-<p>Nothing is retained after deletion, and none of it can be undone.</p>
+<p>None of it can be undone, and nothing is kept in the live service afterwards. Backups taken
+before you left still hold what you had at that moment; they expire on their own within 30 days
+and are never used to restore an account.</p>
 """
 
 
@@ -342,12 +445,69 @@ class YoHTTPServer(ThreadingHTTPServer):
             CREDENTIAL_WINDOW_SECONDS,
         )
         self.send_limiter = RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS)
+        self.lookup_limiter = RateLimiter(LOOKUP_ATTEMPTS, LOOKUP_WINDOW_SECONDS)
+        self.delivery_cost = DeliveryCostEstimator()
 
 
 class YoRequestHandler(BaseHTTPRequestHandler):
     server: YoHTTPServer
 
+    # Set the moment a status line goes out, so _guarded never writes a second one over a
+    # reply that was already on its way.
+    _response_started = False
+
+    # BaseHTTPRequestHandler defaults this to None, meaning a socket that never times out, and
+    # ThreadingHTTPServer caps its thread count at nothing. A client that opens a connection and
+    # then dribbles - or sends `Content-Length: 2000000` and stops - therefore holds a thread
+    # forever, and enough of them exhaust a 256 MB container without sending a single valid
+    # request.
+    #
+    # Production is not currently exposed to that: Traefik terminates the client connection and
+    # talks to this process over a pooled one, so a slow client never reaches here. That is the
+    # same shape as G33 - a real safety property living entirely in the proxy while the
+    # application assumed it held on its own - and G33's lesson was that the proxy side of it is
+    # one label in a shared file. This makes the property true here too.
+    timeout = 30
+
     def do_GET(self) -> None:
+        self._guarded(self._route_get)
+
+    def do_POST(self) -> None:
+        self._guarded(self._route_post)
+
+    def do_DELETE(self) -> None:
+        self._guarded(self._route_delete)
+
+    def _guarded(self, route: Any) -> None:
+        """Run a route, answering 500 rather than dropping the connection.
+
+        Without this, any exception a route did not anticipate escapes into socketserver, which
+        logs a traceback and closes the socket with **no response at all** - so the caller sees a
+        connection reset and cannot tell a server fault from a network one. Two such escapes were
+        found and fixed on 2026-08-01 (an oversized JSON integer, and math.isfinite on a large
+        int), but the ones worth guarding against are the ones nobody has listed yet: the store is
+        a non-WAL SQLite file behind a threaded server, so `sqlite3.OperationalError: database is
+        locked` is reachable in production under ordinary concurrency and is not a bug in any
+        route.
+
+        The reason is logged and never sent. It is derived from a caller-controlled request and
+        tells an honest client nothing they can act on, which is the same rule /v1/google already
+        applies to Google's rejection messages.
+
+        Nothing is written if the route already began a response: a second status line on the same
+        connection would corrupt a reply that may well have been correct.
+        """
+        try:
+            route()
+        except Exception:  # noqa: BLE001 - the whole point is that it is unenumerated
+            self.log_error("unhandled error serving %s: %s", self.command, format_exc().strip())
+            if not self._response_started:
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "internal_error"},
+                )
+
+    def _route_get(self) -> None:
         parsed = urlsplit(self.path)
         if parsed.path == "/healthz":
             self._write_json(HTTPStatus.OK, {"ok": True})
@@ -383,14 +543,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def do_DELETE(self) -> None:
+    def _route_delete(self) -> None:
         parsed = urlsplit(self.path)
         username = self._authenticate()
         if username is None:
             return
         try:
             if parsed.path == "/v1/session":
-                self._handle_logout()
+                self._handle_logout(username)
                 return
             if parsed.path == "/v1/friends":
                 self._handle_remove_friend(username, parsed.query)
@@ -408,7 +568,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 {"error": "bad_request", "reason": str(error)},
             )
 
-    def do_POST(self) -> None:
+    def _route_post(self) -> None:
         parsed = urlsplit(self.path)
         # Signup and login mint credentials, so they cannot themselves require one.
         if parsed.path in ("/v1/signup", "/v1/login"):
@@ -438,6 +598,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             if client_id is not None:
                 self._handle_broadcast(client_id, body)
+                return
+            # Keyed on the authenticated account, not the IP: the caller has already proved who
+            # they are, and one abusive account must not spend a shared bucket that would lock
+            # out everybody else behind the same carrier NAT.
+            if parsed.path in LOOKUP_LIMITED_PATHS and not self.server.lookup_limiter.allow(
+                username or ""
+            ):
+                self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
                 return
             if parsed.path == "/v1/friends":
                 self._handle_add_friend(username, body)
@@ -599,9 +767,15 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.CREATED
         else:
             stored = self.server.database.get_password_hash(username)
-            if not yo_auth.verify_password(password, stored):
+            if not yo_auth.verify_password(
+                password,
+                stored,
+                equal_cost_iterations=self.server.password_iterations,
+            ):
                 # Deliberately identical for an unknown user and a wrong password, so the
-                # response cannot be used to enumerate which usernames exist.
+                # response cannot be used to enumerate which usernames exist. The BODY was
+                # always identical; what made that sentence true is verify_password spending
+                # the same CPU on both, which it did not until 2026-08-01 - see its docstring.
                 self._write_json(
                     HTTPStatus.UNAUTHORIZED,
                     {"error": "invalid_credentials"},
@@ -698,12 +872,35 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         self._issue_token(HTTPStatus.CREATED, username)
 
     def _issue_token(self, status: HTTPStatus, username: str) -> None:
+        """Hand out a session, unless the account stopped existing while we were working.
+
+        Both callers - password sign-in and Google sign-in - read the account, then spend real
+        time (a ~300 ms PBKDF2, or a Google token verification), and only then arrive here. A
+        DELETE /v1/account inside that window completes first and reaps the tokens that exist at
+        that moment; this one is written afterwards. store_token now refuses to write a token for
+        an absent account, so the loser of that race is told its credentials are no longer good
+        rather than being handed a session on a deleted account.
+        """
         token = yo_auth.new_token()
-        self.server.database.store_token(yo_auth.hash_token(token), username)
+        if not self.server.database.store_token(yo_auth.hash_token(token), username):
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_credentials"})
+            return
         self._write_json(status, {"token": token, "username": username})
 
-    def _handle_logout(self) -> None:
+    def _handle_logout(self, username: str) -> None:
+        """End the session AND stop delivering to the handset that had it.
+
+        Revoking the token alone left the `devices` row in place, so a signed-out phone kept
+        receiving the account's Yos - sender name, location, link and all. See delete_device.
+
+        Note for whoever next seeds the Play reviewer accounts: this deliberately changes a
+        behaviour RELEASE.md used to rely on. `YODEMO2`'s device row was created by signing in on
+        a handset and signing out again, on the observation that registrations survived logout.
+        They no longer do. Leave the demo friend signed in, or re-register it, or the reviewer's
+        first Yo answers `recipient_unregistered` and visibly fails.
+        """
         self.server.database.delete_token(yo_auth.hash_token(self._bearer_token()))
+        self.server.database.delete_device(username)
         self._write_json(HTTPStatus.OK, {"ended": True})
 
     def _handle_delete_account(self, username: str) -> None:
@@ -730,6 +927,11 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         stored_hash = self.server.database.get_api_key_hash(client_id)
         if (
             client_id
+            # Re-checked at USE, not only at registration. A row written by hand, by an older
+            # build of register_client.py, or by a restored backup would otherwise still reach
+            # every subscriber's notification body. Validating only where ids are created leaves
+            # the rejection reachable from anywhere that is not that one script.
+            and CLIENT_ID_PATTERN.fullmatch(client_id)
             and supplied_key
             and stored_hash is not None
             and hmac.compare_digest(
@@ -747,6 +949,10 @@ class YoRequestHandler(BaseHTTPRequestHandler):
     def _handle_register(self, username: str, body: Dict[str, Any]) -> None:
         """The username comes from the token, never the body - you may only claim your own."""
         fcm_token = self._required_string(body, "fcm_token")
+        if len(fcm_token.encode("utf-8")) > MAX_FCM_TOKEN_BYTES:
+            raise BadRequestError(
+                f"fcm_token must be at most {MAX_FCM_TOKEN_BYTES} bytes"
+            )
         self.server.database.upsert_device(username, fcm_token)
         self._write_json(
             HTTPStatus.OK,
@@ -820,7 +1026,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             # bool is a subclass of int, so True would otherwise pass as the coordinate 1.
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise BadRequestError(f"{name} must be a number")
-            if not math.isfinite(value):
+            # isfinite is asked ONLY of floats. Python integers are arbitrary precision, and
+            # math.isfinite raises OverflowError - not a 400 - for any int too large to become a
+            # float, so `{"latitude": 999...}` with 400 digits crashed the handler and dropped the
+            # connection with no response at all. The float case was clearly considered: 1e400
+            # correctly answers 400. The int case was not, because in every other language the two
+            # share a ceiling. An oversized int needs no finiteness check anyway; it is out of
+            # range, and the bounds below refuse it on its own terms.
+            if isinstance(value, float) and not math.isfinite(value):
                 raise BadRequestError(f"{name} must be a finite number")
         if not -90 <= latitude <= 90:
             raise BadRequestError("latitude must be between -90 and 90")
@@ -859,6 +1072,10 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         return value
 
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
+        # Taken before any work, so the blocked path can be made to cost what the delivering path
+        # costs INCLUDING everything they share. Timing from a later point would leave the
+        # difference in the validation and the lookups.
+        started = time.monotonic()
         recipient = self._target_username(body, key="recipient")
         latitude, longitude = self._optional_coordinates(body)
         link = self._optional_attachment(body, "link", MAX_LINK_BYTES)
@@ -872,6 +1089,12 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if self.server.database.is_blocked(recipient, sender):
             # Indistinguishable from a delivered Yo on purpose: telling the sender they were
             # blocked turns the block into a notification for the person who was blocked.
+            #
+            # "Indistinguishable" has to include the clock. The body was always identical and the
+            # timing never was - two SQLite probes against an HTTPS round trip to Google, which
+            # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
+            # DeliveryCostEstimator; this spends what a delivery would have spent.
+            self.server.delivery_cost.sleep_to_match(started)
             self._write_json(HTTPStatus.OK, {"delivered": True})
             return
         fcm_token = self.server.database.get_fcm_token(recipient)
@@ -926,6 +1149,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        # What a real delivery cost, which is what a block must be made to cost. Recorded only on
+        # this path: the failure paths answer a different status and are not what is being matched.
+        self.server.delivery_cost.observe(time.monotonic() - started)
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
 
     def _handle_broadcast(
@@ -986,7 +1212,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(content_length)
         try:
             body = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except ValueError as error:
+            # ValueError, not (UnicodeDecodeError, JSONDecodeError). Both of those ARE
+            # ValueErrors, and naming them individually looked exhaustive while missing a third:
+            # a JSON integer of more than 4300 digits raises a plain ValueError from CPython's
+            # integer-string conversion limit, which escaped this handler entirely and dropped the
+            # connection without a response. Enumerating the subclasses you thought of is how a
+            # catch-list goes stale; catching the base covers the one you did not.
             raise BadRequestError("request body must be valid JSON") from error
         if not isinstance(body, dict):
             raise BadRequestError("request body must be a JSON object")
@@ -1018,17 +1250,47 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         except yo_auth.CredentialError as error:
             raise BadRequestError(str(error)) from error
 
+    def _write_html(self, page: str) -> None:
+        """Serve a self-contained HTML page with the headers these pages need.
+
+        `/privacy` and `/delete-account` are the two pages Google Play re-checks after launch,
+        and `/delete-account` is the only route to erasure for somebody who cannot open the app.
+        Framing that page is therefore worth denying outright: it is a destructive action reached
+        by people who by definition have no other way through.
+
+        The pages are entirely self-contained - one inline <style>, no script, no image, no
+        third-party request of any kind - so `default-src 'none'` is not aspirational here, it is
+        a description. Anything that later needs an external asset should be self-hosted rather
+        than have this relaxed; a webfont link on the install page is exactly the mistake this
+        policy would have caught.
+
+        No `preload` on HSTS, deliberately: preload is a browser-list submission that is slow and
+        awkward to undo, and the value here is the ordinary one. Traefik already issues a
+        permanent redirect to https, so this only closes the very first request.
+        """
+        encoded = page.encode("utf-8")
+        self._response_started = True
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _handle_document_page(self, title: str, body_html: str) -> None:
         page = DOCUMENT_PAGE_TEMPLATE.replace("{{TITLE}}", title).replace(
             "{{BODY}}",
             body_html,
         )
-        encoded = page.encode("utf-8")
-        self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        self._write_html(page)
 
     def _handle_install_page(self) -> None:
         apk = _configured_apk_path()
@@ -1040,12 +1302,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
         else:
             action = '<p class="small">The download is not published yet.</p>'
-        body = INSTALL_PAGE_TEMPLATE.replace("{{ACTION}}", action).encode("utf-8")
-        self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_html(INSTALL_PAGE_TEMPLATE.replace("{{ACTION}}", action))
 
     def _handle_install_apk(self) -> None:
         apk = _configured_apk_path()
@@ -1053,6 +1310,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         data = apk.read_bytes()
+        self._response_started = True
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", "application/vnd.android.package-archive")
         self.send_header("Content-Length", str(len(data)))
@@ -1062,6 +1320,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
 
     def _write_json(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self._response_started = True
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

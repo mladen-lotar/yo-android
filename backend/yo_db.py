@@ -245,21 +245,57 @@ class YoDatabase:
         token_hash: str,
         username: str,
         created_at: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
+        """Issue a token, but only to an account that still exists. False if it does not.
+
+        The existence check is INSIDE the insert, and that is the entire point. Sign-in reads the
+        password hash, spends ~300 ms deriving PBKDF2, and only then writes the token - so a
+        DELETE /v1/account arriving in that window ran its own `DELETE FROM tokens` before this
+        row existed, and the row landed afterwards, naming an account that was gone. Measured:
+        with the delete fired 0, 5, 15 and 30 ms after the login, a live token survived 10 times
+        out of 10.
+
+        Two things made that worse than an orphan row. Nothing prunes it, since tokens have no
+        expiry, and `username_for_token` resolves purely on the tokens table - it never asks
+        whether the account is still there - so the holder kept a working session on a deleted
+        account. And a deleted username is immediately free to claim again, so the stale token
+        becomes a live session belonging to whoever registers that name next.
+
+        It needs no attacker: deleting an account on one phone while another is signing in is
+        enough. SQLite serialises write transactions, so after this change the two possible
+        orders both end correctly - the insert finds no account and does nothing, or it lands
+        first and the delete reaps it.
+        """
         timestamp = int(time.time()) if created_at is None else created_at
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT OR REPLACE INTO tokens(token_hash, username, created_at)
-                VALUES (?, ?, ?)
+                SELECT ?, ?, ?
+                WHERE EXISTS (SELECT 1 FROM accounts WHERE username = ?)
                 """,
-                (token_hash, username, timestamp),
+                (token_hash, username, timestamp, username),
             )
+        return cursor.rowcount == 1
 
     def username_for_token(self, token_hash: str) -> Optional[str]:
+        """Resolve a bearer token, but only to an account that still exists.
+
+        The JOIN is belt to store_token's braces, and it is what makes the property hold for rows
+        that are already in the database rather than only for rows written from now on. A token
+        row has no referential tie to `accounts` - there is no foreign key and nothing prunes it -
+        so any token that outlived its account, however it got there, authenticated happily. That
+        matters because a deleted username is immediately free to claim again: the stale session
+        does not merely linger, it silently transfers to whoever registers that name next.
+        """
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT username FROM tokens WHERE token_hash = ?",
+                """
+                SELECT tokens.username
+                FROM tokens
+                JOIN accounts ON accounts.username = tokens.username
+                WHERE tokens.token_hash = ?
+                """,
                 (token_hash,),
             ).fetchone()
         return None if row is None else row[0]
@@ -347,6 +383,27 @@ class YoDatabase:
                 (owner,),
             ).fetchall()
         return [row[0] for row in rows]
+
+    def delete_device(self, username: str) -> None:
+        """Forget where this account's Yos are delivered.
+
+        Called on logout, because signing out has to mean the handset stops receiving the
+        account's pushes. It did not: `DELETE /v1/session` revoked the presented token and left
+        the `devices` row untouched, so every Yo sent to that account kept arriving on the phone
+        of whoever had signed out - with the sender's name, and any attached location, link or
+        hashtag. On a phone that was sold, handed on, or shared, that is one person's messages
+        being delivered to another, and there was no API that stopped it short of deleting the
+        account outright: /v1/register refuses a blank token, so the signed-out user could not
+        even overwrite their own row with junk.
+
+        `subscriptions` joins `devices` on username too, so a stale row also kept any broadcast
+        the departed account was subscribed to ringing on the new holder's handset.
+        """
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM devices WHERE username = ?",
+                (username,),
+            )
 
     def get_fcm_token(self, username: str) -> Optional[str]:
         with self._connect() as connection:

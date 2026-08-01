@@ -19,6 +19,8 @@ from yo_server import (
     CREDENTIAL_WINDOW_SECONDS,
     MAX_HASHTAG_BYTES,
     MAX_LINK_BYTES,
+    LOOKUP_ATTEMPTS,
+    LOOKUP_WINDOW_SECONDS,
     SEND_ATTEMPTS,
     SEND_WINDOW_SECONDS,
     RateLimiter,
@@ -106,6 +108,10 @@ class YoServerTestCase(unittest.TestCase):
                 CREDENTIAL_WINDOW_SECONDS,
             ),
             send_limiter=RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS),
+            lookup_limiter=RateLimiter(LOOKUP_ATTEMPTS, LOOKUP_WINDOW_SECONDS),
+            # Zero, so the equal-cost sleep on the blocked path does not add a tenth
+            # of a second to every block test. The PROPERTY is asserted separately.
+            delivery_cost=yo_server.DeliveryCostEstimator(initial_seconds=0.0),
             # Unconfigured by default, matching a deployment with no YO_GOOGLE_CLIENT_ID.
             # GoogleSignInTest installs a stub.
             google_verifier=None,
@@ -144,10 +150,17 @@ class YoServerTestCase(unittest.TestCase):
         body=None,
         token=None,
         extra_headers=None,
+        raw_body=None,
     ):
         data = b""
         headers = Message()
-        if body is not None:
+        # raw_body sends bytes the JSON encoder could not have produced, which is the only way to
+        # exercise what the server does with a body it cannot parse.
+        if raw_body is not None:
+            data = raw_body
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(len(data))
+        elif body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(data))
@@ -2206,6 +2219,490 @@ class AccessLogRedactionTest(unittest.TestCase):
 
         self.assertIn("POST /v1/send HTTP/1.1", line)
         self.assertNotIn("redacted", line)
+
+
+class ServedPageHeaderTest(StaticPageTestCase):
+    """Headers on the three public HTML routes.
+
+    Two of them are what Google Play re-checks after launch, and `/delete-account` is the only
+    route to erasure for somebody who cannot open the app - so it is reached, by definition, by
+    people with no other way through. Framing that is worth denying outright.
+    """
+
+    PAGES = ("/install", "/privacy", "/delete-account")
+
+    def test_every_served_page_carries_the_headers(self):
+        expected = (
+            ("Content-Security-Policy", "frame-ancestors 'none'"),
+            ("X-Frame-Options", "DENY"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            ("Strict-Transport-Security", "max-age="),
+        )
+        for path in self.PAGES:
+            _, head, _ = self.raw_request("GET", path)
+            for header, value in expected:
+                with self.subTest(path=path, header=header):
+                    self.assertIn(header, head)
+                    self.assertIn(value, head)
+
+    def test_hsts_is_not_preloaded(self):
+        """`preload` is a browser-list submission that is slow and awkward to undo. Nothing here
+        needs it, and adding it by reflex is how a domain acquires a commitment nobody chose."""
+        for path in self.PAGES:
+            _, head, _ = self.raw_request("GET", path)
+            with self.subTest(path=path):
+                self.assertNotIn("preload", head)
+
+    def test_no_served_page_requests_anything_from_a_third_party(self):
+        """The property, not the instance.
+
+        `/install` pulled Montserrat from fonts.googleapis.com, so every invitee's browser
+        announced its IP to Google before agreeing to anything - on the one page whose visitors
+        by definition have not accepted a policy - while the privacy policy served beside it
+        promises Google receives data in exactly two roles and that nothing is shared with anyone
+        else. Asserting "no absolute URL to any host" rather than "not that one URL" is what makes
+        this catch the next CDN, analytics snippet or webfont somebody reaches for.
+        """
+        for path in self.PAGES:
+            _, _, body = self.raw_request("GET", path)
+            text = body.decode("utf-8")
+            for marker in ("http://", "https://", "//fonts.", "url("):
+                with self.subTest(path=path, marker=marker):
+                    self.assertNotIn(marker, text)
+
+    def test_the_deletion_address_is_still_reachable_without_javascript(self):
+        """It is the only deletion route for someone who cannot open the app, and Cloudflare's
+        Scrape Shield rewrites a bare mailto into a JS-only link. The fences must stay."""
+        _, _, body = self.raw_request("GET", "/delete-account")
+        text = body.decode("utf-8")
+
+        self.assertIn("mailto:", text)
+        self.assertIn("<!--email_off-->", text)
+
+
+class RegisterTokenBoundTest(YoServerTestCase):
+    """An FCM token is ~150-200 characters and nothing bounded it."""
+
+    def _token_for(self, username="ALICE"):
+        status, body = self.request(
+            "POST",
+            "/v1/signup",
+            {"username": username, "password": "correct-horse-1"},
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_an_ordinary_token_is_accepted(self):
+        session = self._token_for()
+        status, _ = self.request(
+            "POST", "/v1/register", {"fcm_token": "f" * 200}, token=session
+        )
+
+        self.assertEqual(200, status)
+
+    def test_an_oversized_token_is_refused_and_nothing_is_stored(self):
+        session = self._token_for()
+        status, _ = self.request(
+            "POST",
+            "/v1/register",
+            {"fcm_token": "f" * (yo_server.MAX_FCM_TOKEN_BYTES + 1)},
+            token=session,
+        )
+
+        self.assertEqual(400, status)
+        self.assertIsNone(self.server.database.get_fcm_token("ALICE"))
+
+    def test_the_bound_is_bytes_not_characters(self):
+        """Same reasoning as the link and hashtag caps: a multibyte string passes a len() check
+        and is then several times larger on the wire and in the database."""
+        session = self._token_for()
+        multibyte = "é" * yo_server.MAX_FCM_TOKEN_BYTES  # 2 bytes each
+        status, _ = self.request(
+            "POST", "/v1/register", {"fcm_token": multibyte}, token=session
+        )
+
+        self.assertEqual(400, status)
+
+
+class LookupRateLimitTest(YoServerTestCase):
+    """Adding a friend and blocking answer `no_such_user`, which makes them existence probes.
+
+    The disclosure is deliberate and stays (FR9). The unmetered RATE was not: one signup bought a
+    sweep of the whole username space at line rate.
+    """
+
+    def _session(self, username):
+        status, body = self.request(
+            "POST",
+            "/v1/signup",
+            {"username": username, "password": "correct-horse-1"},
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_probing_for_accounts_is_eventually_refused(self):
+        session = self._session("ALICE")
+        statuses = [
+            self.request(
+                "POST", "/v1/friends", {"username": f"GHOST{index:03d}"}, token=session
+            )[0]
+            for index in range(LOOKUP_ATTEMPTS + 5)
+        ]
+
+        self.assertEqual(404, statuses[0], "a probe must still work at all")
+        self.assertIn(429, statuses)
+        self.assertEqual(429, statuses[-1])
+
+    def test_the_limit_is_per_account_not_shared(self):
+        """Keyed on the authenticated caller on purpose. An IP bucket would let one abuser behind
+        a carrier NAT lock out every other user sharing that address."""
+        alice = self._session("ALICE")
+        bob = self._session("BOB")
+        for index in range(LOOKUP_ATTEMPTS + 2):
+            self.request(
+                "POST", "/v1/friends", {"username": f"GHOST{index:03d}"}, token=alice
+            )
+
+        status, _ = self.request(
+            "POST", "/v1/friends", {"username": "GHOSTX"}, token=bob
+        )
+
+        self.assertEqual(404, status, "Bob must be unaffected by Alice's probing")
+
+    def test_every_authenticated_write_without_its_own_budget_is_covered(self):
+        """A path list is only as good as the thing that notices when a route is added to one
+        list and not the other."""
+        self.assertEqual(
+            {"/v1/friends", "/v1/block", "/v1/register"},
+            set(yo_server.LOOKUP_LIMITED_PATHS),
+        )
+
+
+class TokenOutlivingItsAccountTest(YoServerTestCase):
+    """A token must never name an account that is not there.
+
+    Sign-in reads the account, spends ~300 ms on PBKDF2, and only then writes the token. A
+    DELETE /v1/account inside that window completed first and reaped the tokens that existed at
+    that moment; the new one landed afterwards. Measured before the fix: with the delete fired 0,
+    5, 15 or 30 ms after the login, a live token survived 40 times out of 40.
+
+    The consequence is not a stray row. Nothing prunes tokens, and a deleted username is free to
+    claim again, so the stale session silently becomes a session on whoever registers that name
+    next.
+    """
+
+    def _account(self, username="ALICE"):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_a_token_cannot_be_issued_for_an_account_that_is_gone(self):
+        """The race, without the race: the state the loser of it would have written."""
+        self.assertFalse(
+            self.server.database.store_token("some-token-hash", "NOBODY"),
+            "storing a token for an account that does not exist must not succeed",
+        )
+        self.assertIsNone(self.server.database.username_for_token("some-token-hash"))
+
+    def test_a_token_written_before_a_delete_stops_authenticating_after_it(self):
+        """Belt to the other's braces: the JOIN makes this true for rows already in the table,
+        however they got there, not only for rows written from now on."""
+        token = self._account()
+        self.assertEqual(200, self.request("GET", "/v1/friends", token=token)[0])
+
+        self.server.database.delete_account("ALICE")
+
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=token)[0])
+
+    def test_a_stale_token_does_not_transfer_to_whoever_claims_the_name_next(self):
+        """The whole reason this is not merely an orphan row."""
+        attacker = self._account("GHOST")
+        # Simulate the losing login: a token row for an account that is about to vanish.
+        self.server.database.delete_account("GHOST")
+        self.server.database.store_token(yo_auth.hash_token("stale-token"), "GHOST")
+
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "GHOST", "password": "different-pass-9"}
+        )
+        self.assertEqual(201, status, "the freed username is claimable, by design")
+
+        self.assertEqual(
+            401,
+            self.request("GET", "/v1/friends", token="stale-token")[0],
+            "the old token must not authenticate as the new owner",
+        )
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=attacker)[0])
+
+    def test_an_ordinary_sign_in_is_unaffected(self):
+        token = self._account()
+        status, body = self.request("GET", "/v1/friends", token=token)
+
+        self.assertEqual(200, status)
+        self.assertEqual([], body["friends"])
+
+
+class LogoutForgetsTheDeviceTest(YoServerTestCase):
+    """Signing out has to mean the handset stops receiving the account's Yos."""
+
+    def _account(self, username):
+        _, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        return body["token"]
+
+    def test_logging_out_removes_the_registration(self):
+        token = self._account("CAROL")
+        self.request("POST", "/v1/register", {"fcm_token": "CAROL-PHONE"}, token=token)
+        self.assertEqual("CAROL-PHONE", self.server.database.get_fcm_token("CAROL"))
+
+        self.assertEqual(200, self.request("DELETE", "/v1/session", token=token)[0])
+
+        self.assertIsNone(
+            self.server.database.get_fcm_token("CAROL"),
+            "a signed-out phone must stop receiving the account's Yos",
+        )
+
+    def test_a_yo_to_a_signed_out_account_is_not_delivered_to_the_old_handset(self):
+        """The observable consequence, which is the part that matters: the sender's name, and any
+        location, link or hashtag they attached, were arriving on a phone its owner had signed
+        out of - and on a phone that was sold or handed on, that is one person's messages being
+        delivered to another."""
+        carol = self._account("CAROL")
+        self.request("POST", "/v1/register", {"fcm_token": "CAROL-PHONE"}, token=carol)
+        self.request("DELETE", "/v1/session", token=carol)
+        bob = self._account("BOB")
+
+        status, body = self.request(
+            "POST", "/v1/send", {"recipient": "CAROL"}, token=bob
+        )
+
+        self.assertEqual(404, status)
+        self.assertEqual("recipient_unregistered", body["reason"])
+        self.assertEqual([], self.fcm_client.calls)
+
+
+class BlockedSendCostTest(YoServerTestCase):
+    """A block answers 200 delivered:true and sends nothing. That has to include the clock.
+
+    Measured before the fix: blocked p50 0.79 ms, delivered p50 116.69 ms, ranges disjoint by
+    110 ms. The one control whose threat model explicitly names the sender as the adversary
+    announced itself to that adversary in the timing, while the body was byte-identical.
+
+    Asserted as "the blocked path consults the delivery-cost estimator" rather than by measuring
+    wall-clock time, which would be a flaky test on a loaded machine. The estimator's own
+    arithmetic is asserted separately.
+    """
+
+    def _account(self, username):
+        _, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        return body["token"]
+
+    def test_a_blocked_send_spends_what_a_delivery_would_have(self):
+        alice = self._account("ALICE")
+        bob = self._account("BOB")
+        self.request("POST", "/v1/register", {"fcm_token": "BOB-PHONE"}, token=bob)
+        self.request("POST", "/v1/block", {"username": "ALICE"}, token=bob)
+
+        with mock.patch.object(self.server.delivery_cost, "sleep_to_match") as matched:
+            status, body = self.request(
+                "POST", "/v1/send", {"recipient": "BOB"}, token=alice
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        matched.assert_called_once()
+        self.assertEqual([], self.fcm_client.calls, "nothing may actually be sent")
+
+    def test_a_real_delivery_teaches_the_estimator_what_one_costs(self):
+        alice = self._account("ALICE")
+        bob = self._account("BOB")
+        self.request("POST", "/v1/register", {"fcm_token": "BOB-PHONE"}, token=bob)
+
+        with mock.patch.object(self.server.delivery_cost, "observe") as observed:
+            self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice)
+
+        observed.assert_called_once()
+        self.assertGreaterEqual(observed.call_args[0][0], 0.0)
+
+    def test_the_estimator_follows_what_it_is_told(self):
+        """Self-calibrating rather than a constant, because the right delay depends on how far
+        the server is from Google - a laptop pays ~117 ms, the production host perhaps 60-75."""
+        estimator = yo_server.DeliveryCostEstimator(initial_seconds=0.0)
+        for _ in range(200):
+            estimator.observe(0.070)
+
+        self.assertAlmostEqual(0.070, estimator.estimate(), places=3)
+
+
+class MalformedNumberTest(YoServerTestCase):
+    """Numbers a caller can send that Python does not treat like other languages do.
+
+    Both cases below escaped every handler and dropped the connection with no response at all -
+    the caller saw a reset and could not tell a server fault from a network one. The float forms
+    of the same inputs were always handled correctly, which is the tell: whoever wrote this
+    thought about infinity and NaN, and did not think about Python integers being unbounded.
+    """
+
+    def _session(self):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "ALICE", "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_an_integer_too_large_for_a_float_is_refused_not_crashed(self):
+        """math.isfinite raises OverflowError, not False, for an int that will not fit a float."""
+        session = self._session()
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": int("9" * 400), "longitude": 1},
+            token=session,
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+    def test_the_float_forms_still_behave(self):
+        session = self._session()
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/send",
+                    {"recipient": "BOB", "latitude": value, "longitude": 1},
+                    token=session,
+                )
+                self.assertEqual(400, status)
+
+    def test_a_valid_coordinate_is_unaffected(self):
+        session = self._session()
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": 45.815, "longitude": 15.982},
+            token=session,
+        )
+
+        # BOB does not exist; the point is that the coordinates were accepted and we got that far.
+        self.assertEqual(404, status)
+        self.assertEqual("recipient_not_found", body["reason"])
+
+
+class RawBodyTest(YoServerTestCase):
+    """_read_json_body's contract is that a bad body is a 400. It had a hole."""
+
+    def test_a_json_integer_over_the_digit_limit_is_a_bad_request(self):
+        """CPython refuses to convert an integer literal of more than 4300 digits and raises a
+        plain ValueError - not a JSONDecodeError - so naming the subclasses individually looked
+        exhaustive and missed it. Catching the base class is what makes the contract true."""
+        status, body = self.request(
+            "POST", "/v1/signup", raw_body=b'{"username": ' + b"9" * 5000 + b"}"
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+    def test_ordinary_malformed_json_is_still_a_bad_request(self):
+        status, body = self.request("POST", "/v1/signup", raw_body=b"{{{")
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+
+class UnhandledErrorTest(YoServerTestCase):
+    """Anything a route did not anticipate must be a 500, not a dropped connection.
+
+    The specific escapes found on 2026-08-01 are fixed above. This asserts the backstop, because
+    the ones worth guarding against are the ones nobody has enumerated - the store is a non-WAL
+    SQLite file behind a threaded server, so `database is locked` is reachable under ordinary
+    production concurrency and is not a bug in any route.
+    """
+
+    def test_an_unexpected_failure_answers_500_rather_than_dropping_the_connection(self):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "ALICE", "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        token = body["token"]
+
+        def exploding(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(self.server.database, "list_friends", exploding):
+            status, body = self.request("GET", "/v1/friends", token=token)
+
+        self.assertEqual(500, status)
+        self.assertEqual("internal_error", body["error"])
+
+    def test_the_reason_is_never_disclosed_to_the_caller(self):
+        """Same rule /v1/google already applies to Google's rejection messages: a message derived
+        from a caller-controlled request tells an honest client nothing they can act on."""
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "ALICE", "password": "correct-horse-1"}
+        )
+        token = body["token"]
+
+        def exploding(*_args, **_kwargs):
+            raise RuntimeError("SECRET-INTERNAL-DETAIL /root/claude/modules/yo/data/yo.db")
+
+        with mock.patch.object(self.server.database, "list_friends", exploding):
+            _, body = self.request("GET", "/v1/friends", token=token)
+
+        self.assertNotIn("SECRET-INTERNAL-DETAIL", json.dumps(body))
+        self.assertNotIn("yo.db", json.dumps(body))
+
+
+class BroadcastClientIdTest(YoServerTestCase):
+    """A client id is delivered to every subscriber AS THE SENDER of the Yo."""
+
+    def _register(self, client_id, key="secret-key"):
+        self.server.database.upsert_api_client(client_id, _hash_client_key(key))
+        return {"X-Yo-Client-Id": client_id, "X-Yo-Client-Key": key}
+
+    def test_an_ordinary_client_id_still_works(self):
+        status, _ = self.request(
+            "POST", "/v1/broadcast", {}, extra_headers=self._register("fedex")
+        )
+
+        self.assertEqual(200, status)
+
+    def test_a_client_id_that_could_forge_a_tap_promise_is_refused_at_use(self):
+        """Not only at registration. A row written by hand, restored from a backup, or created by
+        an older build of register_client.py would otherwise still reach every subscriber's shade.
+        The app renders `From <SENDER>` with no charset filter of its own, because until now that
+        field could only ever have come from validate_username.
+        """
+        forging = "WORLDCUP  ·  TAP TO OPEN evil.com"
+        status, body = self.request(
+            "POST", "/v1/broadcast", {}, extra_headers=self._register(forging)
+        )
+
+        self.assertEqual(401, status)
+        self.assertEqual("unauthorized", body["error"])
+
+    def test_the_charset_rule_rejects_everything_that_can_imitate_the_app(self):
+        for hostile in (
+            "a b",  # a space is all it takes to start a second clause
+            "yo·evil",  # the app's own separator
+            "yo.evil.com",  # reads as a host
+            "yo\nevil",  # a newline
+            "‮yo",  # an RTL override
+            "y",  # too short to be meaningful
+            "y" * 33,  # longer than a username may be
+        ):
+            with self.subTest(hostile):
+                self.assertIsNone(yo_server.CLIENT_ID_PATTERN.fullmatch(hostile))
+
+    def test_the_historical_client_names_this_route_exists_for_are_allowed(self):
+        for legitimate in ("fedex", "worldcup", "WorldCup", "yo-bot", "yo_bot", "ifttt2"):
+            with self.subTest(legitimate):
+                self.assertIsNotNone(yo_server.CLIENT_ID_PATTERN.fullmatch(legitimate))
 
 
 if __name__ == "__main__":
