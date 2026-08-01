@@ -11,4 +11,6 @@ data class YoMessage(
     val hashtag: String? = null,
     val latitude: Double? = null,
     val longitude: Double? = null,
+    /** Null when unknown: written before delivery was recorded, or still in flight. */
+    val delivered: Boolean? = null,
 )

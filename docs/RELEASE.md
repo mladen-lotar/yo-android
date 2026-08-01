@@ -714,6 +714,53 @@ Two things about applying it, both of which have bitten before:
   in late August. A retention rule that silently deletes on the day you add it is one you have not
   finished reading.
 
+### 8.11 Nothing was watching, and now something is
+
+Found 1 August 2026 while assessing go-live readiness. There was **no monitoring of any kind**: no
+cron on the host, no uptime container, nothing. `restart: unless-stopped` covers a process that
+EXITS. Docker's healthcheck covers a process that is alive but broken - except that a healthcheck
+only ever *labels* the container `unhealthy` and takes no action. So the one failure a healthcheck
+uniquely detects was the one failure nothing responded to.
+
+That is a policy exposure and not only a downtime one: Play re-checks `/privacy` and
+`/delete-account` after launch, and both are served by the same process as the API, so they go down
+together and nobody would have known.
+
+Two halves, because neither is sufficient alone.
+
+| Where | What | Why it cannot be the other one |
+|---|---|---|
+| Host, `tools/yo-watchdog.sh` via cron | Restarts the container after 2 consecutive bad checks | It can ACT, but the box has no notification channel |
+| Laptop, `tools/yo-uptime-check.py` via launchd | Probes the public hostname, alerts to Slack | It can TELL somebody, but it cannot restart anything |
+
+Details that are load-bearing rather than decorative:
+
+- **Both probe the PUBLIC hostname, with GET.** A check against the container is green in exactly
+  the failure the container cannot see - a Traefik router that stopped matching, the `yo-cf-only`
+  allowlist, DNS. And HEAD is avoided on principle even though it now works (§8.12).
+- **The watchdog refuses to restart on an EDGE fault.** Container healthy + public URL failing is a
+  routing problem; restarting cannot fix it and would add an outage to an outage. It logs loudly
+  and stops.
+- **It will not restart-loop.** 15 minutes minimum between restarts, and if the service is still
+  broken after one it says so rather than restarting forever - which would look like self-healing
+  while actually being a crash loop with a cron job hiding it.
+- **Cloudflare 403s the default `Python-urllib` user-agent.** Measured: `curl` unmodified gets 200
+  and `curl -A "Python-urllib/3.12"` gets 403 against the same URL in the same second. Without an
+  explicit User-Agent the monitor would have reported a permanent outage on a healthy service from
+  its first run - and an alerter that is always screaming gets muted, after which its silence means
+  nothing either.
+- **Two consecutive failures before alerting**, because one timeout across the public internet is
+  weather.
+
+### 8.12 HEAD used to answer 501
+
+`BaseHTTPRequestHandler` implements no `do_HEAD`, so `curl -I` - the reflex "is it up" - returned
+**501** on a perfectly healthy service. Uptime monitors default to HEAD precisely because it is
+cheap, so the service that most needed watching would have reported itself down from its first
+check. It now answers the same status and headers as GET with no body, and `/install/yo.apk`
+specifically does NOT read the file off disk for a HEAD, because reading a multi-megabyte file into
+a 256 MB container purely to discard it turns the cheapest probe into the most expensive request.
+
 ### 8.9 The edge was breaking the only no-app deletion route
 
 Found 28 July 2026, and it is the kind of defect that only exists in production - the pages are
