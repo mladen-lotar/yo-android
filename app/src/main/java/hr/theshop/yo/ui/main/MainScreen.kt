@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
@@ -34,6 +35,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -152,6 +154,62 @@ fun MainScreen(
             val targets = friends.map { SendTarget.Friend(it) } +
                 groups.map { SendTarget.YoGroup(it) }
 
+            // PINNED ABOVE THE BANDS, and the position IS the fix.
+            //
+            // All three of these used to be appended AFTER every 89dp band in the same
+            // LazyColumn. Measured on a Galaxy S23 - 1080x2340, density 480, so a band is 267px
+            // against 2,120px of usable height: SEVEN bands fit, and at eight these rows are
+            // pushed off-screen. The delivered flash is drawn on the band itself, so success was
+            // always visible and only FAILURE could scroll away, which quietly re-opened G25 for
+            // exactly the accounts that use the app most.
+            //
+            // Above the bands they cannot be scrolled past. The cost is that a failure shifts the
+            // first band down by one row, and that is the right trade: the bands are the thing
+            // you can always find again, the failure is the thing you cannot.
+            if (friendsLoadFailed) {
+                item(key = "friends-error") {
+                    Text(
+                        text = "COULDN'T LOAD FRIENDS",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 14.dp),
+                    )
+                }
+            }
+
+            // Says the consequence, not the mechanism: "push registration failed" means nothing to
+            // someone wondering why their phone is quiet. Tappable because the cause is usually
+            // transient, so asking again is the one thing that actually helps (gap G17).
+            if (pushUnavailable) {
+                item(key = "push-error") {
+                    Text(
+                        text = if (pushRetrying) "RECONNECTING..." else "NOT RECEIVING YOS - TAP TO RETRY",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !pushRetrying) { viewModel.retryDeviceRegistration() }
+                            .padding(vertical = 14.dp),
+                    )
+                }
+            }
+
+            // Same slot and same idiom as the push band above, for the same reason: name the
+            // consequence, and offer the one action that helps. Silence here was the whole bug -
+            // a Yo that never arrived left no trace anywhere in the UI.
+            sendFailure?.let { failure ->
+                item(key = "send-error") {
+                    Text(
+                        text = "COULDN'T YO ${failure.label} - TAP TO RETRY",
+                        style = YoLabel,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = sendInFlightTo == null) { viewModel.retrySend() }
+                            .padding(vertical = 14.dp),
+                    )
+                }
+            }
+
             bandRows(
                 targets = targets,
                 deliveredTo = sendDeliveredTo,
@@ -197,49 +255,6 @@ fun MainScreen(
                 )
             }
 
-            if (friendsLoadFailed) {
-                item(key = "friends-error") {
-                    Text(
-                        text = "COULDN'T LOAD FRIENDS",
-                        style = YoLabel,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 14.dp),
-                    )
-                }
-            }
-
-            // Says the consequence, not the mechanism: "push registration failed" means nothing to
-            // someone wondering why their phone is quiet. Tappable because the cause is usually
-            // transient, so asking again is the one thing that actually helps (gap G17).
-            if (pushUnavailable) {
-                item(key = "push-error") {
-                    Text(
-                        text = if (pushRetrying) "RECONNECTING..." else "NOT RECEIVING YOS - TAP TO RETRY",
-                        style = YoLabel,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(enabled = !pushRetrying) { viewModel.retryDeviceRegistration() }
-                            .padding(vertical = 14.dp),
-                    )
-                }
-            }
-
-            // Same slot and same idiom as the push band above, for the same reason: name the
-            // consequence, and offer the one action that helps. Silence here was the whole bug -
-            // a Yo that never arrived left no trace anywhere in the UI.
-            sendFailure?.let { failure ->
-                item(key = "send-error") {
-                    Text(
-                        text = "COULDN'T YO ${failure.label} - TAP TO RETRY",
-                        style = YoLabel,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(enabled = sendInFlightTo == null) { viewModel.retrySend() }
-                            .padding(vertical = 14.dp),
-                    )
-                }
-            }
         }
 
         MenuButton(
@@ -539,7 +554,22 @@ private fun MenuSheet(
     onDeleteAccount: () -> Unit,
 ) {
     YoSheet(onDismiss = onDismiss) {
-        Column(modifier = Modifier.fillMaxWidth()) {
+        // Scrollable, because the content is now taller than the sheet.
+        //
+        // Eight 89dp bands plus the drag handle overflow a ModalBottomSheet's maximum height, and
+        // a plain Column simply clips: DELETE ACCOUNT rendered about 80px of its 267px on a
+        // Galaxy S23 and nothing would scroll to reveal the rest. It stayed reachable - tapping
+        // the visible strip did open the confirmation - so this was cosmetic rather than G22
+        // repeating, but it is a Play requirement drawn at a third of its size, and a ninth band
+        // would have pushed it off the sheet completely.
+        //
+        // The other sheets were never affected because they are LazyColumns, which scroll by
+        // construction. This is the one built from a Column, and it is the one that grew.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState()),
+        ) {
             // ADD FRIEND is the counterpart of Yo's "FIND FRIENDS" row, and it is load-bearing:
             // friendships are explicit, so without it a fresh account has no bands at all.
             Band(
@@ -985,6 +1015,20 @@ private fun HistoryRow(message: YoMessage) {
         message.hashtag?.let { append("  ·  #$it") }
         if (hasLocation) {
             append("  ·  ${LocationLink.format(latitude!!)}, ${LocationLink.format(longitude!!)}")
+        }
+        // Only `false` is marked. The three states are genuinely distinct and only one of them is
+        // worth saying out loud:
+        //
+        //   true  - delivered, which is what a plain row has always meant. Adding "SENT" to every
+        //           successful row would be noise on the common case.
+        //   false - did NOT arrive. This is the whole point: the band said COULDN'T YO and then
+        //           the moment passed, while this row - the surface that LASTS - went on looking
+        //           exactly like a Yo that landed.
+        //   null  - written before the column existed, so the state is unknown. Rendered as it
+        //           always was, because inventing either answer for an old row would be the same
+        //           class of lie in a new place.
+        if (message.delivered == false) {
+            append("  ·  NOT DELIVERED")
         }
     }
     Column(

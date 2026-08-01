@@ -59,6 +59,11 @@ class YoMessageTransmissionTest {
                 "id",
                 "sender",
                 "timestamp",
+                // `delivered` is this device's record of whether ITS OWN send was confirmed. The
+                // recipient has no use for it and must not be told: it describes the sender's
+                // outcome, not the message. It exists so history stops rendering a failed send
+                // identically to one that arrived (G29), which is a fact about this screen.
+                "delivered",
             )
     }
 

@@ -81,6 +81,25 @@ LOOKUP_WINDOW_SECONDS = 60
 # left standing one route away.
 MAX_FCM_TOKEN_BYTES = 4096
 
+# A bearer token stops working 90 days after it was issued.
+#
+# It used to work forever. The `tokens` table has always had a `created_at` that nothing read, so
+# an exfiltrated token was valid until that exact session called DELETE /v1/session - which the
+# thief has no reason to do. That is G10, and issue #37 filed it as "a stolen Yo session can never
+# be revoked".
+#
+# 90 days is chosen against the recovery path, not against a threat model in the abstract. There is
+# no refresh mechanism and none is wanted: an expired token produces a 401, the client clears the
+# session on any authenticated 401, and the sign-in screen appears by itself. So the entire cost of
+# expiry is "sign in again", and the entire benefit is that every stolen token has a deadline.
+# Shorter would be defensible; much shorter turns a one-tap app into a login prompt.
+#
+# Deliberately NOT paired with a "sign out everywhere" band in the menu. The server could support
+# it trivially, but the menu already renders eight bands and clips the eighth (G37) - a ninth would
+# push DELETE ACCOUNT off the sheet entirely, trading a Play requirement for a feature nobody has
+# asked for. An unreachable ViewModel method would be G26 all over again, so it is not built.
+TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60
+
 # The authenticated writes that are metered per account. /v1/send has its own, tighter budget.
 LOOKUP_LIMITED_PATHS = ("/v1/friends", "/v1/block", "/v1/register")
 
@@ -456,6 +475,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
     # reply that was already on its way.
     _response_started = False
 
+    # True while serving HEAD: headers and Content-Length are written, the body is not.
+    _suppress_body = False
+
     # BaseHTTPRequestHandler defaults this to None, meaning a socket that never times out, and
     # ThreadingHTTPServer caps its thread count at nothing. A client that opens a connection and
     # then dribbles - or sends `Content-Length: 2000000` and stops - therefore holds a thread
@@ -471,6 +493,25 @@ class YoRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._guarded(self._route_get)
+
+    def do_HEAD(self) -> None:
+        """Same status and headers as GET, no body.
+
+        `BaseHTTPRequestHandler` has no default implementation, so this answered **501** - and
+        `curl -I` is the reflex reach for "is it up", which made a healthy service look broken.
+        That is not merely cosmetic: uptime monitors default to HEAD precisely because it is
+        cheap, so the service that most needs watching was the one that would have reported
+        itself down from the first check.
+
+        Every GET route here is a pure read - /healthz, the three public pages, /v1/friends,
+        /v1/blocked - so replaying one and dropping the body is safe. Content-Length is still
+        sent, and still describes the body a GET would have returned, which is what HEAD is for.
+        """
+        self._suppress_body = True
+        try:
+            self._guarded(self._route_get)
+        finally:
+            self._suppress_body = False
 
     def do_POST(self) -> None:
         self._guarded(self._route_post)
@@ -635,7 +676,8 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         token = self._bearer_token()
         if token:
             username = self.server.database.username_for_token(
-                yo_auth.hash_token(token)
+                yo_auth.hash_token(token),
+                issued_after=int(time.time()) - TOKEN_TTL_SECONDS,
             )
             if username is not None:
                 return username
@@ -881,6 +923,12 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         an absent account, so the loser of that race is told its credentials are no longer good
         rather than being handed a session on a deleted account.
         """
+        # Swept here rather than on a timer, because this process has no scheduler and sign-in is
+        # exactly the moment a new row appears. Expired tokens are already unusable - this is
+        # about the table not growing forever, which nothing else prevented.
+        self.server.database.delete_expired_tokens(
+            int(time.time()) - TOKEN_TTL_SECONDS
+        )
         token = yo_auth.new_token()
         if not self.server.database.store_token(yo_auth.hash_token(token), username):
             self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_credentials"})
@@ -1283,7 +1331,8 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.end_headers()
-        self.wfile.write(encoded)
+        if not self._suppress_body:
+            self.wfile.write(encoded)
 
     def _handle_document_page(self, title: str, body_html: str) -> None:
         page = DOCUMENT_PAGE_TEMPLATE.replace("{{TITLE}}", title).replace(
@@ -1309,14 +1358,18 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         if apk is None:
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
-        data = apk.read_bytes()
+        # stat() rather than read_bytes() for HEAD: reading a multi-megabyte file into a
+        # 256 MB container purely to throw it away is how a cheap probe becomes a DoS.
+        data = b"" if self._suppress_body else apk.read_bytes()
+        length = apk.stat().st_size if self._suppress_body else len(data)
         self._response_started = True
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", "application/vnd.android.package-archive")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(length))
         self.send_header("Content-Disposition", 'attachment; filename="yo.apk"')
         self.end_headers()
-        self.wfile.write(data)
+        if not self._suppress_body:
+            self.wfile.write(data)
 
     def _write_json(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -1325,7 +1378,8 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if not self._suppress_body:
+            self.wfile.write(body)
 
 
 def create_server(

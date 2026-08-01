@@ -46,7 +46,13 @@ object AppModule {
             context,
             YoDatabase::class.java,
             "yo.db",
-        ).build()
+        )
+            // Without this an upgrade THROWS on first open - this database shipped with no
+            // migrations and no destructive fallback, which is exactly why the schema could not
+            // be changed until now. Destructive fallback is still deliberately absent: it "fixes"
+            // the crash by erasing the user's history.
+            .addMigrations(YoDatabase.MIGRATION_2_3)
+            .build()
 
     @Provides
     fun provideYoDao(database: YoDatabase): YoDao = database.yoDao()

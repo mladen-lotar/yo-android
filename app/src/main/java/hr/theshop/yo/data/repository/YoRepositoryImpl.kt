@@ -16,11 +16,17 @@ class YoRepositoryImpl @Inject constructor(
     private val remoteDeliveryPort: YoRemoteDeliveryPort,
 ) : YoRepository {
     override suspend fun saveSent(message: YoMessage): YoSendOutcome {
+        // Written BEFORE the attempt, deliberately: link and hashtag exist only in this row, so
+        // discarding it on failure would destroy what the user typed at exactly the moment they
+        // want to retry (G25). The verdict is stamped onto it afterwards rather than deciding
+        // whether it is written at all.
         yoDao.insert(message.toEntity())
         return try {
             if (remoteDeliveryPort.deliver(message)) {
+                yoDao.markDelivered(message.id, true)
                 YoSendOutcome.Delivered
             } else {
+                yoDao.markDelivered(message.id, false)
                 YoSendOutcome.NotDelivered
             }
         } catch (e: CancellationException) {
@@ -29,6 +35,7 @@ class YoRepositoryImpl @Inject constructor(
             // left to tell.
             throw e
         } catch (e: Throwable) {
+            yoDao.markDelivered(message.id, false)
             YoSendOutcome.Unreachable
         }
     }
@@ -49,6 +56,7 @@ private fun YoMessage.toEntity() =
         hashtag = hashtag,
         latitude = latitude,
         longitude = longitude,
+        delivered = delivered,
     )
 
 private fun YoEntity.toDomain() =
@@ -61,4 +69,5 @@ private fun YoEntity.toDomain() =
         hashtag = hashtag,
         latitude = latitude,
         longitude = longitude,
+        delivered = delivered,
     )

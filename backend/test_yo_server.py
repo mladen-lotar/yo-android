@@ -1,9 +1,11 @@
+import inspect
 import io
 import ipaddress
 import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from email.message import Message
 from types import SimpleNamespace
@@ -2537,6 +2539,138 @@ class BlockedSendCostTest(YoServerTestCase):
             estimator.observe(0.070)
 
         self.assertAlmostEqual(0.070, estimator.estimate(), places=3)
+
+
+class TokenExpiryTest(YoServerTestCase):
+    """A stolen session has to have a deadline (G10, issue #37).
+
+    A token was valid until that exact session called DELETE /v1/session - which a thief has no
+    reason to do - so an exfiltrated one was good forever. The `created_at` column has been
+    written since the table existed and nothing ever read it.
+    """
+
+    def _session(self, username="ALICE"):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": username, "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def _age_all_tokens(self, seconds):
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE tokens SET created_at = ?", (int(time.time()) - seconds,)
+            )
+
+    def test_a_fresh_token_works(self):
+        token = self._session()
+        self.assertEqual(200, self.request("GET", "/v1/friends", token=token)[0])
+
+    def test_a_token_past_its_ttl_is_refused(self):
+        token = self._session()
+        self._age_all_tokens(yo_server.TOKEN_TTL_SECONDS + 60)
+
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=token)[0])
+
+    def test_a_token_just_inside_the_ttl_still_works(self):
+        """The boundary in the direction that matters: expiry must not log people out early."""
+        token = self._session()
+        self._age_all_tokens(yo_server.TOKEN_TTL_SECONDS - 3600)
+
+        self.assertEqual(200, self.request("GET", "/v1/friends", token=token)[0])
+
+    def test_a_token_of_unknown_age_is_treated_as_expired(self):
+        """NULL created_at means "arrived some other way". Unknown age is not a reason to trust
+        something indefinitely - and the column has always been written, so this cannot fire on a
+        row the application itself produced."""
+        token = self._session()
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("UPDATE tokens SET created_at = NULL")
+
+        self.assertEqual(401, self.request("GET", "/v1/friends", token=token)[0])
+
+    def test_expired_tokens_are_swept_rather_than_only_filtered(self):
+        """Otherwise the table grows forever: nothing else deletes a token except an explicit
+        logout or account deletion, and an expired row is dead weight either way."""
+        self._session()
+        self._age_all_tokens(yo_server.TOKEN_TTL_SECONDS + 60)
+        with sqlite3.connect(self.database_path) as connection:
+            before = connection.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+        self.assertEqual(1, before)
+
+        # Signing in is the moment a new row appears, so it is the moment to sweep.
+        self.request("POST", "/v1/login", {"username": "ALICE", "password": "correct-horse-1"})
+
+        with sqlite3.connect(self.database_path) as connection:
+            rows = connection.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+        self.assertEqual(1, rows, "the expired row went, the fresh one stayed")
+
+    def test_the_ttl_is_long_enough_to_not_be_a_login_prompt(self):
+        """A guard on the constant, not on the mechanism. There is no refresh flow, so the whole
+        cost of expiry is a re-login; setting this to hours would turn a one-tap app into a
+        password screen, and the value should not drift there without somebody noticing."""
+        self.assertGreaterEqual(yo_server.TOKEN_TTL_SECONDS, 30 * 24 * 60 * 60)
+
+
+class HeadRequestTest(StaticPageTestCase):
+    """HEAD answered 501, which made a healthy service look down.
+
+    `curl -I` is the reflex reach for "is it up", and uptime monitors default to HEAD precisely
+    because it is cheap - so the service that most needs watching would have reported itself
+    broken from its first check.
+    """
+
+    PAGES = ("/healthz", "/install", "/privacy", "/delete-account")
+
+    def raw_head(self, path):
+        handler = YoRequestHandler.__new__(YoRequestHandler)
+        handler.command = "HEAD"
+        handler.path = path
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = f"HEAD {path} HTTP/1.1"
+        handler.headers = Message()
+        handler.rfile = io.BytesIO(b"")
+        handler.wfile = io.BytesIO()
+        handler.server = self.server
+        handler.client_address = ("127.0.0.1", 0)
+        handler.log_message = lambda *_: None
+        handler.do_HEAD()
+        head, body = handler.wfile.getvalue().split(b"\r\n\r\n", 1)
+        status = int(head.splitlines()[0].decode("ascii").split(" ", 2)[1])
+        return status, head.decode("latin-1"), body
+
+    def test_head_matches_get_and_sends_no_body(self):
+        for path in self.PAGES:
+            with self.subTest(path=path):
+                head_status, head_headers, head_body = self.raw_head(path)
+                get_status, _, get_body = self.raw_request("GET", path)
+
+                self.assertEqual(get_status, head_status)
+                self.assertEqual(b"", head_body, "HEAD must not send a body")
+                self.assertIn(
+                    f"Content-Length: {len(get_body)}",
+                    head_headers,
+                    "Content-Length must still describe the body a GET would return",
+                )
+
+    def test_head_carries_the_same_security_headers(self):
+        """A monitor that follows headers must see the same posture as a browser."""
+        _, headers, _ = self.raw_head("/privacy")
+        for header in (
+            "Content-Security-Policy",
+            "X-Frame-Options",
+            "X-Content-Type-Options",
+            "Referrer-Policy",
+            "Strict-Transport-Security",
+        ):
+            with self.subTest(header=header):
+                self.assertIn(header, headers)
+
+    def test_head_does_not_read_the_apk_off_disk(self):
+        """/install/yo.apk reads the whole file into memory. Doing that for a body that is then
+        discarded turns the cheapest possible probe into the most expensive request on the
+        server, on a route that is public and unauthenticated."""
+        self.assertIn("_suppress_body", inspect.getsource(YoRequestHandler._handle_install_apk))
 
 
 class MalformedNumberTest(YoServerTestCase):

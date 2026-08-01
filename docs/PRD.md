@@ -674,9 +674,23 @@ user-visible effect whatsoever**. `YoBackendApi.sendYo`
 carefully split is read by curl and by the server log and by nothing the user will ever see. It was
 still worth doing; it is not worth citing as a change to how sending behaves.
 
-**G10 — Tokens never expire.** The `tokens` table has a `created_at` that nothing reads. There is
-no TTL, no "sign out everywhere", and no per-device labelling, so an exfiltrated token is valid
-until that exact session calls `DELETE /v1/session`.
+**G10 — Tokens never expired. — RESOLVED 2026-08-01 (the TTL half).** A bearer token now stops
+working 90 days after it was issued, and expired rows are swept at sign-in so the table stops
+growing forever. `created_at` was always written and never read; it is read now.
+
+90 days is chosen against the recovery path rather than in the abstract: there is no refresh flow,
+an expired token yields a 401, the client already clears its session on any authenticated 401, and
+the sign-in screen appears by itself - so the whole cost of expiry is "sign in again" and the whole
+benefit is that every stolen token has a deadline. This is what G8 identified as the real mitigation:
+encrypting the token raises the cost of a theft, expiring it bounds the damage of one that already
+succeeded.
+
+**"Sign out everywhere" is deliberately NOT built.** The server could support it in a line, but it
+needs a menu band to be reachable, the menu already has eight and clipped the eighth (G37), and a
+ninth would push DELETE ACCOUNT - a Play requirement - off the sheet. An unreachable ViewModel
+method would be G26 exactly. Original text follows.
+
+**G10 (original) — Tokens never expire.**
 
 **G11 — Signup is open to the internet.** This is inherent to a public signup endpoint rather than
 a defect, and it is a deliberate trade: the alternative was keeping a bootstrap secret in the APK,
@@ -1122,8 +1136,26 @@ The feature graphic on the next function **stays `RGB` deliberately**: Play spec
 comment in the generator saying so, because the two lines sit twenty apart and read like an
 oversight worth tidying.
 
-**G29 — history still renders a failed send identically to a delivered one. — OPEN, deliberately
-deferred.** G25 fixed the *transient* surface: the band shows `COULDN'T YO <NAME> - TAP TO RETRY`
+**G29 — history rendered a failed send identically to a delivered one. — RESOLVED 2026-08-01.**
+The deferral said this "should be the first thing done after the release, while the schema is still
+trivial and almost nobody has data to migrate". Production was wiped to zero rows on 2026-08-01, so
+that window is now rather than later, and the migration was written then.
+
+`YoEntity.delivered` is a nullable Boolean, Room is at version 3, and `MIGRATION_2_3` is this
+database's FIRST migration - the constraint that kept a dead `photoUri` column alive (G24) is paid
+off rather than worked around. `ADD COLUMN` specifically: minSdk 24 means SQLite may be 3.9, where
+`DROP COLUMN` does not exist, and a table rebuild's wrong `INSERT ... SELECT` SUCCEEDS while
+silently copying values into the wrong columns. `ADD COLUMN` has no such failure mode.
+
+Existing rows keep NULL, and only `false` is rendered (`· NOT DELIVERED`). Three states, and the
+honest treatment of each: `true` needs no label, `false` is the entire point, and NULL is genuinely
+unknown - defaulting an old row to delivered would re-tell exactly this lie, and to failed would
+invent a new one. `YoDatabaseMigrationTest` builds a REAL version-2 file from the exported `2.json`,
+including the `room_master_table` identity hash, migrates it, and asserts the row survives; a fourth
+test asserts that WITHOUT the migration Room throws, so the migration is load-bearing and not merely
+present. Original text follows.
+
+**G29 (original) — OPEN, deliberately deferred.** G25 fixed the *transient* surface: the band shows `COULDN'T YO <NAME> - TAP TO RETRY`
 and then the moment passes. The Room row it wrote is **permanent**, carries no delivery state, and
 renders exactly like a Yo that arrived. So the surface that lasts is the one still lying, and it
 outlives the one that tells the truth — which is arguably the worse half of the original defect.
@@ -1314,7 +1346,12 @@ Worth naming how it got in: the plan for G30 said *client sanitise and server re
 the three pieces shipped. A partial implementation of a rule reads as complete right up until
 somebody types the ordinary thing.
 
-**G35 — the three failure rows can sit below the fold. — OPEN, now MEASURED on hardware.**
+**G35 — the three failure rows could sit below the fold. — RESOLVED 2026-08-01.** They are now
+emitted BEFORE `bandRows` instead of after, so they cannot be scrolled past at any friend count.
+The cost is that a failure shifts the first band down one row, which is the right trade: the bands
+are the thing you can always find again, the failure is the thing you cannot. Original text follows.
+
+**G35 (original) — OPEN, now MEASURED on hardware.**
 `COULDN'T LOAD FRIENDS`, `NOT RECEIVING YOS` and `COULDN'T YO <NAME>` are all appended as items
 *after* every 89dp band in the same `LazyColumn`. Measured on a Galaxy S23 (1080x2340, density 480,
 so scale 3.0 and an 89dp band is 267px) against 2,120px of usable height between the status and
@@ -1333,7 +1370,12 @@ purpose is the safety control FR9 names. `loadFriends` already distinguished a f
 empty one, and that asymmetry is what identified this rather than any judgement about severity. The
 sheet now reads `COULDN'T LOAD THIS LIST`, and the flag clears once the server answers.
 
-**G37 — the eighth menu band renders 80px of its 267px. — OPEN, cosmetic.** Found on a Galaxy S23,
+**G37 — the eighth menu band rendered 80px of its 267px. — RESOLVED 2026-08-01.** The menu sheet's
+`Column` gained `verticalScroll`. Every other sheet was always fine because they are `LazyColumn`s,
+which scroll by construction; this was the one built from a `Column`, and it was the one that grew.
+Original text follows.
+
+**G37 (original) — OPEN, cosmetic.** Found on a Galaxy S23,
 29 July 2026. The menu sheet holds eight 89dp bands plus a drag handle, which overflows the sheet's
 maximum height, so `DELETE ACCOUNT` — the last one — is clipped to roughly the top third of its
 band, and the sheet does not scroll to reveal the rest.

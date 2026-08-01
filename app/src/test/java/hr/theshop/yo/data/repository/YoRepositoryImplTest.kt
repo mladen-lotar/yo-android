@@ -39,7 +39,9 @@ class YoRepositoryImplTest {
             val outcome = repository.saveSent(message)
 
             assertEquals(YoSendOutcome.Delivered, outcome)
-            assertEquals(listOf(message), repository.observeHistory().first())
+            // The row now carries the VERDICT, which is the whole of G29: the transient band
+            // said YO! and passed, while this row - the surface that lasts - said nothing.
+            assertEquals(listOf(message.copy(delivered = true)), repository.observeHistory().first())
             assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
         } finally {
             database.close()
@@ -67,7 +69,10 @@ class YoRepositoryImplTest {
                 val outcome = repository.saveSent(message)
 
                 assertEquals(YoSendOutcome.NotDelivered, outcome)
-                assertEquals(listOf(message), repository.observeHistory().first())
+                assertEquals(
+                    listOf(message.copy(delivered = false)),
+                    repository.observeHistory().first(),
+                )
                 assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
             } finally {
                 database.close()
@@ -95,7 +100,10 @@ class YoRepositoryImplTest {
                 assertEquals(YoSendOutcome.Unreachable, outcome)
                 // The link and hashtag exist only in this row, so discarding it on a failed send
                 // would destroy what the user typed at the moment they want to retry.
-                assertEquals(listOf(message), repository.observeHistory().first())
+                assertEquals(
+                    listOf(message.copy(delivered = false)),
+                    repository.observeHistory().first(),
+                )
                 assertEquals(listOf(message), remoteDeliveryPort.deliveredMessages)
             } finally {
                 database.close()
@@ -133,6 +141,8 @@ class YoRepositoryImplTest {
             assertSame(cancellation, thrown)
             assertEquals(null, outcome)
             // The row is still written: saveSent persists before it ever tries to deliver.
+            // delivered stays NULL on purpose: a cancelled send did not fail, its outcome is
+            // simply unknown, and marking it false would invent a failure the user never had.
             assertEquals(listOf(message), repository.observeHistory().first())
         } finally {
             database.close()
@@ -162,7 +172,10 @@ class YoRepositoryImplTest {
             repository.saveSent(older)
             repository.saveSent(newer)
 
-            assertEquals(listOf(newer, older), repository.observeHistory().first())
+            assertEquals(
+                listOf(newer.copy(delivered = true), older.copy(delivered = true)),
+                repository.observeHistory().first(),
+            )
         } finally {
             database.close()
         }

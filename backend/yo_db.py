@@ -278,7 +278,25 @@ class YoDatabase:
             )
         return cursor.rowcount == 1
 
-    def username_for_token(self, token_hash: str) -> Optional[str]:
+    def delete_expired_tokens(self, older_than: int) -> int:
+        """Drop every token issued before `older_than`. Returns how many went.
+
+        Swept rather than only filtered on read, so the table does not grow without bound - it
+        never had any pruning at all, and nothing else deletes a token except an explicit logout
+        or account deletion.
+        """
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM tokens WHERE created_at IS NULL OR created_at < ?",
+                (older_than,),
+            )
+        return cursor.rowcount
+
+    def username_for_token(
+        self,
+        token_hash: str,
+        issued_after: Optional[int] = None,
+    ) -> Optional[str]:
         """Resolve a bearer token, but only to an account that still exists.
 
         The JOIN is belt to store_token's braces, and it is what makes the property hold for rows
@@ -287,6 +305,17 @@ class YoDatabase:
         so any token that outlived its account, however it got there, authenticated happily. That
         matters because a deleted username is immediately free to claim again: the stale session
         does not merely linger, it silently transfers to whoever registers that name next.
+
+        `issued_after` is the expiry, and it is the answer to "a stolen session can never be
+        revoked" (G10, issue #37). A token used to be valid until that exact session called
+        `DELETE /v1/session`, so an exfiltrated one was good forever and its holder had no reason
+        ever to log out. Encrypting the token at rest - the remedy G8 originally named - raises
+        the cost of a theft; expiring it bounds the damage of a theft that already succeeded,
+        which is the half that helps.
+
+        A NULL `created_at` counts as EXPIRED rather than as ancient-but-valid. The column has
+        always been written, so this can only fire on a row that arrived some other way, and
+        "unknown age" is not a reason to trust something forever.
         """
         with self._connect() as connection:
             row = connection.execute(
@@ -295,8 +324,12 @@ class YoDatabase:
                 FROM tokens
                 JOIN accounts ON accounts.username = tokens.username
                 WHERE tokens.token_hash = ?
+                  AND (
+                        ? IS NULL
+                     OR (tokens.created_at IS NOT NULL AND tokens.created_at >= ?)
+                  )
                 """,
-                (token_hash,),
+                (token_hash, issued_after, issued_after),
             ).fetchone()
         return None if row is None else row[0]
 
