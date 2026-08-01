@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from traceback import format_exc
 from typing import Any, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
@@ -395,6 +396,10 @@ class YoHTTPServer(ThreadingHTTPServer):
 class YoRequestHandler(BaseHTTPRequestHandler):
     server: YoHTTPServer
 
+    # Set the moment a status line goes out, so _guarded never writes a second one over a
+    # reply that was already on its way.
+    _response_started = False
+
     # BaseHTTPRequestHandler defaults this to None, meaning a socket that never times out, and
     # ThreadingHTTPServer caps its thread count at nothing. A client that opens a connection and
     # then dribbles - or sends `Content-Length: 2000000` and stops - therefore holds a thread
@@ -409,6 +414,44 @@ class YoRequestHandler(BaseHTTPRequestHandler):
     timeout = 30
 
     def do_GET(self) -> None:
+        self._guarded(self._route_get)
+
+    def do_POST(self) -> None:
+        self._guarded(self._route_post)
+
+    def do_DELETE(self) -> None:
+        self._guarded(self._route_delete)
+
+    def _guarded(self, route: Any) -> None:
+        """Run a route, answering 500 rather than dropping the connection.
+
+        Without this, any exception a route did not anticipate escapes into socketserver, which
+        logs a traceback and closes the socket with **no response at all** - so the caller sees a
+        connection reset and cannot tell a server fault from a network one. Two such escapes were
+        found and fixed on 2026-08-01 (an oversized JSON integer, and math.isfinite on a large
+        int), but the ones worth guarding against are the ones nobody has listed yet: the store is
+        a non-WAL SQLite file behind a threaded server, so `sqlite3.OperationalError: database is
+        locked` is reachable in production under ordinary concurrency and is not a bug in any
+        route.
+
+        The reason is logged and never sent. It is derived from a caller-controlled request and
+        tells an honest client nothing they can act on, which is the same rule /v1/google already
+        applies to Google's rejection messages.
+
+        Nothing is written if the route already began a response: a second status line on the same
+        connection would corrupt a reply that may well have been correct.
+        """
+        try:
+            route()
+        except Exception:  # noqa: BLE001 - the whole point is that it is unenumerated
+            self.log_error("unhandled error serving %s: %s", self.command, format_exc().strip())
+            if not self._response_started:
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "internal_error"},
+                )
+
+    def _route_get(self) -> None:
         parsed = urlsplit(self.path)
         if parsed.path == "/healthz":
             self._write_json(HTTPStatus.OK, {"ok": True})
@@ -444,7 +487,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-    def do_DELETE(self) -> None:
+    def _route_delete(self) -> None:
         parsed = urlsplit(self.path)
         username = self._authenticate()
         if username is None:
@@ -469,7 +512,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 {"error": "bad_request", "reason": str(error)},
             )
 
-    def do_POST(self) -> None:
+    def _route_post(self) -> None:
         parsed = urlsplit(self.path)
         # Signup and login mint credentials, so they cannot themselves require one.
         if parsed.path in ("/v1/signup", "/v1/login"):
@@ -904,7 +947,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             # bool is a subclass of int, so True would otherwise pass as the coordinate 1.
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise BadRequestError(f"{name} must be a number")
-            if not math.isfinite(value):
+            # isfinite is asked ONLY of floats. Python integers are arbitrary precision, and
+            # math.isfinite raises OverflowError - not a 400 - for any int too large to become a
+            # float, so `{"latitude": 999...}` with 400 digits crashed the handler and dropped the
+            # connection with no response at all. The float case was clearly considered: 1e400
+            # correctly answers 400. The int case was not, because in every other language the two
+            # share a ceiling. An oversized int needs no finiteness check anyway; it is out of
+            # range, and the bounds below refuse it on its own terms.
+            if isinstance(value, float) and not math.isfinite(value):
                 raise BadRequestError(f"{name} must be a finite number")
         if not -90 <= latitude <= 90:
             raise BadRequestError("latitude must be between -90 and 90")
@@ -1070,7 +1120,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(content_length)
         try:
             body = json.loads(raw_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        except ValueError as error:
+            # ValueError, not (UnicodeDecodeError, JSONDecodeError). Both of those ARE
+            # ValueErrors, and naming them individually looked exhaustive while missing a third:
+            # a JSON integer of more than 4300 digits raises a plain ValueError from CPython's
+            # integer-string conversion limit, which escaped this handler entirely and dropped the
+            # connection without a response. Enumerating the subclasses you thought of is how a
+            # catch-list goes stale; catching the base covers the one you did not.
             raise BadRequestError("request body must be valid JSON") from error
         if not isinstance(body, dict):
             raise BadRequestError("request body must be a JSON object")
@@ -1121,6 +1177,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         permanent redirect to https, so this only closes the very first request.
         """
         encoded = page.encode("utf-8")
+        self._response_started = True
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
@@ -1161,6 +1218,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         data = apk.read_bytes()
+        self._response_started = True
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", "application/vnd.android.package-archive")
         self.send_header("Content-Length", str(len(data)))
@@ -1170,6 +1228,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
 
     def _write_json(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self._response_started = True
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

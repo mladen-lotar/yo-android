@@ -147,10 +147,17 @@ class YoServerTestCase(unittest.TestCase):
         body=None,
         token=None,
         extra_headers=None,
+        raw_body=None,
     ):
         data = b""
         headers = Message()
-        if body is not None:
+        # raw_body sends bytes the JSON encoder could not have produced, which is the only way to
+        # exercise what the server does with a body it cannot parse.
+        if raw_body is not None:
+            data = raw_body
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(len(data))
+        elif body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
             headers["Content-Length"] = str(len(data))
@@ -2367,6 +2374,125 @@ class LookupRateLimitTest(YoServerTestCase):
             {"/v1/friends", "/v1/block", "/v1/register"},
             set(yo_server.LOOKUP_LIMITED_PATHS),
         )
+
+
+class MalformedNumberTest(YoServerTestCase):
+    """Numbers a caller can send that Python does not treat like other languages do.
+
+    Both cases below escaped every handler and dropped the connection with no response at all -
+    the caller saw a reset and could not tell a server fault from a network one. The float forms
+    of the same inputs were always handled correctly, which is the tell: whoever wrote this
+    thought about infinity and NaN, and did not think about Python integers being unbounded.
+    """
+
+    def _session(self):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "ALICE", "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_an_integer_too_large_for_a_float_is_refused_not_crashed(self):
+        """math.isfinite raises OverflowError, not False, for an int that will not fit a float."""
+        session = self._session()
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": int("9" * 400), "longitude": 1},
+            token=session,
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+    def test_the_float_forms_still_behave(self):
+        session = self._session()
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                status, _ = self.request(
+                    "POST",
+                    "/v1/send",
+                    {"recipient": "BOB", "latitude": value, "longitude": 1},
+                    token=session,
+                )
+                self.assertEqual(400, status)
+
+    def test_a_valid_coordinate_is_unaffected(self):
+        session = self._session()
+        status, body = self.request(
+            "POST",
+            "/v1/send",
+            {"recipient": "BOB", "latitude": 45.815, "longitude": 15.982},
+            token=session,
+        )
+
+        # BOB does not exist; the point is that the coordinates were accepted and we got that far.
+        self.assertEqual(404, status)
+        self.assertEqual("recipient_not_found", body["reason"])
+
+
+class RawBodyTest(YoServerTestCase):
+    """_read_json_body's contract is that a bad body is a 400. It had a hole."""
+
+    def test_a_json_integer_over_the_digit_limit_is_a_bad_request(self):
+        """CPython refuses to convert an integer literal of more than 4300 digits and raises a
+        plain ValueError - not a JSONDecodeError - so naming the subclasses individually looked
+        exhaustive and missed it. Catching the base class is what makes the contract true."""
+        status, body = self.request(
+            "POST", "/v1/signup", raw_body=b'{"username": ' + b"9" * 5000 + b"}"
+        )
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+    def test_ordinary_malformed_json_is_still_a_bad_request(self):
+        status, body = self.request("POST", "/v1/signup", raw_body=b"{{{")
+
+        self.assertEqual(400, status)
+        self.assertEqual("bad_request", body["error"])
+
+
+class UnhandledErrorTest(YoServerTestCase):
+    """Anything a route did not anticipate must be a 500, not a dropped connection.
+
+    The specific escapes found on 2026-08-01 are fixed above. This asserts the backstop, because
+    the ones worth guarding against are the ones nobody has enumerated - the store is a non-WAL
+    SQLite file behind a threaded server, so `database is locked` is reachable under ordinary
+    production concurrency and is not a bug in any route.
+    """
+
+    def test_an_unexpected_failure_answers_500_rather_than_dropping_the_connection(self):
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "ALICE", "password": "correct-horse-1"}
+        )
+        self.assertEqual(201, status)
+        token = body["token"]
+
+        def exploding(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(self.server.database, "list_friends", exploding):
+            status, body = self.request("GET", "/v1/friends", token=token)
+
+        self.assertEqual(500, status)
+        self.assertEqual("internal_error", body["error"])
+
+    def test_the_reason_is_never_disclosed_to_the_caller(self):
+        """Same rule /v1/google already applies to Google's rejection messages: a message derived
+        from a caller-controlled request tells an honest client nothing they can act on."""
+        status, body = self.request(
+            "POST", "/v1/signup", {"username": "ALICE", "password": "correct-horse-1"}
+        )
+        token = body["token"]
+
+        def exploding(*_args, **_kwargs):
+            raise RuntimeError("SECRET-INTERNAL-DETAIL /root/claude/modules/yo/data/yo.db")
+
+        with mock.patch.object(self.server.database, "list_friends", exploding):
+            _, body = self.request("GET", "/v1/friends", token=token)
+
+        self.assertNotIn("SECRET-INTERNAL-DETAIL", json.dumps(body))
+        self.assertNotIn("yo.db", json.dumps(body))
 
 
 class BroadcastClientIdTest(YoServerTestCase):
