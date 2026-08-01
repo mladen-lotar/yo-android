@@ -6,6 +6,7 @@ import hr.theshop.yo.di.InviteUrl
 import hr.theshop.yo.domain.location.OneShotLocationProvider
 import hr.theshop.yo.domain.model.DeviceRegistrationOutcome
 import hr.theshop.yo.domain.model.Group
+import hr.theshop.yo.domain.model.HashtagRule
 import hr.theshop.yo.domain.model.PhoneContact
 import hr.theshop.yo.data.remote.AddFriendOutcome
 import hr.theshop.yo.data.remote.YoBackendApi
@@ -202,16 +203,24 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    private suspend fun loadFriends() {
-        runCatching { fetchFriendsUseCase() }
-            .onSuccess { loadedFriends ->
-                _friends.value = loadedFriends
-                _friendsLoadFailed.value = false
-            }
-            .onFailure {
-                _friends.value = emptyList()
-                _friendsLoadFailed.value = true
-            }
+    /**
+     * `internal` for the same reason [loadBlocked] is: the cancellation contract is only
+     * assertable if a test can call it directly.
+     */
+    internal suspend fun loadFriends() {
+        try {
+            _friends.value = fetchFriendsUseCase()
+            _friendsLoadFailed.value = false
+        } catch (e: CancellationException) {
+            // Not a failed load. `runCatching` caught this too, so leaving the screen mid-fetch
+            // emptied the friends list and drew COULDN'T LOAD FRIENDS - a claim about the server
+            // made out of the user's own navigation. G36 fixed exactly this in loadBlocked and
+            // cited loadFriends as the sibling that already got it right; loadFriends did not.
+            throw e
+        } catch (e: Throwable) {
+            _friends.value = emptyList()
+            _friendsLoadFailed.value = true
+        }
     }
 
     /**
@@ -371,12 +380,7 @@ class MainViewModel @Inject constructor(
      * it matches what every other product does with a hashtag, and it keeps the security rule
      * intact by making the server's 400 unreachable from our own client instead of by relaxing it.
      */
-    internal fun normalizeHashtag(raw: String?): String? =
-        raw?.takeIf { it.isNotBlank() }
-            ?.trimStart('#')
-            ?.replace(HASHTAG_DISALLOWED, "")
-            ?.take(MAX_HASHTAG_CHARS)
-            ?.takeIf { it.isNotEmpty() }
+    internal fun normalizeHashtag(raw: String?): String? = HashtagRule.sanitize(raw)
 
     /**
      * "example.com" is what people type, and the recipient's notification only ever opens http or
@@ -476,15 +480,5 @@ class MainViewModel @Inject constructor(
     private companion object {
         /** RFC 3986 scheme: letter, then letters/digits/+/-/. up to the colon. */
         val SCHEME_PREFIX = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:")
-
-        /**
-         * The inverse of the server's `\A[\w-]+\Z`, stated the same way here so the two cannot
-         * disagree about the same string. `\p{L}` excludes format characters, so an RTL override
-         * or a zero-width joiner goes with the spaces.
-         */
-        val HASHTAG_DISALLOWED = Regex("[^\\p{L}\\p{N}_-]")
-
-        /** Well inside the server's 140-BYTE cap even for multibyte scripts. */
-        const val MAX_HASHTAG_CHARS = 32
     }
 }

@@ -1146,6 +1146,56 @@ class MainViewModelTest {
         assertSame(cancellation, thrown)
     }
 
+    /**
+     * The same rule on the sibling path, which is where it came from.
+     *
+     * G36 fixed `loadBlocked` swallowing a cancellation and cited `loadFriends` as the one that
+     * already distinguished a failed load from an empty one - and it did, for real failures. It
+     * used `runCatching`, which catches `CancellationException` too, so leaving the screen
+     * mid-fetch emptied the friend list and raised COULDN'T LOAD FRIENDS: a claim about the
+     * server manufactured out of the user's own navigation, on the screen that is the whole app.
+     */
+    @Test
+    fun `a cancelled friends load is not reported as a failed one`() = runTest(dispatcher) {
+        val backendApi = FakeYoBackendApi(friends = listOf("ADA"))
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+        val cancellation = CancellationException("scope gone")
+        backendApi.friendsFailure = cancellation
+
+        val thrown =
+            try {
+                viewModel.loadFriends()
+                null
+            } catch (e: CancellationException) {
+                e
+            }
+
+        assertSame(cancellation, thrown)
+        assertFalse(
+            "a cancellation must not raise the failure banner",
+            viewModel.friendsLoadFailed.value,
+        )
+        assertEquals(
+            "a cancellation must not empty the list either",
+            listOf("ADA"),
+            viewModel.friends.value,
+        )
+    }
+
+    @Test
+    fun `a genuinely failed friends load is still reported`() = runTest(dispatcher) {
+        val backendApi = FakeYoBackendApi(friends = listOf("ADA"))
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+        backendApi.friendsFailure = IOException("offline")
+
+        viewModel.loadFriends()
+
+        assertTrue(viewModel.friendsLoadFailed.value)
+        assertEquals(emptyList<String>(), viewModel.friends.value)
+    }
+
     // The observable consequence of the same rule, kept alongside it: a cancelled read leaves the
     // list intact and the ViewModel usable rather than wedged.
     @Test
@@ -1424,7 +1474,10 @@ class MainViewModelTest {
 
     private class FakeYoBackendApi(
         friends: List<String> = emptyList(),
-        private val friendsFailure: Throwable? = null,
+        // A `var` so a test can start healthy and then fail, which is the only way to exercise a
+        // reload - the constructor form can only ever describe a fetch that was broken from the
+        // first call. Mirrors fetchBlockedFailure.
+        var friendsFailure: Throwable? = null,
         private val addOutcome: AddFriendOutcome = AddFriendOutcome.Added,
         private val deleteAccountSucceeds: Boolean = true,
     ) : StubYoBackendApi() {

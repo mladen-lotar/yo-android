@@ -156,5 +156,93 @@ class TokenTest(unittest.TestCase):
         self.assertNotEqual(digest, yo_auth.hash_token(yo_auth.new_token()))
 
 
+class EqualCostVerificationTest(unittest.TestCase):
+    """A login that cannot possibly succeed must cost what one that could costs.
+
+    Asserted as "exactly one key derivation happens, at the same cost, whatever is stored"
+    rather than by timing. The derivation count IS the property; elapsed time is only its
+    consequence, and a wall-clock assertion on a loaded machine is a test that fails for
+    reasons that have nothing to do with the code.
+
+    What this defends: `/v1/login` returns a byte-identical 401 for an unknown username and a
+    wrong password, and that was mistaken for indistinguishability. It never was - a real
+    account paid a 600,000-iteration PBKDF2 (294 ms in the production container) and an unknown
+    one returned in about 1 ms, so the endpoint enumerated the entire user table one request at
+    a time. Measured at 107x on a laptop before this changed, 1.01x after.
+    """
+
+    def _derivations_for(self, encoded):
+        """Every (salt, iterations) pair the verification actually derived."""
+        observed = []
+        real_derive = yo_auth._derive
+
+        def counting(password, salt, iterations):
+            observed.append(iterations)
+            return real_derive(password, salt, iterations)
+
+        original = yo_auth._derive
+        yo_auth._derive = counting
+        try:
+            result = yo_auth.verify_password(
+                "some-attempted-password",
+                encoded,
+                equal_cost_iterations=CHEAP_ITERATIONS,
+            )
+        finally:
+            yo_auth._derive = original
+        return result, observed
+
+    def test_every_failing_case_derives_exactly_once_at_the_same_cost(self):
+        real_hash = yo_auth.hash_password("the-real-password", CHEAP_ITERATIONS)
+        cases = {
+            "a real account, wrong password": real_hash,
+            "no such account at all": None,
+            "a google account, which has no password": yo_auth.UNUSABLE_PASSWORD_HASH,
+            "a row that is not an encoded hash": "garbage",
+            "an empty string": "",
+            "a hash with a nonsense iteration count": "pbkdf2_sha256$0$aa$bb",
+            "a hash from another algorithm": "argon2$1000$aa$bb",
+        }
+        for label, encoded in cases.items():
+            with self.subTest(label):
+                verified, derivations = self._derivations_for(encoded)
+                self.assertFalse(verified)
+                self.assertEqual(
+                    [CHEAP_ITERATIONS],
+                    derivations,
+                    "every path must spend exactly one derivation at the configured cost",
+                )
+
+    def test_the_google_account_case_is_not_distinguishable_from_an_unknown_one(self):
+        """Two absent-hash cases funnel through here and both had to be closed. Fixing only the
+        unknown-account one would have left a second oracle behind the first, separating accounts
+        that sign in with Google from accounts that sign in with a password."""
+        _, unknown = self._derivations_for(None)
+        _, google = self._derivations_for(yo_auth.UNUSABLE_PASSWORD_HASH)
+
+        self.assertEqual(unknown, google)
+
+    def test_a_correct_password_still_verifies(self):
+        encoded = yo_auth.hash_password("the-real-password", CHEAP_ITERATIONS)
+
+        self.assertTrue(yo_auth.verify_password("the-real-password", encoded))
+        self.assertFalse(yo_auth.verify_password("not-it", encoded))
+
+    def test_a_real_account_is_verified_at_its_own_stored_cost(self):
+        """The stored iteration count travels with the hash so it can be raised later without
+        invalidating anyone - the equal-cost decoy must not quietly override it."""
+        encoded = yo_auth.hash_password("the-real-password", CHEAP_ITERATIONS * 2)
+        _, derivations = self._derivations_for(encoded)
+
+        self.assertEqual([CHEAP_ITERATIONS * 2], derivations)
+
+    def test_no_password_never_degrades_into_any_password_working(self):
+        for attempt in ("", "!", "anything", yo_auth.UNUSABLE_PASSWORD_HASH):
+            with self.subTest(attempt):
+                self.assertFalse(
+                    yo_auth.verify_password(attempt, yo_auth.UNUSABLE_PASSWORD_HASH)
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

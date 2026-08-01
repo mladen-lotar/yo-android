@@ -38,12 +38,50 @@ MAX_HASHTAG_BYTES = 140
 # #世界 both pass while spaces, control characters and the separator itself do not.
 HASHTAG_PATTERN = re.compile(r"\A[\w-]+\Z")
 
+# A broadcast client id is delivered to every subscriber as the SENDER, landing in exactly the
+# position a username lands in - the app renders "From <SENDER>" with no charset filter of its
+# own, because until now that field could only ever have come from validate_username. Nothing
+# validated a client id anywhere: register_client.py stored whatever --client-id was given. So a
+# client registered as "WORLDCUP  ·  TAP TO OPEN evil.com" forges a second tap promise in every
+# subscriber's shade - G30's hashtag forgery, in the one route that never got the rule. It is
+# admin-only and production holds zero clients, so this closes it before it can ever be true
+# rather than after.
+#
+# Case is NOT constrained and the id is NOT uppercased on the way in, deliberately. The historical
+# clients this route exists for are named `fedex` and `worldcup` (PRD FR7), the app renders the
+# sender through `uppercase()` anyway, and normalising at registration while the caller keeps
+# sending what they typed would simply break the lookup. What matters is the character SET: no
+# whitespace, no `·`, no dot, no control character - nothing that can imitate the app's own
+# separators or its "TAP TO OPEN" wording. `-` is allowed because it cannot.
+CLIENT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{2,32}\Z")
+
 # Signup and login are necessarily public - an invitee has no credentials by definition - so
 # they are the abuse surface that replaces the old shared key. Sends are limited per account.
 CREDENTIAL_ATTEMPTS = 10
 CREDENTIAL_WINDOW_SECONDS = 900
 SEND_ATTEMPTS = 60
 SEND_WINDOW_SECONDS = 60
+
+# Adding a friend and blocking both answer `no_such_user` for a name nobody holds, which makes
+# either one an account-existence probe. That disclosure is deliberate and cannot be removed -
+# you have to be able to add somebody by typing their name (FR9). The RATE was not deliberate:
+# nothing limited these routes at all, so a single signup bought an unmetered sweep of the whole
+# username space at line rate, which is the reconnaissance half of G30's "push a link into any
+# username you can guess". Registering a device sits in the same bucket because it is the other
+# authenticated write with no limit. A person adds a handful of friends in a lifetime of using
+# this app and registers once per launch, so this is nowhere near a real user.
+LOOKUP_ATTEMPTS = 30
+LOOKUP_WINDOW_SECONDS = 60
+
+# An FCM registration token is ~150-200 characters. Nothing bounded it, so any authenticated
+# caller could store up to MAX_BODY_BYTES of arbitrary text per write, repeatedly and unmetered,
+# into a non-WAL SQLite file that journal_mode=delete rewrites on every transaction - on a disk
+# shared with every other container on the host. This is the shape G24 removed /v1/photo for,
+# left standing one route away.
+MAX_FCM_TOKEN_BYTES = 4096
+
+# The authenticated writes that are metered per account. /v1/send has its own, tighter budget.
+LOOKUP_LIMITED_PATHS = ("/v1/friends", "/v1/block", "/v1/register")
 
 # How many allowed requests between sweeps of the rate limiter's idle keys.
 _SWEEP_EVERY = 256
@@ -137,6 +175,16 @@ def _configured_apk_path() -> Optional[Path]:
 
 # Styled from Yo's own values: Amethyst #9B59B6, Montserrat Bold, white centred type, the mixed-case
 # "Yo" wordmark and the tagline "It's that simple." See docs/PRD.md section 4.1.
+#
+# NO WEBFONT LINK, deliberately. This page used to pull Montserrat from fonts.googleapis.com, which
+# made every visitor's browser announce its IP address to Google before it had agreed to anything -
+# and this is the page every INVITE lands on, so its visitors are by definition people who do not
+# have the app and have accepted no policy. The served privacy policy says Google receives data in
+# exactly two narrow roles, push and sign-in verification, and "Nothing is shared with anyone else":
+# a third-party font request is a third role the document denies. The publisher is Croatian, so
+# that is GDPR-relevant and not merely untidy (LG Munchen I, 3 O 17493/20). Montserrat still renders
+# for anyone who has it installed; everyone else gets the declared fallback and an identical layout.
+# If the face is ever wanted for certain, self-host the woff2 - do not re-add a third-party link.
 INSTALL_PAGE_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -144,7 +192,6 @@ INSTALL_PAGE_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#9b59b6">
 <title>Yo - It's that simple.</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Montserrat:700,400">
 <style>
   html, body { height: 100%; margin: 0; }
   body {
@@ -342,10 +389,24 @@ class YoHTTPServer(ThreadingHTTPServer):
             CREDENTIAL_WINDOW_SECONDS,
         )
         self.send_limiter = RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS)
+        self.lookup_limiter = RateLimiter(LOOKUP_ATTEMPTS, LOOKUP_WINDOW_SECONDS)
 
 
 class YoRequestHandler(BaseHTTPRequestHandler):
     server: YoHTTPServer
+
+    # BaseHTTPRequestHandler defaults this to None, meaning a socket that never times out, and
+    # ThreadingHTTPServer caps its thread count at nothing. A client that opens a connection and
+    # then dribbles - or sends `Content-Length: 2000000` and stops - therefore holds a thread
+    # forever, and enough of them exhaust a 256 MB container without sending a single valid
+    # request.
+    #
+    # Production is not currently exposed to that: Traefik terminates the client connection and
+    # talks to this process over a pooled one, so a slow client never reaches here. That is the
+    # same shape as G33 - a real safety property living entirely in the proxy while the
+    # application assumed it held on its own - and G33's lesson was that the proxy side of it is
+    # one label in a shared file. This makes the property true here too.
+    timeout = 30
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -438,6 +499,14 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             if client_id is not None:
                 self._handle_broadcast(client_id, body)
+                return
+            # Keyed on the authenticated account, not the IP: the caller has already proved who
+            # they are, and one abusive account must not spend a shared bucket that would lock
+            # out everybody else behind the same carrier NAT.
+            if parsed.path in LOOKUP_LIMITED_PATHS and not self.server.lookup_limiter.allow(
+                username or ""
+            ):
+                self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "rate_limited"})
                 return
             if parsed.path == "/v1/friends":
                 self._handle_add_friend(username, body)
@@ -599,9 +668,15 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             status = HTTPStatus.CREATED
         else:
             stored = self.server.database.get_password_hash(username)
-            if not yo_auth.verify_password(password, stored):
+            if not yo_auth.verify_password(
+                password,
+                stored,
+                equal_cost_iterations=self.server.password_iterations,
+            ):
                 # Deliberately identical for an unknown user and a wrong password, so the
-                # response cannot be used to enumerate which usernames exist.
+                # response cannot be used to enumerate which usernames exist. The BODY was
+                # always identical; what made that sentence true is verify_password spending
+                # the same CPU on both, which it did not until 2026-08-01 - see its docstring.
                 self._write_json(
                     HTTPStatus.UNAUTHORIZED,
                     {"error": "invalid_credentials"},
@@ -730,6 +805,11 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         stored_hash = self.server.database.get_api_key_hash(client_id)
         if (
             client_id
+            # Re-checked at USE, not only at registration. A row written by hand, by an older
+            # build of register_client.py, or by a restored backup would otherwise still reach
+            # every subscriber's notification body. Validating only where ids are created leaves
+            # the rejection reachable from anywhere that is not that one script.
+            and CLIENT_ID_PATTERN.fullmatch(client_id)
             and supplied_key
             and stored_hash is not None
             and hmac.compare_digest(
@@ -747,6 +827,10 @@ class YoRequestHandler(BaseHTTPRequestHandler):
     def _handle_register(self, username: str, body: Dict[str, Any]) -> None:
         """The username comes from the token, never the body - you may only claim your own."""
         fcm_token = self._required_string(body, "fcm_token")
+        if len(fcm_token.encode("utf-8")) > MAX_FCM_TOKEN_BYTES:
+            raise BadRequestError(
+                f"fcm_token must be at most {MAX_FCM_TOKEN_BYTES} bytes"
+            )
         self.server.database.upsert_device(username, fcm_token)
         self._write_json(
             HTTPStatus.OK,
@@ -1018,17 +1102,46 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         except yo_auth.CredentialError as error:
             raise BadRequestError(str(error)) from error
 
+    def _write_html(self, page: str) -> None:
+        """Serve a self-contained HTML page with the headers these pages need.
+
+        `/privacy` and `/delete-account` are the two pages Google Play re-checks after launch,
+        and `/delete-account` is the only route to erasure for somebody who cannot open the app.
+        Framing that page is therefore worth denying outright: it is a destructive action reached
+        by people who by definition have no other way through.
+
+        The pages are entirely self-contained - one inline <style>, no script, no image, no
+        third-party request of any kind - so `default-src 'none'` is not aspirational here, it is
+        a description. Anything that later needs an external asset should be self-hosted rather
+        than have this relaxed; a webfont link on the install page is exactly the mistake this
+        policy would have caught.
+
+        No `preload` on HSTS, deliberately: preload is a browser-list submission that is slow and
+        awkward to undo, and the value here is the ordinary one. Traefik already issues a
+        permanent redirect to https, so this only closes the very first request.
+        """
+        encoded = page.encode("utf-8")
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _handle_document_page(self, title: str, body_html: str) -> None:
         page = DOCUMENT_PAGE_TEMPLATE.replace("{{TITLE}}", title).replace(
             "{{BODY}}",
             body_html,
         )
-        encoded = page.encode("utf-8")
-        self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        self._write_html(page)
 
     def _handle_install_page(self) -> None:
         apk = _configured_apk_path()
@@ -1040,12 +1153,7 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             )
         else:
             action = '<p class="small">The download is not published yet.</p>'
-        body = INSTALL_PAGE_TEMPLATE.replace("{{ACTION}}", action).encode("utf-8")
-        self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_html(INSTALL_PAGE_TEMPLATE.replace("{{ACTION}}", action))
 
     def _handle_install_apk(self) -> None:
         apk = _configured_apk_path()

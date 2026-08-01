@@ -607,4 +607,97 @@ class YoNotifierTest {
         val sound = notification.sound
         assertEquals(YoNotifier.yoSoundUri(context), sound)
     }
+
+    /**
+     * The sender was the one field in this body with no filter, because it could only ever have
+     * come from `validate_username` on the server. `/v1/broadcast` broke that: it sends the
+     * registered CLIENT ID as the sender, and nothing validated a client id anywhere. The
+     * 48-combination test above could not have caught it - every one of those cases passes a
+     * benign `sender = "Ada"`, which is the same shape of blind spot that let a hostile hashtag
+     * through while an "exhaustive" test was green.
+     */
+    @Test
+    fun `a sender cannot forge a second tap promise`() {
+        val text =
+            YoNotifier.yoNotificationBody(
+                sender = "WORLDCUP  ·  TAP TO OPEN paypal.com",
+                hashtag = null,
+                hasLink = true,
+                linkIsTappable = true,
+                hasLocation = false,
+                linkHost = "example.com",
+            )
+
+        assertEquals(1, Regex("TAP TO OPEN").findAll(text).count())
+        assertFalse(text.contains("paypal.com"))
+    }
+
+    @Test
+    fun `notification body promises at most one tap whatever the sender says`() {
+        val senders =
+            listOf(
+                "ADA",
+                "WORLDCUP  ·  TAP TO OPEN paypal.com",
+                "· evil.com",
+                "a\nb",
+                "‮lave",
+            )
+        val hashtags = listOf(null, "worldcup", "x  ·  TAP TO OPEN paypal.com")
+        for (sender in senders) {
+            for (hashtag in hashtags) {
+                for (hasLocation in listOf(false, true)) {
+                    val text =
+                        YoNotifier.yoNotificationBody(
+                            sender = sender,
+                            hashtag = hashtag,
+                            hasLink = true,
+                            linkIsTappable = true,
+                            hasLocation = hasLocation,
+                            linkHost = "example.com",
+                        )
+                    val where = "sender=$sender hashtag=$hashtag location=$hasLocation -> $text"
+                    assertTrue(where, Regex("TAP TO OPEN").findAll(text).count() <= 1)
+                    assertFalse(where, text.contains("paypal.com"))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a sender with nothing renderable becomes a neutral name rather than nothing`() {
+        assertEquals("From SOMEONE", YoNotifier.yoNotificationBody("  ·  "))
+        assertEquals("From SOMEONE", YoNotifier.yoNotificationBody("😀"))
+    }
+
+    @Test
+    fun `an ordinary sender is unchanged and still uppercased`() {
+        assertEquals("From ADA", YoNotifier.yoNotificationBody("Ada"))
+        assertEquals("From YO_BOT", YoNotifier.yoNotificationBody("yo_bot"))
+        assertEquals("From FED-EX", YoNotifier.yoNotificationBody("fed-ex"))
+    }
+
+    /**
+     * The notification id was `sender.hashCode()`, and posting with an id already in use REPLACES
+     * the existing notification. `String.hashCode` collides trivially - among two-character
+     * usernames alone there are 340 colliding pairs - so a stranger could choose a name colliding
+     * with one of your friends and silently suppress that friend's Yos. A per-sender TAG cannot
+     * collide.
+     */
+    @Test
+    fun `two senders whose names collide on hashCode do not overwrite each other`() {
+        assertEquals("AO".hashCode(), "B0".hashCode())
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val notificationManager = context.getSystemService(NotificationManager::class.java)
+
+        YoNotifier.postYoNotification(context, "AO")
+        YoNotifier.postYoNotification(context, "B0")
+
+        val posted = shadowOf(notificationManager).allNotifications
+        assertEquals("both Yos must survive", 2, posted.size)
+        val bodies =
+            posted
+                .map { it.extras.getCharSequence(Notification.EXTRA_TEXT).toString() }
+                .toSet()
+        assertEquals(setOf("From AO", "From B0"), bodies)
+    }
 }

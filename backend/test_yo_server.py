@@ -19,6 +19,8 @@ from yo_server import (
     CREDENTIAL_WINDOW_SECONDS,
     MAX_HASHTAG_BYTES,
     MAX_LINK_BYTES,
+    LOOKUP_ATTEMPTS,
+    LOOKUP_WINDOW_SECONDS,
     SEND_ATTEMPTS,
     SEND_WINDOW_SECONDS,
     RateLimiter,
@@ -106,6 +108,7 @@ class YoServerTestCase(unittest.TestCase):
                 CREDENTIAL_WINDOW_SECONDS,
             ),
             send_limiter=RateLimiter(SEND_ATTEMPTS, SEND_WINDOW_SECONDS),
+            lookup_limiter=RateLimiter(LOOKUP_ATTEMPTS, LOOKUP_WINDOW_SECONDS),
             # Unconfigured by default, matching a deployment with no YO_GOOGLE_CLIENT_ID.
             # GoogleSignInTest installs a stub.
             google_verifier=None,
@@ -2206,6 +2209,211 @@ class AccessLogRedactionTest(unittest.TestCase):
 
         self.assertIn("POST /v1/send HTTP/1.1", line)
         self.assertNotIn("redacted", line)
+
+
+class ServedPageHeaderTest(StaticPageTestCase):
+    """Headers on the three public HTML routes.
+
+    Two of them are what Google Play re-checks after launch, and `/delete-account` is the only
+    route to erasure for somebody who cannot open the app - so it is reached, by definition, by
+    people with no other way through. Framing that is worth denying outright.
+    """
+
+    PAGES = ("/install", "/privacy", "/delete-account")
+
+    def test_every_served_page_carries_the_headers(self):
+        expected = (
+            ("Content-Security-Policy", "frame-ancestors 'none'"),
+            ("X-Frame-Options", "DENY"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            ("Strict-Transport-Security", "max-age="),
+        )
+        for path in self.PAGES:
+            _, head, _ = self.raw_request("GET", path)
+            for header, value in expected:
+                with self.subTest(path=path, header=header):
+                    self.assertIn(header, head)
+                    self.assertIn(value, head)
+
+    def test_hsts_is_not_preloaded(self):
+        """`preload` is a browser-list submission that is slow and awkward to undo. Nothing here
+        needs it, and adding it by reflex is how a domain acquires a commitment nobody chose."""
+        for path in self.PAGES:
+            _, head, _ = self.raw_request("GET", path)
+            with self.subTest(path=path):
+                self.assertNotIn("preload", head)
+
+    def test_no_served_page_requests_anything_from_a_third_party(self):
+        """The property, not the instance.
+
+        `/install` pulled Montserrat from fonts.googleapis.com, so every invitee's browser
+        announced its IP to Google before agreeing to anything - on the one page whose visitors
+        by definition have not accepted a policy - while the privacy policy served beside it
+        promises Google receives data in exactly two roles and that nothing is shared with anyone
+        else. Asserting "no absolute URL to any host" rather than "not that one URL" is what makes
+        this catch the next CDN, analytics snippet or webfont somebody reaches for.
+        """
+        for path in self.PAGES:
+            _, _, body = self.raw_request("GET", path)
+            text = body.decode("utf-8")
+            for marker in ("http://", "https://", "//fonts.", "url("):
+                with self.subTest(path=path, marker=marker):
+                    self.assertNotIn(marker, text)
+
+    def test_the_deletion_address_is_still_reachable_without_javascript(self):
+        """It is the only deletion route for someone who cannot open the app, and Cloudflare's
+        Scrape Shield rewrites a bare mailto into a JS-only link. The fences must stay."""
+        _, _, body = self.raw_request("GET", "/delete-account")
+        text = body.decode("utf-8")
+
+        self.assertIn("mailto:", text)
+        self.assertIn("<!--email_off-->", text)
+
+
+class RegisterTokenBoundTest(YoServerTestCase):
+    """An FCM token is ~150-200 characters and nothing bounded it."""
+
+    def _token_for(self, username="ALICE"):
+        status, body = self.request(
+            "POST",
+            "/v1/signup",
+            {"username": username, "password": "correct-horse-1"},
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_an_ordinary_token_is_accepted(self):
+        session = self._token_for()
+        status, _ = self.request(
+            "POST", "/v1/register", {"fcm_token": "f" * 200}, token=session
+        )
+
+        self.assertEqual(200, status)
+
+    def test_an_oversized_token_is_refused_and_nothing_is_stored(self):
+        session = self._token_for()
+        status, _ = self.request(
+            "POST",
+            "/v1/register",
+            {"fcm_token": "f" * (yo_server.MAX_FCM_TOKEN_BYTES + 1)},
+            token=session,
+        )
+
+        self.assertEqual(400, status)
+        self.assertIsNone(self.server.database.get_fcm_token("ALICE"))
+
+    def test_the_bound_is_bytes_not_characters(self):
+        """Same reasoning as the link and hashtag caps: a multibyte string passes a len() check
+        and is then several times larger on the wire and in the database."""
+        session = self._token_for()
+        multibyte = "é" * yo_server.MAX_FCM_TOKEN_BYTES  # 2 bytes each
+        status, _ = self.request(
+            "POST", "/v1/register", {"fcm_token": multibyte}, token=session
+        )
+
+        self.assertEqual(400, status)
+
+
+class LookupRateLimitTest(YoServerTestCase):
+    """Adding a friend and blocking answer `no_such_user`, which makes them existence probes.
+
+    The disclosure is deliberate and stays (FR9). The unmetered RATE was not: one signup bought a
+    sweep of the whole username space at line rate.
+    """
+
+    def _session(self, username):
+        status, body = self.request(
+            "POST",
+            "/v1/signup",
+            {"username": username, "password": "correct-horse-1"},
+        )
+        self.assertEqual(201, status)
+        return body["token"]
+
+    def test_probing_for_accounts_is_eventually_refused(self):
+        session = self._session("ALICE")
+        statuses = [
+            self.request(
+                "POST", "/v1/friends", {"username": f"GHOST{index:03d}"}, token=session
+            )[0]
+            for index in range(LOOKUP_ATTEMPTS + 5)
+        ]
+
+        self.assertEqual(404, statuses[0], "a probe must still work at all")
+        self.assertIn(429, statuses)
+        self.assertEqual(429, statuses[-1])
+
+    def test_the_limit_is_per_account_not_shared(self):
+        """Keyed on the authenticated caller on purpose. An IP bucket would let one abuser behind
+        a carrier NAT lock out every other user sharing that address."""
+        alice = self._session("ALICE")
+        bob = self._session("BOB")
+        for index in range(LOOKUP_ATTEMPTS + 2):
+            self.request(
+                "POST", "/v1/friends", {"username": f"GHOST{index:03d}"}, token=alice
+            )
+
+        status, _ = self.request(
+            "POST", "/v1/friends", {"username": "GHOSTX"}, token=bob
+        )
+
+        self.assertEqual(404, status, "Bob must be unaffected by Alice's probing")
+
+    def test_every_authenticated_write_without_its_own_budget_is_covered(self):
+        """A path list is only as good as the thing that notices when a route is added to one
+        list and not the other."""
+        self.assertEqual(
+            {"/v1/friends", "/v1/block", "/v1/register"},
+            set(yo_server.LOOKUP_LIMITED_PATHS),
+        )
+
+
+class BroadcastClientIdTest(YoServerTestCase):
+    """A client id is delivered to every subscriber AS THE SENDER of the Yo."""
+
+    def _register(self, client_id, key="secret-key"):
+        self.server.database.upsert_api_client(client_id, _hash_client_key(key))
+        return {"X-Yo-Client-Id": client_id, "X-Yo-Client-Key": key}
+
+    def test_an_ordinary_client_id_still_works(self):
+        status, _ = self.request(
+            "POST", "/v1/broadcast", {}, extra_headers=self._register("fedex")
+        )
+
+        self.assertEqual(200, status)
+
+    def test_a_client_id_that_could_forge_a_tap_promise_is_refused_at_use(self):
+        """Not only at registration. A row written by hand, restored from a backup, or created by
+        an older build of register_client.py would otherwise still reach every subscriber's shade.
+        The app renders `From <SENDER>` with no charset filter of its own, because until now that
+        field could only ever have come from validate_username.
+        """
+        forging = "WORLDCUP  ·  TAP TO OPEN evil.com"
+        status, body = self.request(
+            "POST", "/v1/broadcast", {}, extra_headers=self._register(forging)
+        )
+
+        self.assertEqual(401, status)
+        self.assertEqual("unauthorized", body["error"])
+
+    def test_the_charset_rule_rejects_everything_that_can_imitate_the_app(self):
+        for hostile in (
+            "a b",  # a space is all it takes to start a second clause
+            "yo·evil",  # the app's own separator
+            "yo.evil.com",  # reads as a host
+            "yo\nevil",  # a newline
+            "‮yo",  # an RTL override
+            "y",  # too short to be meaningful
+            "y" * 33,  # longer than a username may be
+        ):
+            with self.subTest(hostile):
+                self.assertIsNone(yo_server.CLIENT_ID_PATTERN.fullmatch(hostile))
+
+    def test_the_historical_client_names_this_route_exists_for_are_allowed(self):
+        for legitimate in ("fedex", "worldcup", "WorldCup", "yo-bot", "yo_bot", "ifttt2"):
+            with self.subTest(legitimate):
+                self.assertIsNotNone(yo_server.CLIENT_ID_PATTERN.fullmatch(legitimate))
 
 
 if __name__ == "__main__":
