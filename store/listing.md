@@ -110,9 +110,17 @@ Google sign-in is unusable for a reviewer while the OAuth consent screen is rest
 the-shop.hr organisation, so the declaration must be **All functionality is restricted** with a
 username/password demo account, and must say so:
 
+> **The password is deliberately not in this file, and must never be put back.** It is a live
+> credential for a real account in the production database, and this repository is **public**. It
+> was committed here on 2026-07-29 and published for as long as that commit was the tip; treat the
+> value that was in it as compromised and rotate it before submission regardless of anything else.
+> The convention this broke was already written down — PRD §7.1 records the demo password as
+> "generated and reported to the user, deliberately NOT committed". Paste the current value
+> straight into the Play Console field below; it belongs in a password manager, not in git.
+
 ```
 Username: YODEMO1
-Password: YomyoU4NTT1pe8ik
+Password: <from the operator's password manager - NOT stored in this repository>
 
 Sign in with LOG IN on the first screen. Do NOT use CONTINUE WITH GOOGLE - Google sign-in is
 currently restricted to our organisation's accounts and will fail for you.
@@ -128,7 +136,7 @@ the blocked list, and account deletion.
 | | |
 |---|---|
 | Username | `YODEMO1` |
-| Password | `YomyoU4NTT1pe8ik` |
+| Password | not recorded here - see the warning above |
 | Friends visible on the home screen | `ADA`, `LEO`, `YODEMO2` |
 
 1. ~~the demo account has at least one friend, in BOTH directions~~ - done. `list_friends`

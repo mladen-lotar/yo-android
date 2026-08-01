@@ -49,7 +49,7 @@ open - including the reviewer's, whom this document already tells not to use it.
 | FCM for `hr.theshop.yo` | Done - app + both SHA-1s in `yo-theshop` |
 | Google sign-in for `hr.theshop.yo` | Done - all clients in `yo-theshop` (G16 closed); not yet re-verified on device |
 | OAuth consent screen off `orgInternalOnly` | **Outstanding** - Console only, blocks every non-`the-shop.hr` account |
-| App access - credentials for the reviewer | Done (29 Jul 2026) - `YODEMO1` / `YomyoU4NTT1pe8ik`, three friends visible, and `YODEMO2` now has a registered device so a reviewer's Yo actually delivers. Credentials and instructions in `store/listing.md`. **Four accounts to delete after launch** |
+| App access - credentials for the reviewer | Account ready (29 Jul 2026) - `YODEMO1`, three friends visible, and `YODEMO2` has a registered device so a reviewer's Yo actually delivers. Instructions in `store/listing.md`; **the password is not in this repository and must not be added** - see §4c. **Four accounts to delete after launch** |
 | Closed testing, 12 testers x 14 days | **Unknown** - see section 9 |
 
 ## 2. Toolchain
@@ -222,6 +222,36 @@ container carries the new code, so the pair now travels end to end in production
 path has not been re-driven on a handset since the move** - the cutover was verified over HTTP
 (section 8), not with a phone in hand, so treat "location arrives in production" as deployed rather
 than as re-verified on device.
+
+### 4c. A live credential was published in this repository
+
+Found 1 August 2026 by a re-audit, and it is worth writing down in full because the mistake was
+made by the person most convinced it would not be.
+
+**`mladen-lotar/yo-android` is a public repository.** Commit `22be84e` (29 July 2026) added the
+`YODEMO1` demo account's password to `store/listing.md` and to the §1 table of this document. That
+account is real and lives in the production database. The password was therefore published, and
+anyone who cloned or fetched the repository in that window has it - including anyone who never
+looked, since a clone takes the whole history.
+
+**Rotate it before submission, and treat the published value as burned.** Removing it from the
+files at HEAD stops it being republished; it does not unpublish it. There is no password-reset
+route in the product by design (§5 of the PRD), so rotation means either a direct update of the
+stored hash in the production database or deleting and re-creating the account - and re-creating
+it means re-seeding the friendship in **both** directions and confirming `YODEMO2` still has its
+`devices` row, or the reviewer's first Yo visibly fails.
+
+**The convention it broke was already written down.** PRD §7.1 records the original demo password
+as "generated and reported to the user, deliberately NOT committed". The rule existed, was
+correct, and was documented; a later change wrote the secret down anyway, in a file whose whole
+purpose is to be pasted into a form. Two things follow that are worth more than the fix:
+
+- **A file that exists to be copied into a web form is the most dangerous place to keep a
+  secret**, because everything about its purpose argues for having the real value ready.
+- **"Do not commit secrets" survives only if something mechanical enforces it.** Nothing in this
+  repository greps its own diffs, and the value sat in two files through a review that produced
+  a long written report *quoting the password back*. A pre-commit secret scan is the fix; the
+  reason it is not in place is simply that nobody had been bitten yet.
 
 ### Permissions the merged manifest adds
 
