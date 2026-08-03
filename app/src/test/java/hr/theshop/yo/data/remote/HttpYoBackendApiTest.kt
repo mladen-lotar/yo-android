@@ -13,6 +13,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -42,14 +43,16 @@ import org.robolectric.RobolectricTestRunner
 class HttpYoBackendApiTest {
     private lateinit var server: LoopbackHttpServer
     private lateinit var api: HttpYoBackendApi
+    private lateinit var sessionStore: FakeSessionStore
 
     @Before
     fun startServer() {
         server = LoopbackHttpServer().also { it.start() }
+        sessionStore = FakeSessionStore()
         api =
             HttpYoBackendApi(
                 baseUrl = "http://${InetAddress.getLoopbackAddress().hostAddress}:${server.port}",
-                sessionStore = FakeSessionStore(),
+                sessionStore = sessionStore,
                 ioDispatcher = Dispatchers.IO,
             )
     }
@@ -201,6 +204,40 @@ class HttpYoBackendApiTest {
             }
 
         assertNotNull("an unparseable body must not be reported as a clean refusal", thrown)
+    }
+
+    // ---- the 401 guard --------------------------------------------------------------------
+    //
+    // TOKEN_TTL_SECONDS on the server is 90 days (backend/yo_server.py), so this path fires on
+    // nothing but the clock — the user never asked to sign out. It clears the session, and
+    // deliberately nothing else: this class holds no reference to history, groups or the device
+    // registration cache, so there is nothing here for it to wipe even if it wanted to.
+
+    @Test
+    fun `a 401 on an authenticated request clears the session`() = runTest {
+        server.responseStatus = 401
+        server.responseBody = """{"error":"invalid_token"}"""
+
+        // fetchFriends throws on a non-2xx response; the guard runs before that throw, so the
+        // session is already gone by the time this call surfaces its failure to the caller.
+        runCatching { api.fetchFriends() }
+
+        assertNull(sessionStore.current())
+        assertNull(sessionStore.session.value)
+    }
+
+    // The guard is exact rather than a blanket 401 check: a signed-out caller carries no
+    // Authorization header at all, so a 401 here (e.g. a bad login) must not be mistaken for a
+    // dead token that was never sent.
+    @Test
+    fun `a 401 with no token attached does not touch a session that was never there`() = runTest {
+        sessionStore.clear()
+        server.responseStatus = 401
+        server.responseBody = """{"error":"invalid_credentials"}"""
+
+        runCatching { api.fetchFriends() }
+
+        assertNull(sessionStore.current())
     }
 
     data class RecordedRequest(

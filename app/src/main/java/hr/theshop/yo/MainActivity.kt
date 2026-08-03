@@ -29,9 +29,12 @@ class MainActivity : ComponentActivity() {
     lateinit var sessionStore: SessionStore
 
     /**
-     * Asked for together on first launch so the user answers once instead of being interrupted
-     * later: notifications to receive a Yo, contacts to invite people to it. Both are requested
-     * only when missing, so a returning user sees nothing.
+     * Notifications only, requested when missing so a returning user sees nothing. Contacts used
+     * to be asked for here too, but `onCreate` runs before there is necessarily a signed-in
+     * account - a fresh install hits this on the sign-in screen, where there is nobody yet to
+     * invite anyone. `InviteSheet` in MainScreen already asks for READ_CONTACTS itself, in
+     * context, the moment the invite sheet actually opens; asking again here bought nothing but
+     * an earlier, less explicable prompt.
      */
     private val startupPermissionRequest =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
@@ -60,7 +63,6 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
-            add(Manifest.permission.READ_CONTACTS)
         }.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }

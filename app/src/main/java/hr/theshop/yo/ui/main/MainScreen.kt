@@ -392,8 +392,11 @@ internal sealed interface SendTarget {
      * asserting that creating a duplicate name yields a distinct group, so it is a deliberate
      * contract rather than an oversight. Keying the LazyColumn on the label therefore produced
      * duplicate keys, which Compose treats as a fatal error: the home screen crashed on every
-     * launch, and because groups are local and survive logout, the only ways out were Clear Data,
-     * reinstall, or account deletion - whose UI is behind the screen that is crash-looping.
+     * launch, and because groups were local and survived logout at the time this was written, the
+     * only ways out were Clear Data, reinstall, or account deletion - whose UI is behind the
+     * screen that is crash-looping. Signing out now clears them too, but that changes nothing
+     * about the key argument below either way: an id was always what made two identically-named
+     * groups distinguishable, regardless of how long either of them lives.
      *
      * A group's identity is its id. A friend's is their username, which the server guarantees is
      * unique. The label is what the band SAYS, and was never identity.

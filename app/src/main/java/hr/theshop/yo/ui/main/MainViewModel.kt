@@ -13,11 +13,11 @@ import hr.theshop.yo.data.remote.YoBackendApi
 import hr.theshop.yo.domain.model.YoMessage
 import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.repository.ContactsRepository
-import hr.theshop.yo.domain.repository.DeviceRegistrationStore
 import hr.theshop.yo.domain.repository.GroupRepository
 import hr.theshop.yo.domain.repository.SessionStore
 import hr.theshop.yo.domain.repository.YoRepository
 import hr.theshop.yo.domain.usecase.BuildInviteMessageUseCase
+import hr.theshop.yo.domain.usecase.ClearLocalAccountDataUseCase
 import hr.theshop.yo.domain.usecase.FetchFriendsUseCase
 import hr.theshop.yo.domain.usecase.FilterContactsUseCase
 import hr.theshop.yo.domain.usecase.RegisterDeviceUseCase
@@ -31,6 +31,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -47,13 +49,22 @@ class MainViewModel @Inject constructor(
     private val buildInviteMessage: BuildInviteMessageUseCase,
     private val filterContacts: FilterContactsUseCase,
     private val sessionStore: SessionStore,
-    private val deviceRegistrationStore: DeviceRegistrationStore,
+    private val clearLocalAccountData: ClearLocalAccountDataUseCase,
     private val backendApi: YoBackendApi,
     @param:InviteUrl private val inviteUrl: String,
 ) : ViewModel() {
     /** The signed-in account. Empty only in the instant before the sign-in screen takes over. */
     val username: String
         get() = sessionStore.current()?.username.orEmpty()
+
+    /**
+     * Captured once, at construction. MainActivity keys the composable's `hiltViewModel(key = ...)`
+     * on the username, so this same instance is what survives a sign-out and a sign-back-in as the
+     * SAME account — there is no fresh construction to hang re-registration off. [init] below
+     * therefore has to watch [sessionStore] for the rest of this instance's life rather than run
+     * once, and this is the account it is allowed to act for.
+     */
+    private val boundAccount: String = sessionStore.current()?.username.orEmpty()
 
     private val _friends = MutableStateFlow<List<String>>(emptyList())
     val friends: StateFlow<List<String>> = _friends.asStateFlow()
@@ -170,16 +181,36 @@ class MainViewModel @Inject constructor(
             initialValue = emptyList(),
         )
 
+    /**
+     * A collector rather than a one-shot block: see [boundAccount]. `sessionStore.session` is a
+     * StateFlow, so this still emits immediately on cold start and runs exactly one register and
+     * one loadFriends, same as before — but it also fires again on every later change, which is
+     * what lets the SAME account signing back in re-register instead of relying on an instance
+     * that is never recreated. A different account signing in on this instance is left alone
+     * entirely: MainActivity constructs a fresh ViewModel for a new username, and this one has
+     * nothing to do with an account it was never bound to.
+     */
     init {
         viewModelScope.launch {
-            registerDevice()
-            loadFriends()
+            sessionStore.session
+                .map { it?.username.orEmpty() }
+                .distinctUntilChanged()
+                .collect { current ->
+                    if (current != boundAccount) return@collect
+                    registerDevice()
+                    loadFriends()
+                }
         }
     }
 
     private suspend fun registerDevice() {
+        // Forced rather than left to the use case's own cache: that cache is keyed on
+        // (username, fcmToken), and the server deletes the devices row on logout (see backend
+        // `_handle_logout`), so the cache would otherwise report "already registered" for a
+        // registration the server has already forgotten, and the client would never re-POST
+        // /v1/register on the next sign-in.
         val outcome =
-            runCatching { registerDeviceUseCase() }
+            runCatching { registerDeviceUseCase(force = true) }
                 .getOrDefault(DeviceRegistrationOutcome.Failed)
         // NotSignedIn is not a failure: there is simply no account to bind a token to yet.
         _pushUnavailable.value = outcome == DeviceRegistrationOutcome.Failed
@@ -296,10 +327,18 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    /** Drops the token server-side first, so a stolen copy of it dies with the logout. */
+    /**
+     * Drops the token server-side first, so a stolen copy of it dies with the logout. Local data
+     * comes next: the server also deletes the devices row on logout now (see backend
+     * `_handle_logout`), and yoRepository/groupRepository are not scoped to an account either, so
+     * leaving them would show this account's history and the device-registration cache to
+     * whoever signs in next. The session is cleared LAST — clearing it first flips MainActivity
+     * to the sign-in screen and lets a fast re-login race the wipe still in flight.
+     */
     fun logOut() {
         viewModelScope.launch {
             backendApi.logOut()
+            clearLocalAccountData()
             sessionStore.clear()
         }
     }
@@ -329,11 +368,7 @@ class MainViewModel @Inject constructor(
                     _deleteAccountFailed.value = true
                     return@launch
                 }
-                runCatching {
-                    yoRepository.clear()
-                    groupRepository.clear()
-                    deviceRegistrationStore.clear()
-                }
+                clearLocalAccountData()
                 sessionStore.clear()
             } finally {
                 _deletingAccount.value = false

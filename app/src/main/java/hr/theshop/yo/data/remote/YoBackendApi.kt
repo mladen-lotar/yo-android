@@ -317,6 +317,13 @@ class HttpYoBackendApi(
                 // The guard is exact rather than a blanket 401 check: /v1/signup, /v1/login and
                 // /v1/google come through here too and legitimately answer 401 for a wrong
                 // password, but a signed-out caller has no token to attach.
+                //
+                // Deliberately clears ONLY the session, not history, groups or the device
+                // registration cache. TOKEN_TTL_SECONDS on the server is 90 days
+                // (backend/yo_server.py), so this path fires on nothing but the clock - the user
+                // did not ask to sign out, they just had the app closed for three months. Wiping
+                // local data on that timer would destroy it with no action behind it; ViewModel's
+                // logOut()/deleteAccount() clear local data because THOSE are the user asking.
                 if (authenticated && statusCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
                     sessionStore.clear()
                 }
