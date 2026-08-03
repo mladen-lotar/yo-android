@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -100,6 +101,16 @@ private const val LONG_LABEL_CHARS = 9
  * a link, so the gesture is period-correct). Everything else — history, group creation — lives
  * behind the red menu button, which is where Yo put its only non-list affordance.
  */
+/**
+ * The actual decision behind the notification-permission request below: ask only on a device that
+ * has the permission at all (POST_NOTIFICATIONS does not exist below Tiramisu, and asking there
+ * throws) and only when it is not already granted, so a returning user who already said yes sees
+ * nothing. Pulled out as a plain function because it is the one piece of this file that a JVM unit
+ * test can exercise directly - see MainScreenNotificationPermissionTest.
+ */
+internal fun shouldRequestNotificationPermission(sdkInt: Int, alreadyGranted: Boolean): Boolean =
+    sdkInt >= Build.VERSION_CODES.TIRAMISU && !alreadyGranted
+
 @Composable
 fun MainScreen(
     viewModel: MainViewModel = hiltViewModel(),
@@ -133,6 +144,32 @@ fun MainScreen(
         if (sendDeliveredTo != null) {
             delay(SENT_FLASH_MILLIS)
             viewModel.clearSendDelivered()
+        }
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) {}
+
+    // Moved here from MainActivity.onCreate: this composable only exists once a session does (see
+    // MainActivity's else-branch), so keying on the session's username fires once per session
+    // appearing - including a sign-up in this same launch, which lands here with no restart in
+    // between for onCreate to have gated on, and again on a fresh sign-in after a sign-out, since
+    // this composable is torn down and rebuilt by that same branch switch. A signed-out user
+    // never reaches this line at all.
+    LaunchedEffect(viewModel.username) {
+        // The SDK_INT check is repeated inline around both references to the permission string,
+        // not only inside shouldRequestNotificationPermission below: lint's InlinedApi check
+        // does not see through a function call to know the guard happened, and flags an unguarded
+        // use of a field that requires API 33 otherwise.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val alreadyGranted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (shouldRequestNotificationPermission(Build.VERSION.SDK_INT, alreadyGranted)) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
         }
     }
 
