@@ -37,7 +37,23 @@ MAX_HASHTAG_BYTES = 140
 # sender could attach the hashtag "x  ·  TAP TO OPEN paypal.com" and forge a second tap target in
 # somebody else's shade, wearing a name they recognise. \w is Unicode-aware here, so #worldcup and
 # #世界 both pass while spaces, control characters and the separator itself do not.
-HASHTAG_PATTERN = re.compile(r"\A[\w-]+\Z")
+#
+# Five of \w's own letters are exceptions to that: U+037A, U+115F, U+1160, U+3164 and U+FFA0
+# render as nothing (or as blank whitespace) in every mainstream renderer, so a hashtag built from
+# these instead of ASCII spaces reproduces the same forgery - "TAP TO OPEN paypal.com" spelled
+# with blanks - and a category-only charset rule still calls every one of them a letter. They are
+# excluded by exact codepoint, not by shape: dot-rendering letters such as U+1427 (Canadian
+# syllabics) are real letters in a real script and stay allowed. It is the missing WHITESPACE
+# that makes a forgery legible, not the dot.
+#
+# This is now a pattern of characters to STRIP rather than a shape the whole string must match -
+# see _optional_attachment. A hashtag's byte length still 400s: that cannot diverge between
+# processes. Its charset used to as well, and a modern handset's ICU and this process's Unicode
+# table disagree on which astral code points are even assigned yet (production has rejected a real
+# Chinese-name hashtag the sending phone accepted), so a 400 here failed the WHOLE Yo and G25's
+# retry re-issued that identical doomed request forever. Reject what cannot diverge; sanitise what
+# can.
+HASHTAG_PATTERN = re.compile(r"[^\w-]|[ͺᅟᅠㅤﾠ]")
 
 # A broadcast client id is delivered to every subscriber as the SENDER, landing in exactly the
 # position a username lands in - the app renders "From <SENDER>" with no charset filter of its
@@ -326,7 +342,7 @@ DOCUMENT_PAGE_TEMPLATE = """<!doctype html>
 """
 
 PRIVACY_PAGE_BODY = """<h1>Yo privacy policy</h1>
-<p class="updated">Last updated 28 July 2026. Yo is published by The Shop.</p>
+<p class="updated">Last updated 3 August 2026. Yo is published by The Shop.</p>
 
 <h2>The short version</h2>
 <p>Yo sends one word. It needs to know who you are and which device to wake, and it is not
@@ -338,6 +354,10 @@ of anything to anyone.</p>
   <li><strong>Your username.</strong> Chosen by you. It is how friends address you.</li>
   <li><strong>Your password, hashed.</strong> PBKDF2-HMAC-SHA256. The password itself is never
       stored and cannot be recovered from what is.</li>
+  <li><strong>A session key, hashed.</strong> Signing in creates one; only a hash of it is kept,
+      never the key itself, and each signed-in device holds its own. It stops working 90 days
+      after it was issued, and logging out removes that device's entry, and its notification
+      token, immediately.</li>
   <li><strong>A Google account identifier</strong>, if you sign in with Google: only Google's
       opaque subject id. Your email address is never stored.</li>
   <li><strong>A notification token</strong> for your device, issued by Firebase Cloud Messaging.
@@ -345,9 +365,12 @@ of anything to anyone.</p>
   <li><strong>Your friends and blocks</strong>, which are the usernames you added or blocked.</li>
   <li><strong>Your IP address, briefly</strong>, to rate-limit sign-ups and sending. It is not
       retained as a log of who you are.</li>
-  <li><strong>A server access log</strong>, which records the time, the address a request came
-      from, and which route it asked for - but not who you asked about. It rotates and is
-      discarded, and it exists to diagnose faults rather than to build a picture of anyone.</li>
+  <li><strong>A server access log</strong>, written as each request arrives and never edited
+      afterwards. It records the time, the address a request came from, and which route it asked
+      for - never who you asked about: a username only ever travels inside a request's body, and
+      any value in the query string is redacted before the line is written. Deleting your
+      account does not reach back into a log already written. It rotates on size, not on a
+      schedule, and the oldest file is discarded first as new ones fill up.</li>
 </ul>
 
 <h2>What passes through without being stored</h2>
@@ -368,9 +391,13 @@ is not written to our database. We carry it; we do not keep it.</p>
       to show an invite list. Only a name and a local id are ever held, never a phone number or
       an email address, and none of it is sent to us or to anyone else. Invitations are sent by
       whichever messaging app you pick, and Yo never learns who you chose.</li>
-  <li><strong>Your Yo history and groups.</strong> Stored locally and erased when you delete your
-      account or uninstall the app. Your groups never leave the phone at all: sending to a group
-      sends an ordinary Yo to each member, and we never learn that the group exists.</li>
+  <li><strong>Your Yo history and groups.</strong> Stored locally, never on our servers. Deleting
+      your account in the app, or logging out, erases it immediately. A deletion requested
+      because you could not open the app happens on our side first and is erased on your phone
+      the next time the app runs and finds the account gone. If it never runs again, uninstalling
+      removes it: the app does not back its data up to the cloud, so there is no copy anywhere
+      else for the uninstall to leave behind. Your groups never leave the phone at all: sending to
+      a group sends an ordinary Yo to each member, and we never learn that the group exists.</li>
 </ul>
 
 <h2>Who else sees it</h2>
@@ -378,17 +405,24 @@ is not written to our database. We carry it; we do not keep it.</p>
 link or a hashtag, they see that too.</p>
 <p>Google, in two narrow roles: Firebase Cloud Messaging carries the notification to your device -
 including anything you attached, since that travels inside the notification - and Google verifies
-the sign-in token if you choose "continue with Google". Nothing is shared with anyone else, and
-nothing is sold.</p>
+the sign-in token if you choose "continue with Google".</p>
+<p>Cloudflare sits in front of every request on its way to our server, the way any reverse proxy
+has to, which means it terminates the connection before we do. Hetzner is the company whose
+machine our server and its database run on. Both handle what passes through them only on our
+instructions, to route and to host what we already run, and neither uses it for any purpose of
+their own.</p>
+<p>Nothing is shared with anyone else, and nothing is sold.</p>
 
 <h2>How long we keep it</h2>
-<p>Until you delete your account. Deleting it removes everything above from the live service
+<p>Until you delete your account. Deleting it removes everything the database holds about you
 straight away.</p>
-<p>Backups are the one exception, and we would rather say so than leave you to assume otherwise:
-the database is backed up regularly so that a disk failure does not lose everyone's accounts, and
-a backup taken before you left still contains what you had at that moment. Those copies expire on
-their own within 30 days and are never used to bring an account back. Nothing is restored from
-them except to recover the service after a failure.</p>
+<p>Backups and the access log are the two exceptions, and we would rather say so than leave you to
+assume otherwise. The database is backed up regularly so that a disk failure does not lose
+everyone's accounts, and a backup taken before you left still contains what you had at that
+moment. Those copies expire on their own within 30 days and are never used to bring an account
+back. Nothing is restored from them except to recover the service after a failure. The access log
+is written continuously and a deletion does not reach back into lines already written; it still
+carries no username, and it rotates out on its own as described above.</p>
 
 <h2>Deleting your account</h2>
 <p>In the app: menu, then DELETE ACCOUNT. This erases your account, your friends, your blocks,
@@ -428,11 +462,17 @@ normally far sooner.</p>
   <li>Every sign-in session, on every device.</li>
   <li>Your friends and blocks - and you disappear from other people's friend lists.</li>
   <li>Your notification token, so no further Yo can reach you.</li>
-  <li>Your Yo history and groups held on your own phone.</li>
 </ul>
 <p>None of it can be undone, and nothing is kept in the live service afterwards. Backups taken
 before you left still hold what you had at that moment; they expire on their own within 30 days
 and are never used to restore an account.</p>
+
+<h2>What this cannot reach</h2>
+<p>A deletion requested this way happens on our server, which cannot reach inside a phone we do
+not control. If the app is opened again on that handset, it finds the account gone and clears its
+own local Yo history and groups at that point. If it is never opened again, the data leaves with
+the phone: the app keeps no cloud copy of it, so nothing survives for an uninstall to remove and
+nothing is left for us, or anyone else, to get to.</p>
 """
 
 
@@ -1113,10 +1153,32 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         # Bytes, not code points. FCM's data payload cap is 4096 BYTES, so a 2048-character link
         # of astral-plane characters is 8 KB on the wire: it would pass a len() check here, be
         # rejected by Google, and surface to the sender as a 502 that no retry can ever clear.
+        #
+        # Checked before any charset work, and left a 400: byte length is measured the same way
+        # regardless of which Unicode table this process or the sender's happens to know about, so
+        # it is the one property here that cannot diverge.
         if len(value.encode("utf-8")) > limit:
             raise BadRequestError(f"{key} must be at most {limit} bytes")
-        if key == "hashtag" and not HASHTAG_PATTERN.fullmatch(value.lstrip("#")):
-            raise BadRequestError("hashtag must be letters, digits, underscores or dashes")
+        if key == "hashtag":
+            # Sanitised, not rejected - see HASHTAG_PATTERN. A charset check keyed to this
+            # process's own Unicode table would 400 an astral character a modern handset already
+            # accepts as a letter, and the client's retry re-issues that identical doomed request
+            # forever. Stripping instead means an older table only ever narrows what a hashtag
+            # keeps, never fails the whole Yo over it.
+            #
+            # The leading hash is stripped for the same reason it always was - so "#worldcup"
+            # isn't punished for the hash the app itself would have added - but the rest of
+            # `value` is preserved untouched whenever nothing needed removing, so a hashtag that
+            # was already clean carries on unchanged rather than losing its leading hash.
+            candidate = value.lstrip("#")
+            sanitized = HASHTAG_PATTERN.sub("", candidate)
+            if not sanitized:
+                # An attachment that sanitises to nothing is an attachment that vanished, and
+                # that has to be reported for the same reason as the docstring above - not
+                # silently dropped.
+                raise BadRequestError("hashtag must be letters, digits, underscores or dashes")
+            if sanitized != candidate:
+                value = sanitized
         return value
 
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
@@ -1134,23 +1196,19 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 {"delivered": False, "reason": "rate_limited"},
             )
             return
-        if self.server.database.is_blocked(recipient, sender):
-            # Indistinguishable from a delivered Yo on purpose: telling the sender they were
-            # blocked turns the block into a notification for the person who was blocked.
-            #
-            # "Indistinguishable" has to include the clock. The body was always identical and the
-            # timing never was - two SQLite probes against an HTTPS round trip to Google, which
-            # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
-            # DeliveryCostEstimator; this spends what a delivery would have spent.
-            self.server.delivery_cost.sleep_to_match(started)
-            self._write_json(HTTPStatus.OK, {"delivered": True})
-            return
+        # Held rather than acted on immediately: evaluating this before the device lookup used to
+        # let a deviceless recipient answer 200 delivered:true for a blocked sender and 404
+        # recipient_unregistered for an unblocked one (G9) - the status code itself was the
+        # oracle, no timing needed. Every path below now does the same work in the same order
+        # regardless of `blocked`, so the two cases diverge only at the very end.
+        blocked = self.server.database.is_blocked(recipient, sender)
         fcm_token = self.server.database.get_fcm_token(recipient)
         if fcm_token is None:
             # A real account with no device is not a missing account. Reporting both as
             # "recipient_not_found" told senders their friend did not exist whenever that friend's
             # registration had quietly failed. This discloses nothing new: /v1/friends and /v1/block
-            # already answer "no_such_user" for names that do not exist.
+            # already answer "no_such_user" for names that do not exist. Unguarded by `blocked` on
+            # purpose - see the comment above.
             reason = (
                 "recipient_unregistered"
                 if self.server.database.account_exists(recipient)
@@ -1163,6 +1221,17 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                     "reason": reason,
                 },
             )
+            return
+        if blocked:
+            # Indistinguishable from a delivered Yo on purpose: telling the sender they were
+            # blocked turns the block into a notification for the person who was blocked.
+            #
+            # "Indistinguishable" has to include the clock. The body was always identical and the
+            # timing never was - two SQLite probes against an HTTPS round trip to Google, which
+            # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
+            # DeliveryCostEstimator; this spends what a delivery would have spent.
+            self.server.delivery_cost.sleep_to_match(started)
+            self._write_json(HTTPStatus.OK, {"delivered": True})
             return
         try:
             delivered = bool(

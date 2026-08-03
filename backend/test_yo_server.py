@@ -1244,24 +1244,91 @@ class SendAttachmentTest(YoServerTestCase):
             self.fcm_client.attachment_calls,
         )
 
+    def test_a_homoglyph_hashtag_cannot_forge_the_notification_body(self):
+        """RED-FIRST: five of \\w's own letters render as nothing in every mainstream renderer
+        (four Hangul fillers plus the Greek ypogegrammeni). A charset rule keyed on Unicode
+        category alone still calls them letters, so a hashtag spelled with these instead of
+        ASCII spaces reproduces the exact forgery the ASCII-space rule was written to stop -
+        without ever containing a literal space or the app's own "·" separator. U+1427
+        (a real letter, Canadian syllabics) is deliberately included and must NOT be stripped:
+        it is the missing whitespace that makes a forgery legible, not the dot."""
+        filler = "ㅤ"  # HANGUL FILLER - Unicode category Lo, renders as nothing
+        dot = "ᐧ"  # CANADIAN SYLLABICS FINAL MIDDLE DOT - a real letter, stays allowed
+        hostile = (
+            "x"
+            + filler * 2
+            + dot
+            + filler * 2
+            + "TAP"
+            + filler
+            + "TO"
+            + filler
+            + "OPEN"
+            + filler
+            + "paypal"
+            + dot
+            + "com"
+        )
+
+        status, body = self.send(hashtag=hostile)
+
+        self.assertEqual(200, status)
+        delivered_hashtag = self.fcm_client.attachment_calls[-1][3]
+        for blank_codepoint in "ͺᅟᅠㅤﾠ":
+            self.assertNotIn(
+                blank_codepoint,
+                delivered_hashtag,
+                f"delivered hashtag {delivered_hashtag!r} still carries a blank-rendering "
+                "code point, which forges the app's own separator",
+            )
+        # The dot survives - it is a real letter in a real script - but with the fillers gone
+        # there is no whitespace left to make it read as a separator between words.
+        self.assertIn(dot, delivered_hashtag)
+
     def test_a_hashtag_cannot_forge_the_notification_body(self):
         """The recipient's notification body is built by interpolating the hashtag between the
         app's own separators, and the app writes "TAP TO OPEN <host>" there for a real link. A
-        hashtag carrying that wording put a second, attacker-chosen tap promise in somebody
-        else's shade under a sender name they recognise. Length and type were checked; the
-        characters were not."""
-        forgeries = (
+        hashtag carrying that wording used to put a second, attacker-chosen tap promise in
+        somebody else's shade under a sender name they recognise, by evading a charset rule
+        expressed as `\\A[\\w-]+\\Z` - every one of these cases relies on a literal ASCII space
+        or the "·" separator, both of which that rule already refused. That made the rule look
+        sufficient without proving it, because a hashtag spelled with a blank-rendering LETTER
+        instead of a space passed the exact same rule (see
+        test_a_homoglyph_hashtag_cannot_forge_the_notification_body).
+
+        The real property, asserted here instead of seven examples that were all true by
+        construction: a hashtag with at least one legal character is now delivered - sanitised,
+        not 400ed, because rejecting the whole attachment over one bad character was G25's
+        retry loop - and whatever reaches the fcm client contains no space, no "·", and none of
+        the five letters that render as either."""
+        forgeries_with_a_survivor = (
             "x  ·  TAP TO OPEN paypal.com",
             "x\nFrom BANK",
             "x TAP TO OPEN",
             "· evil.com",
             "a b",
-            "#",
-            "###",
         )
 
-        for hashtag in forgeries:
+        for hashtag in forgeries_with_a_survivor:
             with self.subTest(hashtag=hashtag):
+                self.fcm_client.attachment_calls.clear()
+
+                status, body = self.send(hashtag=hashtag)
+
+                self.assertEqual(200, status)
+                self.assertEqual({"delivered": True}, body)
+                delivered_hashtag = self.fcm_client.attachment_calls[-1][3]
+                self.assertNotIn(" ", delivered_hashtag)
+                self.assertNotIn("·", delivered_hashtag)
+                for blank_codepoint in "ͺᅟᅠㅤﾠ":
+                    self.assertNotIn(blank_codepoint, delivered_hashtag)
+
+        # Sanitising can still land on nothing, and an attachment that vanishes is exactly the
+        # case _optional_attachment's own docstring exists to catch - so these still 400.
+        for hashtag in ("#", "###"):
+            with self.subTest(hashtag=hashtag):
+                self.fcm_client.attachment_calls.clear()
+
                 status, body = self.send(hashtag=hashtag)
 
                 self.assertEqual(400, status)
@@ -1279,6 +1346,60 @@ class SendAttachmentTest(YoServerTestCase):
 
                 self.assertEqual(200, status)
                 self.assertEqual(1, len(self.fcm_client.attachment_calls))
+
+    def test_an_astral_letter_this_process_barely_knows_about_still_sends(self):
+        """G30 was a category-shaped charset rule; this is the OTHER way one diverges. A modern
+        handset's ICU and this process's own Unicode table disagree on which astral code points
+        are even assigned yet - U+2EBF0 (CJK Extension I, real characters in real Chinese names)
+        is a real letter to a handset that resolves against a newer table than this process
+        does. Rejecting it 400s a hashtag the sending phone considered perfectly legal, and the
+        client's retry re-issues that identical doomed request forever (G25). Sanitising rather
+        than rejecting means this process's own table only ever narrows what survives - it can
+        never fail the whole Yo over a character it simply hasn't caught up to yet."""
+        astral_letter = "\U0002ebf0"
+        hashtag = "family" + astral_letter
+
+        status, body = self.send(hashtag=hashtag)
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(
+            [("bob-token", "ALICE", None, hashtag)],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_each_blank_rendering_letter_is_stripped_rather_than_rejected(self):
+        """U+037A, U+115F, U+1160, U+3164 and U+FFA0 are exactly the code points HASHTAG_PATTERN
+        now treats as disallowed even though Python's own \\w calls every one of them a letter -
+        each renders as nothing (or as blank whitespace) in every mainstream renderer, which is
+        what let G30's forgery hide inside a rule that only checked Unicode category. Checked
+        individually, so a future change to the excluded set is caught at the one code point
+        that regressed rather than only by a combined string."""
+        blank_codepoints = ("ͺ", "ᅟ", "ᅠ", "ㅤ", "ﾠ")
+        for codepoint in blank_codepoints:
+            with self.subTest(codepoint=hex(ord(codepoint))):
+                self.fcm_client.attachment_calls.clear()
+                hashtag = "a" + codepoint + "b"
+
+                status, body = self.send(hashtag=hashtag)
+
+                self.assertEqual(200, status)
+                self.assertEqual({"delivered": True}, body)
+                self.assertEqual(
+                    [("bob-token", "ALICE", None, "ab")],
+                    self.fcm_client.attachment_calls,
+                )
+
+    def test_the_200_response_never_echoes_the_sanitised_hashtag(self):
+        """The blocked-sender path returns `{"delivered": True}` with nothing else, on purpose -
+        indistinguishable from a real delivery is the whole point of that path. Echoing the
+        sanitised hashtag back here, on the path that actually sends, would reopen exactly that
+        gap: a sender could tell the two paths apart by whether the response body carried a
+        hashtag at all."""
+        status, body = self.send(hashtag="world cup")
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
 
     def test_an_attachment_is_never_written_to_the_database(self):
         """The privacy policy claims a link and a hashtag pass through without being stored, so
@@ -1586,6 +1707,81 @@ class SendTest(YoServerTestCase):
 
         self.assertEqual(400, status)
         self.assertEqual("bad_request", body["error"])
+
+
+class BlockedVsUnblockedStatusParityTest(YoServerTestCase):
+    """G9: the block check used to run BEFORE the device lookup, so a recipient with no
+    registered device answered 200 {"delivered": true} for a blocked sender and 404
+    recipient_unregistered for an unblocked one - the status code itself was the oracle, no
+    timing needed. Asserted as a property: the same send, once blocked and once not, against
+    otherwise identical fixtures, must answer with the identical (status, body)."""
+
+    def _run(self, recipient_state, blocked):
+        """Build one fresh sender/recipient pair in the given recipient_state, block the sender
+        if asked, send, and report (status, body, how many NEW fcm calls that send made)."""
+        suffix = f"{recipient_state}_{'blocked' if blocked else 'open'}".upper()
+        sender_name = f"SENDER_{suffix}"
+        recipient_name = f"RECIPIENT_{suffix}"
+        sender_token = self.signup(sender_name)
+
+        if recipient_state == "no_account":
+            pass
+        elif recipient_state == "no_device":
+            self.signup(recipient_name)
+        elif recipient_state == "with_device":
+            self.signup_with_device(recipient_name)
+        else:
+            raise AssertionError(f"unknown recipient_state: {recipient_state}")
+
+        if blocked:
+            # The HTTP route (`_handle_block`) requires `account_exists`, which the no_account
+            # case cannot satisfy - this reaches straight into the primitive it is built on to
+            # hold recipient_state and blocked-ness independent, exactly like every other case.
+            self.server.database.block(recipient_name, sender_name)
+
+        calls_before = len(self.fcm_client.calls)
+        status, body = self.request(
+            "POST", "/v1/send", {"recipient": recipient_name}, token=sender_token
+        )
+        return status, body, len(self.fcm_client.calls) - calls_before
+
+    def _assert_parity(self, recipient_state):
+        open_status, open_body, open_calls = self._run(recipient_state, blocked=False)
+        blocked_status, blocked_body, blocked_calls = self._run(recipient_state, blocked=True)
+        self.assertEqual((open_status, open_body), (blocked_status, blocked_body))
+        return open_status, open_body, open_calls, blocked_calls
+
+    def test_parity_when_the_recipient_has_no_account(self):
+        self._assert_parity("no_account")
+
+    def test_parity_when_the_recipient_has_no_device(self):
+        self._assert_parity("no_device")
+
+    def test_parity_when_the_recipient_has_a_device(self):
+        status, body, open_calls, blocked_calls = self._assert_parity("with_device")
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(1, open_calls, "the unblocked run must reach FCM")
+        self.assertEqual(0, blocked_calls, "the blocked run must never reach FCM")
+
+    def test_a_blocked_send_still_consumes_the_senders_rate_limit(self):
+        """Otherwise the quota counter becomes the oracle the status code no longer is."""
+        self.server.send_limiter = RateLimiter(1, SEND_WINDOW_SECONDS)
+        sender_token = self.signup("SENDER")
+        self.signup_with_device("BLOCKER")
+        self.server.database.block("BLOCKER", "SENDER")
+        self.signup("OTHER")
+
+        first_status, _ = self.request(
+            "POST", "/v1/send", {"recipient": "BLOCKER"}, token=sender_token
+        )
+        second_status, second_body = self.request(
+            "POST", "/v1/send", {"recipient": "OTHER"}, token=sender_token
+        )
+
+        self.assertEqual(200, first_status)
+        self.assertEqual(429, second_status)
+        self.assertEqual({"delivered": False, "reason": "rate_limited"}, second_body)
 
 
 class BroadcastTest(YoServerTestCase):
@@ -1980,6 +2176,65 @@ class PolicyPageTest(StaticPageTestCase):
             for secret_marker in (b"X-Yo-Token", b"Bearer ", b"YO_SERVER_KEY"):
                 self.assertNotIn(secret_marker, body, path)
 
+    def test_a_web_side_deletion_cannot_wipe_local_history_by_itself(self):
+        """The delete-account page's whole audience is people who cannot open the app, so a
+        promise that deletion erases their local history is untrue for every one of its
+        visitors: no client-side wipe ever fires for them. The copy must say what actually
+        happens - in-app deletion and logout erase it immediately, a deletion done for you is
+        erased next time the app runs and finds the account gone, and uninstalling removes it
+        only because there is no cloud copy - not repeat the old blanket claim."""
+        _, _, privacy_raw = self.raw_request("GET", "/privacy")
+        _, _, delete_raw = self.raw_request("GET", "/delete-account")
+        privacy = " ".join(privacy_raw.decode("utf-8").split())
+        delete_page = " ".join(delete_raw.decode("utf-8").split())
+
+        self.assertIn("logging out, erases it immediately", privacy)
+        self.assertIn("finds the account gone", privacy)
+        self.assertNotIn("held on your own phone", delete_page)
+        self.assertIn("cannot reach inside a phone we do not control", delete_page)
+
+    def test_the_privacy_policy_names_cloudflare_and_hetzner_as_processors(self):
+        """All traffic is proxied through Cloudflare, which terminates TLS and has demonstrably
+        rewritten served HTML, and the database is hosted on Hetzner - so 'nothing is shared
+        with anyone else' was untrue about the two companies that see or hold it. Both must be
+        named, without a hyperlink (an existing test forbids one), as processors bound to our
+        instructions rather than free agents."""
+        _, _, raw = self.raw_request("GET", "/privacy")
+        body = " ".join(raw.decode("utf-8").split())
+
+        self.assertIn("Cloudflare", body)
+        self.assertIn("Hetzner", body)
+        self.assertIn("only on our instructions", body)
+
+    def test_the_access_log_claim_matches_its_real_size_based_rotation(self):
+        """Rotation is size-based - 10 MB times 3 files, verified in the compose config - with
+        no time bound, so the policy must not invent a retention period for it. It must instead
+        say the log is append-only, that a deletion cannot reach back into it, and that it
+        rotates on size with the oldest file discarded first."""
+        _, _, body = self.raw_request("GET", "/privacy")
+        text = body.decode("utf-8")
+
+        start = text.index("access log")
+        end = text.index("</li>", start)
+        log_bullet = text[start:end]
+
+        self.assertIn("never edited", log_bullet)
+        self.assertIn("rotates on size", log_bullet)
+        self.assertIn("oldest", log_bullet)
+        self.assertNotIn("30 days", log_bullet)
+        self.assertIn("does not reach back into", text)
+
+    def test_the_privacy_policy_lists_the_session_token(self):
+        """The 'what we store' list omitted the session-token table entirely. Expiry is
+        enforced on read and swept at sign-in, not on a timer, so the copy must say the key
+        'stops working' after 90 days rather than implying a scheduled purge."""
+        _, _, raw = self.raw_request("GET", "/privacy")
+        body = " ".join(raw.decode("utf-8").split())
+
+        self.assertIn("session key", body)
+        self.assertIn("stops working 90 days after it was issued", body)
+        self.assertIn("logging out removes that device", body)
+
 
 class DeleteAccountTest(YoServerTestCase):
     """DELETE /v1/account - the in-app deletion Google Play requires."""
@@ -2051,15 +2306,67 @@ class DeleteAccountTest(YoServerTestCase):
         self.assertEqual(200, status)
         self.assertEqual([], body["friends"])
 
-    def test_blocks_are_cleared_in_both_directions(self):
+    def test_a_block_placed_on_the_deleted_user_survives_as_a_tombstone(self):
+        """The row is the blocker's safety control, not the deleted user's data - it costs
+        nothing to keep while the account behind `BOB` does not exist. `list_blocked` is asserted
+        alongside `is_blocked` because it runs a different query and `is_blocked` alone would
+        pass even for a row the list can no longer see."""
         alice = self.signup("ALICE")
         bob = self.signup("BOB")
         self.request("POST", "/v1/block", {"username": "BOB"}, token=alice)
 
         self.request("DELETE", "/v1/account", token=bob)
 
-        self.assertFalse(self.server.database.is_blocked("ALICE", "BOB"))
-        self.assertEqual([], self.server.database.list_blocked("ALICE"))
+        self.assertTrue(self.server.database.is_blocked("ALICE", "BOB"))
+        self.assertEqual(["BOB"], self.server.database.list_blocked("ALICE"))
+
+    def test_a_deleted_users_own_blocks_are_cleared(self):
+        """The direction that IS this user's data - blocks they placed on others - still goes."""
+        alice = self.signup("ALICE")
+        bob = self.signup("BOB")
+        self.request("POST", "/v1/block", {"username": "ALICE"}, token=bob)
+
+        self.request("DELETE", "/v1/account", token=bob)
+
+        self.assertFalse(self.server.database.is_blocked("BOB", "ALICE"))
+        self.assertEqual([], self.server.database.list_blocked("BOB"))
+
+    def test_a_reclaimed_username_stays_blocked_by_the_tombstone(self):
+        """End to end: ALICE blocks BOB, BOB deletes, BOB re-signs-up with the identical name and
+        registers a device, BOB sends to ALICE - nothing may arrive. Without the tombstone this is
+        a block-evasion path: delete, re-register the same name, reach the blocker again."""
+        alice = self.signup_with_device("ALICE")
+        bob = self.signup("BOB")
+        self.request("POST", "/v1/block", {"username": "BOB"}, token=alice)
+
+        self.request("DELETE", "/v1/account", token=bob)
+        new_bob = self.signup_with_device("BOB")
+
+        status, body = self.request(
+            "POST", "/v1/send", {"recipient": "ALICE"}, token=new_bob
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual([], self.fcm_client.calls)
+
+    def test_a_new_holder_does_not_inherit_the_old_holders_own_blocks(self):
+        """Inverse of the reclaim test above: the departed user's OWN blocks (rows where they were
+        the owner) do not carry over to whoever signs up as the same name next."""
+        old_bob = self.signup("BOB")
+        charlie = self.signup_with_device("CHARLIE")
+        self.request("POST", "/v1/block", {"username": "CHARLIE"}, token=old_bob)
+
+        self.request("DELETE", "/v1/account", token=old_bob)
+        new_bob = self.signup_with_device("BOB")
+
+        status, body = self.request(
+            "POST", "/v1/send", {"recipient": "BOB"}, token=charlie
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual([("bob-token", "CHARLIE")], self.fcm_client.calls)
 
     def test_the_registered_device_is_removed(self):
         alice = self.signup_with_device("ALICE")

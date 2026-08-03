@@ -328,7 +328,8 @@ narrower than a reviewer would guess, and both are load-bearing:
 | Name / username | Yes | No | App functionality | Chosen by the user; how friends address them |
 | Email address | **No** | No | - | Google sign-in stores only the opaque `sub` |
 | Password | Yes | No | Authentication | Stored as PBKDF2-HMAC-SHA256, never in clear |
-| User IDs | Yes | No | App functionality | FCM registration token; Google subject id |
+| User IDs | Yes | No | App functionality | Google subject id, if you sign in with Google |
+| Device or other IDs | Yes | No | App functionality | Firebase installation ID and the FCM registration token, both created automatically by `firebase-messaging`; they identify this installation, not the person using it |
 | Contacts | **No** | No | - | Read on device for the invite list. Only display name plus a local id, never a phone number or email, and never transmitted |
 | Precise location | Yes | **Yes** | App functionality | Optional. A single fix, only when the user turns on "attach location" for that Yo, relayed to the chosen recipient so they can open it on a map. Never continuous, never in the background |
 | Other in-app messages (link, hashtag) | Yes | **Yes** | App functionality | Optional, user-typed. Relayed to the chosen recipient in the push and **not stored on the server** - the backend validates and forwards, no table or column holds either |
@@ -338,7 +339,7 @@ narrower than a reviewer would guess, and both are load-bearing:
 Also declare: data is encrypted in transit (HTTPS); users can request deletion (in-app and at
 `/delete-account`); the app is not directed at children.
 
-**Two rows changed on 28 July 2026, and the form is simpler for it.**
+**Three rows have changed since launch, and the form is simpler and more accurate for it.**
 
 - **Photos is gone entirely**, because the feature is gone - see PRD G24. The row used to claim the
   photo was "scoped to sender and recipient", and that claim was never true in the way a reader
@@ -354,6 +355,14 @@ Also declare: data is encrypted in transit (HTTPS); users can request deletion (
   difference worth stating on the form is that the server does not retain them - it validates
   length and type, rejects anything malformed with a 400, and forwards. There is a test asserting no
   table or column holds either, which is what keeps this answer true as the schema changes.
+- **Device or other IDs is a new row, added 3 August 2026.** `firebase-messaging` pulls in Firebase
+  Installations as a dependency, so every install gets a Firebase installation ID - a value named,
+  in exactly that phrase, in Play's own definition of *Device or other IDs*. The FCM registration
+  token belongs in the same row for the same reason: it identifies this installation well enough to
+  wake it, not the person carrying it. The *User IDs* row is corrected to drop the FCM token and now
+  reads Google's subject id alone, the one identifier on this form that actually names a person. Of
+  everything in this section, this was the single most submission-relevant defect: an inaccurate
+  Data Safety declaration is itself a Play policy violation, independent of what the code does.
 
 **The location row is unchanged and stays "collected AND shared".** It is the one row on this form
 that is easy to get wrong. It changed when G20 was fixed (2026-07-27): until then "attach location"

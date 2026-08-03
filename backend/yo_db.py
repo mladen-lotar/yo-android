@@ -144,10 +144,27 @@ class YoDatabase:
         cleared here, in one transaction, so a partial failure cannot leave an account that is
         half-gone - unreachable but still holding its username.
 
-        `friendships` and `blocks` are cleared in BOTH directions. Clearing only the rows this
-        user owns would leave them in other people's friend lists: a name that can be tapped,
-        that answers `recipient_not_found`, and that cannot be removed by its owner because the
-        account behind it no longer exists.
+        `friendships` are cleared in BOTH directions. Clearing only the rows this user owns would
+        leave them in other people's friend lists: a name that can be tapped, that answers
+        `recipient_not_found`, and that cannot be removed by its owner because the account behind
+        it no longer exists.
+
+        `blocks` are cleared in ONE direction only: rows this user owns (blocks they placed on
+        other people). Rows where they are the `blocked` party - blocks other people placed ON
+        them - survive as tombstones. That row is the other user's safety control, not this
+        user's data, and it costs nothing to keep while this account does not exist. Erasing it
+        the same way friendships are erased reopens a block-evasion path: B blocks M, M deletes
+        their account (which used to clear B's block as a side effect), M re-registers the
+        identical username, and M reaches B again with B never told. `_handle_block` requires
+        `account_exists`, so a tombstone can only ever be a block that was genuinely in force at
+        deletion time - nothing else can seed this table, so it stays bounded. `_handle_unblock`
+        does not require `account_exists`, so the blocker can clear a tombstone for a vanished
+        name whenever they like.
+
+        Accepted cost: if the username is later claimed by a different person, that person is
+        silently blocked by a control meant for someone else. That fails safe rather than open,
+        and the blocker can lift it at any time with an ordinary unblock - they are just never
+        told they need to, same as any other block.
         """
         with self._connect() as connection:
             existed = connection.execute(
@@ -166,8 +183,8 @@ class YoDatabase:
                 (username, username),
             )
             connection.execute(
-                "DELETE FROM blocks WHERE owner = ? OR blocked = ?",
-                (username, username),
+                "DELETE FROM blocks WHERE owner = ?",
+                (username,),
             )
         return True
 

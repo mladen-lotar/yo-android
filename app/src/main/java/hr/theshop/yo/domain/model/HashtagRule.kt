@@ -15,11 +15,19 @@ package hr.theshop.yo.domain.model
  * the app - a space, the `·` separator, a newline, an RTL override - is removed rather than
  * escaped. `\p{L}` excludes format characters, so zero-width joiners go with the spaces.
  *
- * It is also the CLIENT half of a two-sided rule. The backend refuses anything outside
- * `\A[\w-]+\Z` with a 400 that fails the entire Yo, and G25's retry re-issues that request
- * forever - so the server's rejection has to be unreachable from our own client, not merely
- * present. `HashtagRuleTest` asserts that direction against the real character set rather than
- * against a handful of examples.
+ * It is also the CLIENT half of a two-sided rule. The backend sanitises anything outside
+ * `[\w-]` rather than 400ing (a 400 used to fail the entire Yo, and G25's retry re-issued that
+ * request forever) - so this side exists to make that server-side stripping unreachable in the
+ * first place, not merely survivable. `HashtagRuleTest` asserts that direction against concrete
+ * expected outputs rather than against a copy of the server's own regex.
+ *
+ * Five of `\p{L}`'s own letters are excluded by exact code point rather than by category:
+ * U+037A, U+115F, U+1160, U+3164 and U+FFA0 render as nothing (or as blank whitespace) in every
+ * mainstream renderer, so a hashtag spelled with these instead of ASCII spaces reproduces the
+ * same forgery a plain `\p{L}` filter was meant to stop - "TAP TO OPEN paypal.com" spelled with
+ * blanks passes a category-only check exactly as well as the real thing. Dot-rendering letters
+ * such as U+1427 (Canadian syllabics) stay allowed: they are real letters in a real script, and
+ * it is the missing WHITESPACE that makes a forgery legible, not the dot.
  */
 object HashtagRule {
     /**
@@ -27,14 +35,15 @@ object HashtagRule {
      */
     const val MAX_CHARS = 32
 
-    private val DISALLOWED = Regex("[^\\p{L}\\p{N}_-]")
+    private const val BLANK_RENDERING_CODEPOINTS = "ͺᅟᅠㅤﾠ"
+    private val DISALLOWED = Regex("[^\\p{L}\\p{N}_-]|[$BLANK_RENDERING_CODEPOINTS]")
 
     /**
      * The hashtag as it may be sent and shown, or null when nothing usable is left.
      *
      * "world cup" becomes "worldcup" rather than being rejected: it is the reading the user
-     * meant, it is what every other product does with a hashtag, and it keeps the server's rule
-     * intact by making its 400 unreachable instead of by relaxing it.
+     * meant, it is what every other product does with a hashtag, and it means the server's own
+     * sanitiser - see the class doc - has nothing left to strip for a well-behaved client.
      */
     fun sanitize(raw: String?): String? =
         raw?.takeIf { it.isNotBlank() }

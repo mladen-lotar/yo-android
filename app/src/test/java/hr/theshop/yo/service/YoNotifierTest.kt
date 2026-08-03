@@ -399,6 +399,37 @@ class YoNotifierTest {
         assertEquals(1, Regex("TAP TO OPEN").findAll(text).count())
     }
 
+    /**
+     * The test above relies on a literal ASCII space and the literal "·" separator - both of
+     * which `HashtagRule` already stripped before this defect was ever found, so that test could
+     * never have caught it. Five of `\p{L}`'s own letters (four Hangul fillers plus the Greek
+     * ypogegrammeni) render as blank space in every mainstream renderer, so the identical wording
+     * spelled with these instead of real spaces used to sail through unstripped and land in this
+     * exact sentence, between the app's own separators, reading as a second tap promise.
+     */
+    @Test
+    fun `a homoglyph hashtag cannot forge a second tap promise`() {
+        val filler = 'ㅤ' // HANGUL FILLER - category Lo, renders as nothing
+        val dot = 'ᐧ' // CANADIAN SYLLABICS FINAL MIDDLE DOT - a real letter, stays allowed
+        val hostile = "x" + filler.toString().repeat(2) + dot + filler.toString().repeat(2) +
+            "TAP" + filler + "TO" + filler + "OPEN" + filler + "paypal" + dot + "com"
+
+        val text =
+            body(
+                hashtag = hostile,
+                hasLink = true,
+                linkIsTappable = true,
+                linkHost = "example.com",
+            )
+
+        assertEquals(
+            "From ADA  ·  #x${dot}TAPTOOPENpaypal${dot}com  ·  TAP TO OPEN example.com",
+            text,
+        )
+        assertEquals(1, Regex("TAP TO OPEN").findAll(text).count())
+        assertFalse("no blank-rendering filler survived into the body", text.contains(filler))
+    }
+
     @Test
     fun `a homograph host is shown as punycode rather than as the domain it imitates`() {
         // U+0430 CYRILLIC SMALL LETTER A, which renders identically to ASCII 'a'.
