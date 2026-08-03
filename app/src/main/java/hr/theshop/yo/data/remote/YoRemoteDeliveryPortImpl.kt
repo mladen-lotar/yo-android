@@ -1,20 +1,25 @@
 package hr.theshop.yo.data.remote
 
 import hr.theshop.yo.domain.model.YoMessage
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.repository.YoRemoteDeliveryPort
 import javax.inject.Inject
 
 class YoRemoteDeliveryPortImpl @Inject constructor(
     private val backendApi: YoBackendApi,
 ) : YoRemoteDeliveryPort {
-    override suspend fun deliver(message: YoMessage): Boolean =
+    override suspend fun deliver(message: YoMessage): YoSendOutcome =
         // No sender argument: the backend derives it from this device's token.
         //
         // Every attachment on the message is named here on purpose. Anything left out is stored
         // in the sender's own history, rendered back to them as attached, and never seen by the
         // person they sent it to - which is how location (G20) and then link and hashtag (G23)
         // each shipped looking like features.
-        backendApi.sendYo(
+        //
+        // sendYoOutcome, not sendYo: the plain boolean collapses a permanent rejection and a
+        // transient failure into the same "false", which is exactly the distinction this port
+        // exists to carry through to YoRepositoryImpl.saveSent.
+        backendApi.sendYoOutcome(
             recipient = message.recipient,
             latitude = message.latitude,
             longitude = message.longitude,

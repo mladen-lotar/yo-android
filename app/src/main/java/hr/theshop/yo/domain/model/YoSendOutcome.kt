@@ -24,4 +24,18 @@ enum class YoSendOutcome {
 
     /** The request never got an answer: no network, DNS failure, timeout, unparseable body. */
     Unreachable,
+
+    /**
+     * The server looked at THIS request and refused it for a reason that will not change on a
+     * retry: a byte cap, a malformed recipient, a rate limit - any 4xx other than 401.
+     * Re-issuing the identical bytes gets the identical refusal, so unlike [NotDelivered] and
+     * [Unreachable] - both of which a retry can genuinely fix - a caller must never offer to
+     * retry this one.
+     *
+     * 401 is deliberately excluded: on this path it already means the session's token is dead -
+     * expired on the 90-day clock, or revoked outright by a logout or account deletion on
+     * another handset (see HttpYoBackendApi's guard) - not that this particular Yo was bad, so
+     * it is never reported as this case.
+     */
+    Rejected,
 }

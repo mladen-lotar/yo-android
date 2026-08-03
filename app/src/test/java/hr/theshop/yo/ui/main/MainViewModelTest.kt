@@ -19,6 +19,7 @@ import hr.theshop.yo.testing.TEST_USERNAME
 import hr.theshop.yo.domain.repository.GroupRepository
 import hr.theshop.yo.domain.repository.YoRepository
 import hr.theshop.yo.domain.usecase.BuildInviteMessageUseCase
+import hr.theshop.yo.domain.usecase.ClearLocalAccountDataUseCase
 import hr.theshop.yo.domain.usecase.FetchFriendsUseCase
 import hr.theshop.yo.domain.usecase.FilterContactsUseCase
 import hr.theshop.yo.domain.usecase.RegisterDeviceUseCase
@@ -471,6 +472,31 @@ class MainViewModelTest {
         assertNull(viewModel.sendFailure.value)
     }
 
+    // THE RED-FIRST TEST. A rejection is the server refusing THIS request for a reason that
+    // will not change - a byte cap, a malformed recipient, a rate limit. Re-issuing the
+    // identical bytes gets the identical refusal forever, which is exactly the loop the
+    // hashtag-sanitisation fix closed for one specific case and this outcome closes in general.
+    @Test
+    fun `retrySend refuses to re-issue a send the server permanently rejected`() = runTest {
+        val repository = FakeYoRepository(outcome = YoSendOutcome.Rejected)
+        val viewModel = createViewModel(repository = repository)
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.sendYo("Alice", link = "https://example.com", hashtag = "worldcup")
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, repository.savedMessages.size)
+        assertEquals("Alice", viewModel.sendFailure.value?.label)
+        assertEquals(YoSendOutcome.Rejected, viewModel.sendFailure.value?.outcome)
+
+        viewModel.retrySend()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        // No second attempt was ever saved: retrying a rejected send would just re-send the
+        // identical doomed request.
+        assertEquals(1, repository.savedMessages.size)
+        // The failure band is left exactly as it was - a rejection is not "fixed" by a no-op tap.
+        assertEquals(YoSendOutcome.Rejected, viewModel.sendFailure.value?.outcome)
+    }
+
     @Test
     fun `retrySend does nothing when nothing has failed`() = runTest {
         val repository = FakeYoRepository()
@@ -843,6 +869,57 @@ class MainViewModelTest {
         assertFalse(viewModel.friendsLoadFailed.value)
     }
 
+    // THE RELEASE BLOCKER. The server deletes the devices row on logout (_handle_logout,
+    // yo_server.py), so a client that still thinks it is registered for the same (username,
+    // fcmToken) pair never re-POSTs /v1/register, and the account is unreachable by push from
+    // the moment it signs back in until the token happens to rotate on its own. Driving
+    // sessionStore directly rather than calling viewModel.logOut() / constructing a second
+    // ViewModel is deliberate: MainActivity keys the ViewModel on username, so the production
+    // instance survives a sign-out/sign-in of the SAME account, and that reused instance is
+    // exactly what has to notice the session changed and register again.
+    @Test
+    fun `signing back in as the same account registers the device again`() = runTest {
+        val sessionStore = FakeSessionStore(YoSession(username = TEST_USERNAME, token = "token-1"))
+        val backendApi = FakeYoBackendApi()
+        // Constant across the logout: only the session token changes, mirroring a real device
+        // whose FCM token has not rotated.
+        val tokenProvider = FakeFcmTokenProvider()
+        val viewModel =
+            createViewModel(
+                backendApi = backendApi,
+                sessionStore = sessionStore,
+                tokenProvider = tokenProvider,
+            )
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, backendApi.registeredTokens.size)
+
+        sessionStore.clear()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        sessionStore.save(YoSession(username = TEST_USERNAME, token = "token-2"))
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(2, backendApi.registeredTokens.size)
+    }
+
+    // The mirror image: a ViewModel bound to one account must stay inert for a different
+    // account's session, or a stale instance would register and fetch on somebody else's behalf.
+    @Test
+    fun `a stale instance does not register or fetch when a different username signs in`() = runTest {
+        val sessionStore = FakeSessionStore(YoSession(username = TEST_USERNAME, token = "token-1"))
+        val backendApi = FakeYoBackendApi(friends = listOf("ADA"))
+        val viewModel = createViewModel(backendApi = backendApi, sessionStore = sessionStore)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, backendApi.registeredTokens.size)
+        assertEquals(1, backendApi.fetchCount)
+
+        sessionStore.save(YoSession(username = "SOMEONE_ELSE", token = "token-2"))
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(1, backendApi.registeredTokens.size)
+        assertEquals(1, backendApi.fetchCount)
+    }
+
     @Test
     fun `a device that cannot register for push says so`() = runTest {
         // Gap G17: this used to be swallowed entirely, so an unreachable phone looked healthy and
@@ -884,6 +961,25 @@ class MainViewModelTest {
         dispatcher.scheduler.advanceUntilIdle()
 
         assertFalse(viewModel.pushUnavailable.value)
+    }
+
+    /**
+     * Pins force=true directly: cold start already registered and cached the result, so a
+     * cache-trusting retry would short-circuit on RegisterDeviceUseCase.kt:36 and never reach the
+     * server at all — which is exactly why this was the one repair button that could not repair
+     * anything.
+     */
+    @Test
+    fun `retryDeviceRegistration re-asks the server rather than trusting the cache`() = runTest {
+        val backendApi = FakeYoBackendApi()
+        val viewModel = createViewModel(backendApi = backendApi)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, backendApi.registeredTokens.size)
+
+        viewModel.retryDeviceRegistration()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(2, backendApi.registeredTokens.size)
     }
 
     @Test
@@ -1328,6 +1424,103 @@ class MainViewModelTest {
         assertTrue(registrationStore.cleared)
     }
 
+    /**
+     * The logout twin of the test above. logOut() did not used to clear any local data at all —
+     * the server started deleting the devices row on logout too, and a client that kept believing
+     * it was registered for the same (username, fcmToken) pair never re-registered on the next
+     * sign-in. Without this, deleteAccount's clear was the ONLY path that ever emptied history,
+     * groups or the registration cache, and logging out is the far more common of the two.
+     */
+    @Test
+    fun `logging out erases what this device stored`() = runTest {
+        val repository = FakeYoRepository()
+        val groupRepository = FakeGroupRepository()
+        val registrationStore = FakeDeviceRegistrationStore()
+        val viewModel =
+            createViewModel(
+                repository = repository,
+                groupRepository = groupRepository,
+                registrationStore = registrationStore,
+            )
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.sendYo(recipient = "ANA")
+        groupRepository.createGroup(name = "CREW", memberUsernames = listOf("ANA"))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(repository.observeHistory().first().isNotEmpty())
+
+        viewModel.logOut()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(emptyList<YoMessage>(), repository.observeHistory().first())
+        assertEquals(emptyList<Group>(), groupRepository.observeGroups().first())
+        assertTrue(registrationStore.cleared)
+    }
+
+    /**
+     * Each clear runs in its own runCatching rather than one wrapping all three: a fake whose
+     * yoRepository.clear() throws must not stop groups or the registration cache from being
+     * cleared right beside it. One shared runCatching around all three would let the first
+     * failure abort the rest, silently leaving groups and the registration cache behind for
+     * whoever signs in next on this device.
+     */
+    @Test
+    fun `a throwing repository clear does not stop groups or the registration cache from clearing`() =
+        runTest {
+            val repository = FakeYoRepository(clearFailure = IOException("disk full"))
+            val groupRepository = FakeGroupRepository()
+            val registrationStore = FakeDeviceRegistrationStore()
+            val viewModel =
+                createViewModel(
+                    repository = repository,
+                    groupRepository = groupRepository,
+                    registrationStore = registrationStore,
+                )
+            dispatcher.scheduler.advanceUntilIdle()
+            groupRepository.createGroup(name = "CREW", memberUsernames = listOf("ANA"))
+            dispatcher.scheduler.advanceUntilIdle()
+
+            viewModel.logOut()
+            dispatcher.scheduler.advanceUntilIdle()
+
+            assertEquals(emptyList<Group>(), groupRepository.observeGroups().first())
+            assertTrue(registrationStore.cleared)
+        }
+
+    /**
+     * HttpYoBackendApi's 401 guard clears the session directly, entirely outside MainViewModel,
+     * on nothing but TOKEN_TTL_SECONDS expiring — no user action behind it (see the comment at
+     * YoBackendApi.kt:320). Wiping local data on that timer would destroy it with no action
+     * behind it, so this pins that only an explicit logOut() or deleteAccount() may ever clear
+     * local data; the session disappearing on its own must not.
+     */
+    @Test
+    fun `the session disappearing on its own clears nothing but the session`() = runTest {
+        val repository = FakeYoRepository()
+        val groupRepository = FakeGroupRepository()
+        val registrationStore = FakeDeviceRegistrationStore()
+        val sessionStore = FakeSessionStore()
+        val viewModel =
+            createViewModel(
+                repository = repository,
+                groupRepository = groupRepository,
+                registrationStore = registrationStore,
+                sessionStore = sessionStore,
+            )
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.sendYo(recipient = "ANA")
+        groupRepository.createGroup(name = "CREW", memberUsernames = listOf("ANA"))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(repository.observeHistory().first().isNotEmpty())
+
+        // Mirrors what the 401 guard does directly: clear the session, nothing else.
+        sessionStore.clear()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(repository.observeHistory().first().isNotEmpty())
+        assertTrue(groupRepository.observeGroups().first().isNotEmpty())
+        assertFalse(registrationStore.cleared)
+    }
+
     @Test
     fun `a second tap while deleting does not delete twice`() = runTest {
         val backendApi = FakeYoBackendApi()
@@ -1376,7 +1569,12 @@ class MainViewModelTest {
             buildInviteMessage = BuildInviteMessageUseCase(),
             filterContacts = FilterContactsUseCase(),
             sessionStore = sessionStore,
-            deviceRegistrationStore = registrationStore,
+            clearLocalAccountData =
+                ClearLocalAccountDataUseCase(
+                    yoRepository = repository,
+                    groupRepository = groupRepository,
+                    deviceRegistrationStore = registrationStore,
+                ),
             backendApi = backendApi,
             inviteUrl = INVITE_URL,
         )
@@ -1398,6 +1596,8 @@ class MainViewModelTest {
 
     private class FakeYoRepository(
         var outcome: YoSendOutcome = YoSendOutcome.Delivered,
+        /** Set to make `clear()` throw, so a test can prove the other two clears run anyway. */
+        private val clearFailure: Throwable? = null,
     ) : YoRepository {
         private val state = MutableStateFlow<List<YoMessage>>(emptyList())
 
@@ -1431,6 +1631,7 @@ class MainViewModelTest {
         override fun observeHistory(): Flow<List<YoMessage>> = state
 
         override suspend fun clear() {
+            clearFailure?.let { throw it }
             state.value = emptyList()
             savedMessages.clear()
         }
@@ -1507,6 +1708,14 @@ class MainViewModelTest {
         var sessionAtLogOut: YoSession? = null
             private set
 
+        /** Every fcmToken this fake ever saw posted through `/v1/register`. */
+        val registeredTokens = mutableListOf<String>()
+
+        override suspend fun register(fcmToken: String): Boolean {
+            registeredTokens += fcmToken
+            return true
+        }
+
         override suspend fun fetchFriends(): List<String> {
             fetchCount += 1
             friendsFailure?.let { throw it }
@@ -1578,16 +1787,33 @@ class MainViewModelTest {
         }
     }
 
+    /**
+     * Backed by a real set rather than the hardcoded `isRegistered() = false` this replaced. That
+     * hardcoding made the short-circuit RegisterDeviceUseCase.kt:36 relies on unreachable from
+     * every test in this file, which is why 1,593 lines of tests never caught a device staying
+     * registered against a stale (username, fcmToken) pair after the server had already forgotten
+     * it.
+     */
     private class FakeDeviceRegistrationStore : DeviceRegistrationStore {
+        private val registered = mutableSetOf<DeviceRegistration>()
+
         var cleared = false
             private set
 
-        override fun isRegistered(registration: DeviceRegistration): Boolean = false
+        var clearCount = 0
+            private set
 
-        override fun markRegistered(registration: DeviceRegistration) = Unit
+        override fun isRegistered(registration: DeviceRegistration): Boolean =
+            registration in registered
+
+        override fun markRegistered(registration: DeviceRegistration) {
+            registered += registration
+        }
 
         override fun clear() {
             cleared = true
+            clearCount += 1
+            registered.clear()
         }
     }
 }

@@ -35,7 +35,8 @@ class YoMessageTransmissionTest {
     private companion object {
         /**
          * Reaches the recipient. Every name here must be named in
-         * `YoRemoteDeliveryPortImpl.deliver`'s call to `sendYo`, which the second test checks.
+         * `YoRemoteDeliveryPortImpl.deliver`'s call to `sendYoOutcome`, which the second test
+         * checks.
          */
         val TRANSMITTED =
             setOf(

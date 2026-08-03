@@ -4,6 +4,7 @@ import hr.theshop.yo.domain.model.AuthFailure
 import hr.theshop.yo.domain.model.AuthResult
 import hr.theshop.yo.domain.model.GoogleAuthResult
 import hr.theshop.yo.domain.location.LocationLink
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.model.YoSession
 import hr.theshop.yo.domain.repository.SessionStore
 import java.io.IOException
@@ -68,6 +69,28 @@ interface YoBackendApi {
         link: String? = null,
         hashtag: String? = null,
     ): Boolean
+
+    /**
+     * The full-fidelity verdict [sendYo] collapses into a single boolean for callers that only
+     * ever cared whether the Yo arrived. [hr.theshop.yo.data.remote.YoRemoteDeliveryPortImpl]
+     * uses this one instead, specifically because [hr.theshop.yo.domain.model.YoSendOutcome.Rejected]
+     * needs to survive as far as [hr.theshop.yo.domain.repository.YoRepository.saveSent] and a
+     * `Boolean` cannot carry a third case.
+     *
+     * The distinction this exists to draw: [hr.theshop.yo.domain.model.YoSendOutcome.Rejected] is
+     * the server refusing THIS request for a reason a retry cannot change (a byte cap, a
+     * malformed recipient, a rate limit - any 4xx that is not 401), while
+     * [hr.theshop.yo.domain.model.YoSendOutcome.NotDelivered] and
+     * [hr.theshop.yo.domain.model.YoSendOutcome.Unreachable] both describe something a retry can
+     * genuinely fix.
+     */
+    suspend fun sendYoOutcome(
+        recipient: String,
+        latitude: Double? = null,
+        longitude: Double? = null,
+        link: String? = null,
+        hashtag: String? = null,
+    ): YoSendOutcome
 }
 
 class HttpYoBackendApi(
@@ -239,7 +262,18 @@ class HttpYoBackendApi(
         longitude: Double?,
         link: String?,
         hashtag: String?,
-    ): Boolean {
+    ): Boolean =
+        sendYoOutcome(recipient, latitude, longitude, link, hashtag) == YoSendOutcome.Delivered
+
+    // See the interface doc for why this exists as a distinct method rather than widening
+    // sendYo's own signature.
+    override suspend fun sendYoOutcome(
+        recipient: String,
+        latitude: Double?,
+        longitude: Double?,
+        link: String?,
+        hashtag: String?,
+    ): YoSendOutcome {
         // No sender field: spoofing another user is impossible because the server reads the
         // sender off the bearer token.
         val body =
@@ -259,9 +293,33 @@ class HttpYoBackendApi(
                 }
                 .toString()
         val response = execute(method = "POST", path = "/v1/send", body = body)
-        // Not `isSuccessful` alone: an unconfigured FCM answers 200 with delivered:false, so
-        // treating any 2xx as sent would report every such Yo as having arrived.
-        return response.isSuccessful && JSONObject(response.body).optBoolean("delivered", false)
+        if (response.isSuccessful) {
+            // Not `isSuccessful` alone: an unconfigured FCM answers 200 with delivered:false, so
+            // treating any 2xx as sent would report every such Yo as having arrived.
+            return if (JSONObject(response.body).optBoolean("delivered", false)) {
+                YoSendOutcome.Delivered
+            } else {
+                YoSendOutcome.NotDelivered
+            }
+        }
+        // A 401 already means something else on this path: execute()'s guard above has just
+        // cleared the session because the token is dead - expired on the 90-day clock, or
+        // revoked outright by a logout or account deletion on another handset (see backend
+        // `_handle_logout`/`_handle_delete_account`, both of which invalidate the token
+        // server-side) - not because this particular Yo was bad. Folding it into Rejected would
+        // give the same status code a second, conflicting meaning.
+        if (response.statusCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
+            return YoSendOutcome.NotDelivered
+        }
+        // Any other 4xx is the server refusing this request specifically - re-issuing the
+        // identical bytes gets the identical refusal. 5xx and transport failures (the latter
+        // never reach this line - execute() lets its IOException propagate) are the server or
+        // the network being broken right now, which is exactly what a retry is for.
+        return if (response.statusCode in 400..499) {
+            YoSendOutcome.Rejected
+        } else {
+            YoSendOutcome.NotDelivered
+        }
     }
 
     private fun encode(value: String): String = URLEncoder.encode(value, Charsets.UTF_8.name())
@@ -317,6 +375,17 @@ class HttpYoBackendApi(
                 // The guard is exact rather than a blanket 401 check: /v1/signup, /v1/login and
                 // /v1/google come through here too and legitimately answer 401 for a wrong
                 // password, but a signed-out caller has no token to attach.
+                //
+                // Deliberately clears ONLY the session, not history, groups or the device
+                // registration cache. TOKEN_TTL_SECONDS on the server is 90 days
+                // (backend/yo_server.py), so a token dies on that clock alone about as often as it
+                // dies for any other reason - but the clock is not the only way it dies: logging
+                // out or deleting the account from another handset revokes the same token
+                // server-side (see `_handle_logout`'s `delete_token` and `_handle_delete_account`
+                // in backend/yo_server.py, both reachable independently of this device). Either
+                // way the user did not ask THIS session to end, so wiping local data here would
+                // destroy it with no action behind it on this handset; ViewModel's
+                // logOut()/deleteAccount() clear local data because THOSE are the user asking.
                 if (authenticated && statusCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
                     sessionStore.clear()
                 }

@@ -8,12 +8,13 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from traceback import format_exc
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 import yo_auth
@@ -37,7 +38,45 @@ MAX_HASHTAG_BYTES = 140
 # sender could attach the hashtag "x  ·  TAP TO OPEN paypal.com" and forge a second tap target in
 # somebody else's shade, wearing a name they recognise. \w is Unicode-aware here, so #worldcup and
 # #世界 both pass while spaces, control characters and the separator itself do not.
-HASHTAG_PATTERN = re.compile(r"\A[\w-]+\Z")
+#
+# Five of \w's own letters are exceptions to that: U+037A, U+115F, U+1160, U+3164 and U+FFA0
+# render as nothing (or as blank whitespace) in every mainstream renderer, so a hashtag built from
+# these instead of ASCII spaces reproduces the same forgery - "TAP TO OPEN paypal.com" spelled
+# with blanks - and a category-only charset rule still calls every one of them a letter. They are
+# excluded by exact codepoint, not by shape: dot-rendering letters such as U+1427 (Canadian
+# syllabics) are real letters in a real script and stay allowed. It is the missing WHITESPACE
+# that makes a forgery legible, not the dot.
+#
+# This is now a pattern of characters to STRIP rather than a shape the whole string must match -
+# see _optional_attachment. A hashtag's byte length still 400s: that cannot diverge between
+# processes. Its charset used to as well, and a modern handset's ICU and this process's Unicode
+# table disagree on which astral code points are even assigned yet (production has rejected a real
+# Chinese-name hashtag the sending phone accepted), so a 400 here failed the WHOLE Yo and G25's
+# retry re-issued that identical doomed request forever. Reject what cannot diverge; sanitise what
+# can.
+HASHTAG_PATTERN = re.compile(r"[^\w-]|[ͺᅟᅠㅤﾠ]")
+
+# \w does not cover Unicode categories Mn (non-spacing mark) or Mc (spacing combining mark), so
+# HASHTAG_PATTERN alone stripped every combining mark exactly as unconditionally as it strips a
+# literal space. That is not narrowing a hashtag, it is corrupting one: Devanagari and Arabic
+# spell a real word by attaching a vowel sign or virama/harakat to the letter in front of it, and
+# a category-blind strip reduces "नमस्ते" (namaste) to "नमसत", a consonant skeleton that reads as
+# nonsense - see _optional_attachment and test_a_devanagari_hashtag_keeps_its_vowel_signs. A
+# character in HASHTAG_MARK_CATEGORIES is admitted in addition to HASHTAG_PATTERN's [\w-],
+# provided it is not one of the five codepoints above, which is automatic: none of those five is
+# Mn or Mc (they are Lm/Lo), so widening here cannot let any of them back in.
+#
+# This cannot reopen the forgery HASHTAG_PATTERN exists to stop. Unicode's General Category is a
+# strict partition, so a code point that is Mn or Mc can never simultaneously be Zs (a literal
+# space) or the Po that '·' belongs to - see test_mn_and_mc_can_never_be_space_or_middle_dot. A
+# combining mark is also zero-width by definition: it draws on the character before it rather
+# than occupying a column of its own, so unlike the five excluded letters above it cannot
+# reproduce the VISIBLE word-separating width that made "TAP TO OPEN" read as three words in the
+# first place.
+#
+# A mark has no meaning without the base character it modifies, so a hashtag left with nothing
+# but marks after sanitising is treated as an attachment that vanished - see _optional_attachment.
+HASHTAG_MARK_CATEGORIES = ("Mn", "Mc")
 
 # A broadcast client id is delivered to every subscriber as the SENDER, landing in exactly the
 # position a username lands in - the app renders "From <SENDER>" with no charset filter of its
@@ -185,7 +224,8 @@ class RateLimiter:
 
 
 class DeliveryCostEstimator:
-    """A running estimate of what delivering a Yo costs, so refusing to can cost the same.
+    """A shared deadline both a blocked and a delivered send are padded to, so refusing to
+    deliver costs exactly what delivering does.
 
     A block answers `200 {"delivered":true}` and sends nothing, which is deliberate: telling a
     sender they were blocked turns the block into a notification for the person who was blocked.
@@ -194,6 +234,19 @@ class DeliveryCostEstimator:
     blocked p50 0.79 ms, delivered p50 116.69 ms, ranges disjoint by 110 ms. Against production's
     own jitter (yo.the-shop.io /healthz p50 42 ms, IQR 4 ms) a min-of-three classifier separates
     them essentially perfectly, and the sender is allowed 60 sends a minute.
+
+    Padding only the blocked branch to a single scalar mean was still two independent leaks.
+    First, a delivered send was never padded at all, so it landed anywhere in the real FCM
+    round-trip distribution while a blocked send landed almost exactly on the mean of that
+    distribution - a min-of-N classifier still separates a point mass from the distribution it
+    was drawn from, even with identical means, because the variance differs. Second, the estimate
+    cold-starts at a laptop number every restart (see `_INITIAL_SECONDS` below) and decays toward
+    the real production cost only after roughly a dozen deliveries, so a blocked send is briefly
+    slower than a real one in the opposite direction, in memory only, reopened by every deploy.
+    Both are fixed the same way: there is no per-branch pad to get wrong if both branches sleep to
+    one shared deadline. That makes the property structural rather than statistical - both become
+    the same point mass, so there is no distribution left to model - and it subsumes the
+    cold-start problem too, since a wrong deadline is now a latency bug, not a leak.
 
     So the one control whose threat model explicitly names the sender as the adversary announced
     itself to that adversary. This is the same defect the login path had, in the same week -
@@ -206,29 +259,79 @@ class DeliveryCostEstimator:
     the other, and wrong in the direction of leaking again.
     """
 
-    # Weight on each new observation. Low enough that one slow outlier does not move the estimate
-    # much, high enough to follow a real change in where FCM is being reached from.
-    _SMOOTHING = 0.2
+    # How many recent delivery durations the deadline is drawn from. Bounded so a long-dead
+    # deployment's early traffic eventually ages out rather than permanently biasing the window.
+    _WINDOW_SIZE = 128
 
-    def __init__(self, initial_seconds: float = 0.12):
-        self._seconds = initial_seconds
+    # The percentile the deadline sits at, not the mean: the deadline must sit above almost every
+    # real delivery, or the tail below it is exactly the leak this class exists to remove. Not
+    # `max` either - a single outlier would pad every send for the rest of the window.
+    _PAD_PERCENTILE = 0.95
+
+    # Every restart starts with an empty window, and an empty (or otherwise degenerate) window
+    # must not collapse the pad to zero - that would reopen the exact leak this class fixes.
+    # Deliberately still a laptop-shaped number, not a guessed production one: once both branches
+    # share a deadline this constant is a latency knob, not a security boundary, and it errs slow,
+    # which is the safe side. A module constant, not an environment variable, for the same reason.
+    _INITIAL_SECONDS = 0.12
+
+    # However bad a stretch of real FCM latency gets, no Yo should be made to wait longer than
+    # this for the sake of matching it.
+    _CEILING_SECONDS = 1.0
+
+    def __init__(
+        self,
+        initial_seconds: float = _INITIAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self._floor = initial_seconds
+        self._durations: Deque[float] = deque(maxlen=self._WINDOW_SIZE)
         self._lock = threading.Lock()
+        # Injected rather than called directly, so a test can assert on the EFFECT - the
+        # instant both branches sleep to - instead of only that some sleep function was called,
+        # which passes even when the two branches disagree on when to stop.
+        self._clock = clock
+        self._sleeper = sleeper
 
     def observe(self, seconds: float) -> None:
-        with self._lock:
-            self._seconds = (self._seconds * (1 - self._SMOOTHING)) + (
-                seconds * self._SMOOTHING
-            )
+        """Record what a real delivery cost.
 
-    def estimate(self) -> float:
+        Callers must pass the PRE-sleep elapsed time. If a padded (post-sleep) duration were
+        ever observed here, the deadline would feed on its own output and ratchet upward without
+        bound - every Yo slower forever. This method has no way to enforce that on its own; the
+        call site is what must measure elapsed, observe it, and only then sleep.
+        """
         with self._lock:
-            return self._seconds
+            self._durations.append(seconds)
 
-    def sleep_to_match(self, started: float) -> None:
-        """Spend whatever is left of a delivery's typical cost."""
-        remaining = self.estimate() - (time.monotonic() - started)
+    def _deadline_pad(self) -> float:
+        """The seconds to pad to, floored and ceilinged, computed under the lock."""
+        with self._lock:
+            if not self._durations:
+                percentile = 0.0
+            else:
+                ordered = sorted(self._durations)
+                index = min(
+                    len(ordered) - 1,
+                    max(0, math.ceil(self._PAD_PERCENTILE * len(ordered)) - 1),
+                )
+                percentile = ordered[index]
+        return min(max(percentile, self._floor), self._CEILING_SECONDS)
+
+    def sleep_until_deadline(self, started: float) -> None:
+        """Sleep until `started` plus the shared pad, whatever branch is calling.
+
+        Not "sleep to match a delivery" - there is deliberately no per-branch pad any more. Both
+        the blocked branch and the delivered branch call this against the same `started`, and
+        both return at the same absolute instant, which is what makes the two indistinguishable
+        by construction rather than by a mean the FCM round-trip distribution still spreads
+        around.
+        """
+        deadline = started + self._deadline_pad()
+        remaining = deadline - self._clock()
         if remaining > 0:
-            time.sleep(remaining)
+            self._sleeper(remaining)
 
 
 def _configured_apk_path() -> Optional[Path]:
@@ -326,7 +429,7 @@ DOCUMENT_PAGE_TEMPLATE = """<!doctype html>
 """
 
 PRIVACY_PAGE_BODY = """<h1>Yo privacy policy</h1>
-<p class="updated">Last updated 28 July 2026. Yo is published by The Shop.</p>
+<p class="updated">Last updated 3 August 2026. Yo is published by The Shop.</p>
 
 <h2>The short version</h2>
 <p>Yo sends one word. It needs to know who you are and which device to wake, and it is not
@@ -338,6 +441,10 @@ of anything to anyone.</p>
   <li><strong>Your username.</strong> Chosen by you. It is how friends address you.</li>
   <li><strong>Your password, hashed.</strong> PBKDF2-HMAC-SHA256. The password itself is never
       stored and cannot be recovered from what is.</li>
+  <li><strong>A session key, hashed.</strong> Signing in creates one; only a hash of it is kept,
+      never the key itself, and each signed-in device holds its own. It stops working 90 days
+      after it was issued, and logging out removes that device's entry, and its notification
+      token, immediately.</li>
   <li><strong>A Google account identifier</strong>, if you sign in with Google: only Google's
       opaque subject id. Your email address is never stored.</li>
   <li><strong>A notification token</strong> for your device, issued by Firebase Cloud Messaging.
@@ -345,9 +452,12 @@ of anything to anyone.</p>
   <li><strong>Your friends and blocks</strong>, which are the usernames you added or blocked.</li>
   <li><strong>Your IP address, briefly</strong>, to rate-limit sign-ups and sending. It is not
       retained as a log of who you are.</li>
-  <li><strong>A server access log</strong>, which records the time, the address a request came
-      from, and which route it asked for - but not who you asked about. It rotates and is
-      discarded, and it exists to diagnose faults rather than to build a picture of anyone.</li>
+  <li><strong>A server access log</strong>, written as each request arrives and never edited
+      afterwards. It records the time, the address a request came from, and which route it asked
+      for - never who you asked about: a username only ever travels inside a request's body, and
+      any value in the query string is redacted before the line is written. Deleting your
+      account does not reach back into a log already written. It rotates on size, not on a
+      schedule, and the oldest file is discarded first as new ones fill up.</li>
 </ul>
 
 <h2>What passes through without being stored</h2>
@@ -368,9 +478,13 @@ is not written to our database. We carry it; we do not keep it.</p>
       to show an invite list. Only a name and a local id are ever held, never a phone number or
       an email address, and none of it is sent to us or to anyone else. Invitations are sent by
       whichever messaging app you pick, and Yo never learns who you chose.</li>
-  <li><strong>Your Yo history and groups.</strong> Stored locally and erased when you delete your
-      account or uninstall the app. Your groups never leave the phone at all: sending to a group
-      sends an ordinary Yo to each member, and we never learn that the group exists.</li>
+  <li><strong>Your Yo history and groups.</strong> Stored locally, never on our servers. Deleting
+      your account in the app, or logging out, erases it immediately. A deletion requested
+      because you could not open the app happens on our side first and is erased on your phone
+      the next time the app runs and finds the account gone. If it never runs again, uninstalling
+      removes it: the app does not back its data up to the cloud, so there is no copy anywhere
+      else for the uninstall to leave behind. Your groups never leave the phone at all: sending to
+      a group sends an ordinary Yo to each member, and we never learn that the group exists.</li>
 </ul>
 
 <h2>Who else sees it</h2>
@@ -378,17 +492,24 @@ is not written to our database. We carry it; we do not keep it.</p>
 link or a hashtag, they see that too.</p>
 <p>Google, in two narrow roles: Firebase Cloud Messaging carries the notification to your device -
 including anything you attached, since that travels inside the notification - and Google verifies
-the sign-in token if you choose "continue with Google". Nothing is shared with anyone else, and
-nothing is sold.</p>
+the sign-in token if you choose "continue with Google".</p>
+<p>Cloudflare sits in front of every request on its way to our server, the way any reverse proxy
+has to, which means it terminates the connection before we do. Hetzner is the company whose
+machine our server and its database run on. Both handle what passes through them only on our
+instructions, to route and to host what we already run, and neither uses it for any purpose of
+their own.</p>
+<p>Nothing is shared with anyone else, and nothing is sold.</p>
 
 <h2>How long we keep it</h2>
-<p>Until you delete your account. Deleting it removes everything above from the live service
+<p>Until you delete your account. Deleting it removes everything the database holds about you
 straight away.</p>
-<p>Backups are the one exception, and we would rather say so than leave you to assume otherwise:
-the database is backed up regularly so that a disk failure does not lose everyone's accounts, and
-a backup taken before you left still contains what you had at that moment. Those copies expire on
-their own within 30 days and are never used to bring an account back. Nothing is restored from
-them except to recover the service after a failure.</p>
+<p>Backups and the access log are the two exceptions, and we would rather say so than leave you to
+assume otherwise. The database is backed up regularly so that a disk failure does not lose
+everyone's accounts, and a backup taken before you left still contains what you had at that
+moment. Those copies expire on their own within 30 days and are never used to bring an account
+back. Nothing is restored from them except to recover the service after a failure. The access log
+is written continuously and a deletion does not reach back into lines already written; it still
+carries no username, and it rotates out on its own as described above.</p>
 
 <h2>Deleting your account</h2>
 <p>In the app: menu, then DELETE ACCOUNT. This erases your account, your friends, your blocks,
@@ -428,11 +549,17 @@ normally far sooner.</p>
   <li>Every sign-in session, on every device.</li>
   <li>Your friends and blocks - and you disappear from other people's friend lists.</li>
   <li>Your notification token, so no further Yo can reach you.</li>
-  <li>Your Yo history and groups held on your own phone.</li>
 </ul>
 <p>None of it can be undone, and nothing is kept in the live service afterwards. Backups taken
 before you left still hold what you had at that moment; they expire on their own within 30 days
 and are never used to restore an account.</p>
+
+<h2>What this cannot reach</h2>
+<p>A deletion requested this way happens on our server, which cannot reach inside a phone we do
+not control. If the app is opened again on that handset, it finds the account gone and clears its
+own local Yo history and groups at that point. If it is never opened again, the data leaves with
+the phone: the app keeps no cloud copy of it, so nothing survives for an uninstall to remove and
+nothing is left for us, or anyone else, to get to.</p>
 """
 
 
@@ -1113,10 +1240,48 @@ class YoRequestHandler(BaseHTTPRequestHandler):
         # Bytes, not code points. FCM's data payload cap is 4096 BYTES, so a 2048-character link
         # of astral-plane characters is 8 KB on the wire: it would pass a len() check here, be
         # rejected by Google, and surface to the sender as a 502 that no retry can ever clear.
+        #
+        # Checked before any charset work, and left a 400: byte length is measured the same way
+        # regardless of which Unicode table this process or the sender's happens to know about, so
+        # it is the one property here that cannot diverge.
         if len(value.encode("utf-8")) > limit:
             raise BadRequestError(f"{key} must be at most {limit} bytes")
-        if key == "hashtag" and not HASHTAG_PATTERN.fullmatch(value.lstrip("#")):
-            raise BadRequestError("hashtag must be letters, digits, underscores or dashes")
+        if key == "hashtag":
+            # Sanitised, not rejected - see HASHTAG_PATTERN. A charset check keyed to this
+            # process's own Unicode table would 400 an astral character a modern handset already
+            # accepts as a letter, and the client's retry re-issues that identical doomed request
+            # forever. Stripping instead means an older table only ever narrows what a hashtag
+            # keeps, never fails the whole Yo over it.
+            #
+            # The leading hash is stripped for the same reason it always was - so "#worldcup"
+            # isn't punished for the hash the app itself would have added - but the rest of
+            # `value` is preserved untouched whenever nothing needed removing, so a hashtag that
+            # was already clean carries on unchanged rather than losing its leading hash.
+            candidate = value.lstrip("#")
+            # Char-by-char rather than a single HASHTAG_PATTERN.sub: a character HASHTAG_PATTERN
+            # would strip is kept anyway when it is a combining mark (see HASHTAG_MARK_CATEGORIES
+            # above), so a vowel sign or virama travels with the letter it belongs to instead of
+            # being torn off it.
+            sanitized = "".join(
+                ch
+                for ch in candidate
+                if not HASHTAG_PATTERN.match(ch)
+                or unicodedata.category(ch) in HASHTAG_MARK_CATEGORIES
+            )
+            if sanitized and all(
+                unicodedata.category(ch) in HASHTAG_MARK_CATEGORIES for ch in sanitized
+            ):
+                # A mark with no base character in front of it modifies nothing - it renders as
+                # garbage attached to whatever precedes the hashtag in the notification body, not
+                # as the sender's word. Treated as vanished, same as the empty-string case below.
+                sanitized = ""
+            if not sanitized:
+                # An attachment that sanitises to nothing is an attachment that vanished, and
+                # that has to be reported for the same reason as the docstring above - not
+                # silently dropped.
+                raise BadRequestError("hashtag must be letters, digits, underscores or dashes")
+            if sanitized != candidate:
+                value = sanitized
         return value
 
     def _handle_send(self, sender: str, body: Dict[str, Any]) -> None:
@@ -1134,23 +1299,19 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                 {"delivered": False, "reason": "rate_limited"},
             )
             return
-        if self.server.database.is_blocked(recipient, sender):
-            # Indistinguishable from a delivered Yo on purpose: telling the sender they were
-            # blocked turns the block into a notification for the person who was blocked.
-            #
-            # "Indistinguishable" has to include the clock. The body was always identical and the
-            # timing never was - two SQLite probes against an HTTPS round trip to Google, which
-            # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
-            # DeliveryCostEstimator; this spends what a delivery would have spent.
-            self.server.delivery_cost.sleep_to_match(started)
-            self._write_json(HTTPStatus.OK, {"delivered": True})
-            return
+        # Held rather than acted on immediately: evaluating this before the device lookup used to
+        # let a deviceless recipient answer 200 delivered:true for a blocked sender and 404
+        # recipient_unregistered for an unblocked one (G9) - the status code itself was the
+        # oracle, no timing needed. Every path below now does the same work in the same order
+        # regardless of `blocked`, so the two cases diverge only at the very end.
+        blocked = self.server.database.is_blocked(recipient, sender)
         fcm_token = self.server.database.get_fcm_token(recipient)
         if fcm_token is None:
             # A real account with no device is not a missing account. Reporting both as
             # "recipient_not_found" told senders their friend did not exist whenever that friend's
             # registration had quietly failed. This discloses nothing new: /v1/friends and /v1/block
-            # already answer "no_such_user" for names that do not exist.
+            # already answer "no_such_user" for names that do not exist. Unguarded by `blocked` on
+            # purpose - see the comment above.
             reason = (
                 "recipient_unregistered"
                 if self.server.database.account_exists(recipient)
@@ -1163,6 +1324,18 @@ class YoRequestHandler(BaseHTTPRequestHandler):
                     "reason": reason,
                 },
             )
+            return
+        if blocked:
+            # Indistinguishable from a delivered Yo on purpose: telling the sender they were
+            # blocked turns the block into a notification for the person who was blocked.
+            #
+            # "Indistinguishable" has to include the clock. The body was always identical and the
+            # timing never was - two SQLite probes against an HTTPS round trip to Google, which
+            # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
+            # DeliveryCostEstimator; both branches sleep to the SAME shared deadline now, not a
+            # scalar this one spends toward - a delivered send pads to it too, just below.
+            self.server.delivery_cost.sleep_until_deadline(started)
+            self._write_json(HTTPStatus.OK, {"delivered": True})
             return
         try:
             delivered = bool(
@@ -1199,7 +1372,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         # What a real delivery cost, which is what a block must be made to cost. Recorded only on
         # this path: the failure paths answer a different status and are not what is being matched.
-        self.server.delivery_cost.observe(time.monotonic() - started)
+        #
+        # Order matters and must not change: measure elapsed, observe() it, THEN sleep to the
+        # deadline. observe() must see the PRE-sleep duration - if it saw the padded total
+        # instead, the deadline would feed on its own output and ratchet upward without bound.
+        elapsed = time.monotonic() - started
+        self.server.delivery_cost.observe(elapsed)
+        self.server.delivery_cost.sleep_until_deadline(started)
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
 
     def _handle_broadcast(

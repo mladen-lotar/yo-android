@@ -1,5 +1,6 @@
 package hr.theshop.yo.data.remote
 
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.testing.FakeSessionStore
 import java.io.InputStream
 import java.net.InetAddress
@@ -13,6 +14,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -42,14 +44,16 @@ import org.robolectric.RobolectricTestRunner
 class HttpYoBackendApiTest {
     private lateinit var server: LoopbackHttpServer
     private lateinit var api: HttpYoBackendApi
+    private lateinit var sessionStore: FakeSessionStore
 
     @Before
     fun startServer() {
         server = LoopbackHttpServer().also { it.start() }
+        sessionStore = FakeSessionStore()
         api =
             HttpYoBackendApi(
                 baseUrl = "http://${InetAddress.getLoopbackAddress().hostAddress}:${server.port}",
-                sessionStore = FakeSessionStore(),
+                sessionStore = sessionStore,
                 ioDispatcher = Dispatchers.IO,
             )
     }
@@ -201,6 +205,102 @@ class HttpYoBackendApiTest {
             }
 
         assertNotNull("an unparseable body must not be reported as a clean refusal", thrown)
+    }
+
+    // ---- distinguishing a permanent rejection from a transient failure --------------------
+    //
+    // The send path used to collapse every failure into one boolean, so a permanent 400
+    // rejection was indistinguishable from a transient network failure and the retry re-issued
+    // the identical doomed request forever. sendYoOutcome is the full-fidelity verdict that
+    // `sendYo`'s boolean collapses for its existing callers - see the function's own doc for why
+    // it is a second function rather than a change to `sendYo`'s signature.
+
+    @Test
+    fun `a 400 is reported as a permanent rejection`() = runTest {
+        server.responseStatus = 400
+        server.responseBody = """{"error":"attachment_too_long"}"""
+
+        assertEquals(YoSendOutcome.Rejected, api.sendYoOutcome(recipient = "BOB"))
+    }
+
+    // Rate limiting answers 429 on this endpoint (see backend `_handle_send`), and a 429 is a
+    // 4xx like any other under this rule: the server looked at THIS request and said no. A
+    // future request from the same sender may well succeed once the limiter's window rolls, but
+    // that is a NEW request the user is free to make by sending again - not a reason for this
+    // exact attempt's retry button to keep resubmitting it.
+    @Test
+    fun `a 429 rate-limited response is reported as a permanent rejection, not retryable`() =
+        runTest {
+            server.responseStatus = 429
+            server.responseBody = """{"delivered":false,"reason":"rate_limited"}"""
+
+            assertEquals(YoSendOutcome.Rejected, api.sendYoOutcome(recipient = "BOB"))
+        }
+
+    @Test
+    fun `a 500 is reported as retryable, not a rejection`() = runTest {
+        server.responseStatus = 500
+        server.responseBody = """{"error":"internal_error"}"""
+
+        assertEquals(YoSendOutcome.NotDelivered, api.sendYoOutcome(recipient = "BOB"))
+    }
+
+    // The one status this endpoint answers that Google's own delivery failure maps to (see
+    // yo_server.py's FCMDeliveryError handling) - pinned by its own case because 502 is easy to
+    // typo into the 4xx range it sits right next to.
+    @Test
+    fun `a 502 from a broken FCM delivery is reported as retryable, not a rejection`() = runTest {
+        server.responseStatus = 502
+        server.responseBody = """{"delivered":false,"reason":"fcm_delivery_failed"}"""
+
+        assertEquals(YoSendOutcome.NotDelivered, api.sendYoOutcome(recipient = "BOB"))
+    }
+
+    // 401 already means something else on this path - the guard below clears the session on
+    // nothing but the 90-day clock. Folding it into Rejected would give the same status code a
+    // second, conflicting meaning: "this Yo was bad" versus "this token has expired."
+    @Test
+    fun `a 401 is reported as retryable, not a rejection, and still clears the session`() =
+        runTest {
+            server.responseStatus = 401
+            server.responseBody = """{"error":"invalid_token"}"""
+
+            assertEquals(YoSendOutcome.NotDelivered, api.sendYoOutcome(recipient = "BOB"))
+            assertNull(sessionStore.current())
+        }
+
+    // ---- the 401 guard --------------------------------------------------------------------
+    //
+    // TOKEN_TTL_SECONDS on the server is 90 days (backend/yo_server.py), so this path fires on
+    // nothing but the clock — the user never asked to sign out. It clears the session, and
+    // deliberately nothing else: this class holds no reference to history, groups or the device
+    // registration cache, so there is nothing here for it to wipe even if it wanted to.
+
+    @Test
+    fun `a 401 on an authenticated request clears the session`() = runTest {
+        server.responseStatus = 401
+        server.responseBody = """{"error":"invalid_token"}"""
+
+        // fetchFriends throws on a non-2xx response; the guard runs before that throw, so the
+        // session is already gone by the time this call surfaces its failure to the caller.
+        runCatching { api.fetchFriends() }
+
+        assertNull(sessionStore.current())
+        assertNull(sessionStore.session.value)
+    }
+
+    // The guard is exact rather than a blanket 401 check: a signed-out caller carries no
+    // Authorization header at all, so a 401 here (e.g. a bad login) must not be mistaken for a
+    // dead token that was never sent.
+    @Test
+    fun `a 401 with no token attached does not touch a session that was never there`() = runTest {
+        sessionStore.clear()
+        server.responseStatus = 401
+        server.responseBody = """{"error":"invalid_credentials"}"""
+
+        runCatching { api.fetchFriends() }
+
+        assertNull(sessionStore.current())
     }
 
     data class RecordedRequest(

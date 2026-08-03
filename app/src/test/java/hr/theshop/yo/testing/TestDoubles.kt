@@ -6,6 +6,7 @@ import hr.theshop.yo.domain.model.AuthFailure
 import android.content.Context
 import hr.theshop.yo.domain.model.AuthResult
 import hr.theshop.yo.domain.model.GoogleAuthResult
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.domain.model.YoSession
 import hr.theshop.yo.domain.repository.GoogleIdTokenProvider
 import hr.theshop.yo.domain.repository.GoogleIdTokenResult
@@ -56,6 +57,14 @@ open class StubYoBackendApi : YoBackendApi {
         link: String?,
         hashtag: String?,
     ): Boolean = true
+
+    override suspend fun sendYoOutcome(
+        recipient: String,
+        latitude: Double?,
+        longitude: Double?,
+        link: String?,
+        hashtag: String?,
+    ): YoSendOutcome = YoSendOutcome.Delivered
 }
 
 /**
@@ -80,12 +89,33 @@ data class SendCall(
  * test file for the same reason [StubYoBackendApi] is: the delivery contract is the thing several
  * suites need to assert on, and a private copy per file means the next argument added to `sendYo`
  * is recorded in one of them and silently dropped by the rest.
+ *
+ * [sendOutcome], not [sendResult], is what lets a test distinguish [YoSendOutcome.Rejected] from
+ * [YoSendOutcome.NotDelivered] - [sendResult] alone can only express "delivered or not", which is
+ * exactly the collapse this fake exists to let a test see past. [sendResult] stays for every
+ * existing caller that only cares about that boolean; when [sendOutcome] is set, it wins.
  */
 open class FakeYoBackendApi(
     var sendResult: Boolean = true,
+    var sendOutcome: YoSendOutcome? = null,
     var sendFailure: Throwable? = null,
 ) : StubYoBackendApi() {
     val sends = mutableListOf<SendCall>()
+
+    // Recording lives here, not in sendYo: production code (YoRemoteDeliveryPortImpl) calls
+    // sendYoOutcome, and sendYo below delegates to this rather than duplicating the recording, the
+    // same relationship HttpYoBackendApi's own sendYo/sendYoOutcome pair has.
+    override suspend fun sendYoOutcome(
+        recipient: String,
+        latitude: Double?,
+        longitude: Double?,
+        link: String?,
+        hashtag: String?,
+    ): YoSendOutcome {
+        sends += SendCall(recipient, latitude, longitude, link, hashtag)
+        sendFailure?.let { throw it }
+        return sendOutcome ?: if (sendResult) YoSendOutcome.Delivered else YoSendOutcome.NotDelivered
+    }
 
     override suspend fun sendYo(
         recipient: String,
@@ -93,11 +123,8 @@ open class FakeYoBackendApi(
         longitude: Double?,
         link: String?,
         hashtag: String?,
-    ): Boolean {
-        sends += SendCall(recipient, latitude, longitude, link, hashtag)
-        sendFailure?.let { throw it }
-        return sendResult
-    }
+    ): Boolean =
+        sendYoOutcome(recipient, latitude, longitude, link, hashtag) == YoSendOutcome.Delivered
 }
 
 /**
