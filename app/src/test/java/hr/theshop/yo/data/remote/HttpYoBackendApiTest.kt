@@ -1,5 +1,6 @@
 package hr.theshop.yo.data.remote
 
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.testing.FakeSessionStore
 import java.io.InputStream
 import java.net.InetAddress
@@ -205,6 +206,68 @@ class HttpYoBackendApiTest {
 
         assertNotNull("an unparseable body must not be reported as a clean refusal", thrown)
     }
+
+    // ---- distinguishing a permanent rejection from a transient failure --------------------
+    //
+    // The send path used to collapse every failure into one boolean, so a permanent 400
+    // rejection was indistinguishable from a transient network failure and the retry re-issued
+    // the identical doomed request forever. sendYoOutcome is the full-fidelity verdict that
+    // `sendYo`'s boolean collapses for its existing callers - see the function's own doc for why
+    // it is a second function rather than a change to `sendYo`'s signature.
+
+    @Test
+    fun `a 400 is reported as a permanent rejection`() = runTest {
+        server.responseStatus = 400
+        server.responseBody = """{"error":"attachment_too_long"}"""
+
+        assertEquals(YoSendOutcome.Rejected, api.sendYoOutcome(recipient = "BOB"))
+    }
+
+    // Rate limiting answers 429 on this endpoint (see backend `_handle_send`), and a 429 is a
+    // 4xx like any other under this rule: the server looked at THIS request and said no. A
+    // future request from the same sender may well succeed once the limiter's window rolls, but
+    // that is a NEW request the user is free to make by sending again - not a reason for this
+    // exact attempt's retry button to keep resubmitting it.
+    @Test
+    fun `a 429 rate-limited response is reported as a permanent rejection, not retryable`() =
+        runTest {
+            server.responseStatus = 429
+            server.responseBody = """{"delivered":false,"reason":"rate_limited"}"""
+
+            assertEquals(YoSendOutcome.Rejected, api.sendYoOutcome(recipient = "BOB"))
+        }
+
+    @Test
+    fun `a 500 is reported as retryable, not a rejection`() = runTest {
+        server.responseStatus = 500
+        server.responseBody = """{"error":"internal_error"}"""
+
+        assertEquals(YoSendOutcome.NotDelivered, api.sendYoOutcome(recipient = "BOB"))
+    }
+
+    // The one status this endpoint answers that Google's own delivery failure maps to (see
+    // yo_server.py's FCMDeliveryError handling) - pinned by its own case because 502 is easy to
+    // typo into the 4xx range it sits right next to.
+    @Test
+    fun `a 502 from a broken FCM delivery is reported as retryable, not a rejection`() = runTest {
+        server.responseStatus = 502
+        server.responseBody = """{"delivered":false,"reason":"fcm_delivery_failed"}"""
+
+        assertEquals(YoSendOutcome.NotDelivered, api.sendYoOutcome(recipient = "BOB"))
+    }
+
+    // 401 already means something else on this path - the guard below clears the session on
+    // nothing but the 90-day clock. Folding it into Rejected would give the same status code a
+    // second, conflicting meaning: "this Yo was bad" versus "this token has expired."
+    @Test
+    fun `a 401 is reported as retryable, not a rejection, and still clears the session`() =
+        runTest {
+            server.responseStatus = 401
+            server.responseBody = """{"error":"invalid_token"}"""
+
+            assertEquals(YoSendOutcome.NotDelivered, api.sendYoOutcome(recipient = "BOB"))
+            assertNull(sessionStore.current())
+        }
 
     // ---- the 401 guard --------------------------------------------------------------------
     //

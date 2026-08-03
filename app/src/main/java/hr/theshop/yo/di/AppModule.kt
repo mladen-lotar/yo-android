@@ -41,6 +41,7 @@ object AppModule {
     @Singleton
     fun provideYoDatabase(
         @ApplicationContext context: Context,
+        sessionStore: SessionStore,
     ): YoDatabase =
         Room.databaseBuilder(
             context,
@@ -51,7 +52,16 @@ object AppModule {
             // migrations and no destructive fallback, which is exactly why the schema could not
             // be changed until now. Destructive fallback is still deliberately absent: it "fixes"
             // the crash by erasing the user's history.
-            .addMigrations(YoDatabase.MIGRATION_2_3)
+            //
+            // sessionStore.current()?.username is read HERE, at construction time, rather than
+            // inside the migration itself: a `Migration` has no way to reach the session, but
+            // this module does, because SessionStore is already bound below. Whoever was signed
+            // in when the database last closed is the account that WROTE the pre-upgrade rows -
+            // see migration3To4's own doc for why that is the only account allowed to adopt them.
+            .addMigrations(
+                YoDatabase.MIGRATION_2_3,
+                YoDatabase.migration3To4(sessionStore.current()?.username),
+            )
             .build()
 
     @Provides

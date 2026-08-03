@@ -495,9 +495,18 @@ class MainViewModel @Inject constructor(
         }
     }
 
-    /** Re-issues the attempt that failed. The failures that produce it are usually transient. */
+    /**
+     * Re-issues the attempt that failed. The failures that produce it are usually transient -
+     * except [YoSendOutcome.Rejected], which is the server refusing this exact request for a
+     * reason a retry cannot change. Re-issuing it would just re-send the identical bytes into
+     * the identical refusal, forever, so this refuses outright rather than silently repeating a
+     * doomed request.
+     */
     fun retrySend() {
         val failure = _sendFailure.value ?: return
+        if (failure.outcome == YoSendOutcome.Rejected) {
+            return
+        }
         val attempt = failedAttempt ?: return
         if (_sendInFlightTo.value != null) {
             return

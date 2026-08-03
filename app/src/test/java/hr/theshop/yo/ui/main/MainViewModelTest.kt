@@ -472,6 +472,31 @@ class MainViewModelTest {
         assertNull(viewModel.sendFailure.value)
     }
 
+    // THE RED-FIRST TEST. A rejection is the server refusing THIS request for a reason that
+    // will not change - a byte cap, a malformed recipient, a rate limit. Re-issuing the
+    // identical bytes gets the identical refusal forever, which is exactly the loop the
+    // hashtag-sanitisation fix closed for one specific case and this outcome closes in general.
+    @Test
+    fun `retrySend refuses to re-issue a send the server permanently rejected`() = runTest {
+        val repository = FakeYoRepository(outcome = YoSendOutcome.Rejected)
+        val viewModel = createViewModel(repository = repository)
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.sendYo("Alice", link = "https://example.com", hashtag = "worldcup")
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, repository.savedMessages.size)
+        assertEquals("Alice", viewModel.sendFailure.value?.label)
+        assertEquals(YoSendOutcome.Rejected, viewModel.sendFailure.value?.outcome)
+
+        viewModel.retrySend()
+        dispatcher.scheduler.advanceUntilIdle()
+
+        // No second attempt was ever saved: retrying a rejected send would just re-send the
+        // identical doomed request.
+        assertEquals(1, repository.savedMessages.size)
+        // The failure band is left exactly as it was - a rejection is not "fixed" by a no-op tap.
+        assertEquals(YoSendOutcome.Rejected, viewModel.sendFailure.value?.outcome)
+    }
+
     @Test
     fun `retrySend does nothing when nothing has failed`() = runTest {
         val repository = FakeYoRepository()

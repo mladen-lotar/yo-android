@@ -1,12 +1,11 @@
 package hr.theshop.yo.data.remote
 
 import hr.theshop.yo.domain.model.YoMessage
+import hr.theshop.yo.domain.model.YoSendOutcome
 import hr.theshop.yo.testing.FakeYoBackendApi
 import hr.theshop.yo.testing.SendCall
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class YoRemoteDeliveryPortImplTest {
@@ -15,10 +14,10 @@ class YoRemoteDeliveryPortImplTest {
         val backendApi = FakeYoBackendApi(sendResult = false)
         val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
-        val delivered =
+        val outcome =
             deliveryPort.deliver(YoMessage(id = "message-1", sender = "me", recipient = "Ada"))
 
-        assertFalse(delivered)
+        assertEquals(YoSendOutcome.NotDelivered, outcome)
         assertEquals(listOf(SendCall("Ada")), backendApi.sends)
     }
 
@@ -27,11 +26,26 @@ class YoRemoteDeliveryPortImplTest {
         val backendApi = FakeYoBackendApi()
         val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
 
-        val delivered =
+        val outcome =
             deliveryPort.deliver(YoMessage(id = "message-2", sender = "me", recipient = "Lin"))
 
-        assertTrue(delivered)
+        assertEquals(YoSendOutcome.Delivered, outcome)
         assertEquals(listOf(SendCall("Lin")), backendApi.sends)
+    }
+
+    // The regression this guards: a plain Boolean return on this port used to destroy the
+    // distinction between a permanent rejection and a transient failure before
+    // YoRepositoryImpl.saveSent ever saw it (defect 2). This pins that the port itself now passes
+    // Rejected straight through rather than collapsing it.
+    @Test
+    fun `deliver reports Rejected when the backend permanently refuses the send`() = runTest {
+        val backendApi = FakeYoBackendApi(sendOutcome = YoSendOutcome.Rejected)
+        val deliveryPort = YoRemoteDeliveryPortImpl(backendApi)
+
+        val outcome =
+            deliveryPort.deliver(YoMessage(id = "message-rejected", sender = "me", recipient = "Ada"))
+
+        assertEquals(YoSendOutcome.Rejected, outcome)
     }
 
     // The regression this guards is gap G20: an attached location was written to local history

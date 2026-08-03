@@ -28,4 +28,16 @@ data class YoEntity(
      * telling the truth.
      */
     val delivered: Boolean? = null,
+    /**
+     * The account this row is scoped to, so signing out and back in keeps a device's own history
+     * instead of destroying it while never showing it to anyone else who signs in.
+     *
+     * NULL is only ever transient, inside `YoDatabase.migration3To4` itself: `ADD COLUMN` has no
+     * way to create the column pre-populated, so every pre-upgrade row passes through NULL for
+     * the instant before that same migration either stamps it to the account that wrote it or
+     * deletes it. No row this app ever reads carries a NULL owner - every insert this app makes
+     * sets it directly (see `YoRepositoryImpl.toEntity`), and the migration leaves none behind.
+     * The type stays nullable only because the column itself is nullable at the schema level.
+     */
+    val ownerAccount: String? = null,
 )

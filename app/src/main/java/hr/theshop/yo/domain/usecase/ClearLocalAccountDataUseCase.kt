@@ -13,9 +13,17 @@ import javax.inject.Inject
  * registered for the same (username, fcmToken) pair would never re-POST `/v1/register` on the next
  * sign-in.
  *
+ * `yoRepository.clear()` and `groupRepository.clear()` now only delete rows owned by the account
+ * that is signed in at the moment this runs — see `YoDatabase.migration3To4` — rather than the
+ * whole table. That is exactly why this must run BEFORE the session is cleared:
+ * once the session is gone there is no account left to scope the delete to. Logout no longer costs
+ * the user their own groups: a different account signing in afterwards reads its own rows, not an
+ * empty table.
+ *
  * Deliberately does NOT touch [hr.theshop.yo.domain.repository.SessionStore]: callers own the
  * ordering of clearing the session relative to this, and that ordering differs between them (see
- * `MainViewModel.logOut`).
+ * `MainViewModel.logOut`) — and, since G30, it is also load-bearing for scoping the deletes above
+ * to the right account.
  *
  * Each clear runs in its own [runCatching] rather than one wrapping all three: a repository that
  * throws must not stop the other two from running, or a single misbehaving store would leave
