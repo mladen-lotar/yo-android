@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import time
+import unicodedata
 import unittest
 from email.message import Message
 from types import SimpleNamespace
@@ -1346,6 +1347,110 @@ class SendAttachmentTest(YoServerTestCase):
 
                 self.assertEqual(200, status)
                 self.assertEqual(1, len(self.fcm_client.attachment_calls))
+
+    def test_a_devanagari_hashtag_keeps_its_vowel_signs(self):
+        """RED-FIRST: [\\w-] does not cover Unicode categories Mn (non-spacing mark) or Mc
+        (spacing combining mark), so HASHTAG_PATTERN stripped a vowel sign or virama exactly as
+        unconditionally as it strips a literal space. Those marks are not decoration - a script
+        assigns them the meaning that distinguishes one word from another, and they belong to
+        the consonant in front of them. "नमस्ते" (Devanagari for "namaste") is न+म+स+् (virama,
+        Mn)+त+े (vowel sign E, Mn); stripping the two Mn marks reduces it to "नमसत", a bare
+        consonant skeleton that is a different, nonsensical string, not a narrowed version of
+        the same word. A rule that widens correctly must deliver the hashtag unchanged."""
+        hashtag = "नमस्ते"
+
+        status, body = self.send(hashtag=hashtag)
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(
+            [("bob-token", "ALICE", None, hashtag)],
+            self.fcm_client.attachment_calls,
+        )
+
+    def test_a_hashtag_and_the_client_agree_on_the_same_survivors(self):
+        """The shared table: every one of these must come out EXACTLY as written here, and
+        `HashtagRuleTest`'s `hostile input sanitises to the exact expected survivor` case in the
+        Kotlin suite asserts the identical pairs, so client and server cannot silently drift
+        onto two different rules again the way `sanitised, not rejected` almost did. Vocalised
+        Arabic ("مَرْحَبًا", marhaban) keeps its harakat, and a space between two Devanagari words
+        is still removed exactly as before. "#नमस्ते" keeps its leading hash for the same
+        pre-existing reason "#yo" does above - see _optional_attachment's docstring: the hash is
+        only dropped when sanitising the rest of the string actually changed something."""
+        cases = (
+            ("नमस्ते", "नमस्ते"),
+            ("#नमस्ते", "#नमस्ते"),
+            ("مَرْحَبًا", "مَرْحَبًا"),
+            ("नमस्ते दुनिया", "नमस्तेदुनिया"),
+            ("world cup", "worldcup"),
+            ("world_cup", "world_cup"),
+        )
+        for hashtag, expected in cases:
+            with self.subTest(hashtag=hashtag):
+                self.fcm_client.attachment_calls.clear()
+
+                status, body = self.send(hashtag=hashtag)
+
+                self.assertEqual(200, status)
+                self.assertEqual({"delivered": True}, body)
+                self.assertEqual(
+                    [("bob-token", "ALICE", None, expected)],
+                    self.fcm_client.attachment_calls,
+                )
+
+    def test_a_hashtag_of_only_combining_marks_is_rejected(self):
+        """A combining mark has no meaning without the base character it modifies - a lone vowel
+        sign or accent renders as garbage attached to whatever precedes the hashtag in the
+        notification body, not as a word of its own. Widening the charset to admit Mn/Mc must
+        not let a hashtag consisting ENTIRELY of such marks through: it has to be treated the
+        same as any other attachment that sanitises to nothing (see
+        test_a_hashtag_cannot_forge_the_notification_body's "#"/"###" cases)."""
+        pure_mark_hashtags = (
+            "́",  # COMBINING ACUTE ACCENT alone, category Mn
+            "्",  # DEVANAGARI SIGN VIRAMA alone, category Mn
+            "्́",  # more than one mark, still no base character
+            "#́",  # the leading hash is stripped first, still nothing but a mark left
+        )
+        for hashtag in pure_mark_hashtags:
+            with self.subTest(hashtag=repr(hashtag)):
+                self.fcm_client.attachment_calls.clear()
+
+                status, body = self.send(hashtag=hashtag)
+
+                self.assertEqual(400, status)
+                self.assertEqual("bad_request", body["error"])
+                self.assertEqual([], self.fcm_client.attachment_calls)
+
+    def test_mn_and_mc_can_never_be_space_or_middle_dot(self):
+        """Widening HASHTAG_PATTERN to admit Mn/Mc must not reopen the forgery the five
+        blank-rendering codepoints and the base [\\w-] rule exist to stop. Unicode's General
+        Category is a strict partition - a code point is never in two categories at once - so
+        proving the literal space and the app's own '·' separator are NOT category Mn or Mc is a
+        structural guarantee, not a sample: nothing admitted by HASHTAG_MARK_CATEGORIES can BE
+        either character. None of the five codepoints excluded by exact value is Mn/Mc either
+        (they are Lm/Lo), so this widening cannot let any of those back in."""
+        self.assertNotIn(unicodedata.category(" "), yo_server.HASHTAG_MARK_CATEGORIES)
+        self.assertNotIn(unicodedata.category("·"), yo_server.HASHTAG_MARK_CATEGORIES)
+        for codepoint in "ͺᅟᅠㅤﾠ":
+            self.assertNotIn(unicodedata.category(codepoint), yo_server.HASHTAG_MARK_CATEGORIES)
+
+    def test_a_zero_width_mark_cannot_recreate_visible_word_separation(self):
+        """A combining mark draws on the character before it rather than occupying a column of
+        its own, so - unlike the five excluded letters above, which render as blank WIDTH -
+        admitting one cannot reproduce the visible word-separating gap that made "TAP TO OPEN"
+        legible as three words. U+034F (COMBINING GRAPHEME JOINER, category Mn) is now admitted
+        rather than stripped, but it carries no width: the base letters it sits between still
+        read as run together, not as separate words, so nothing about this hostile string
+        becomes any more legible than it was before this widening."""
+        cgj = "͏"
+        hostile = "TAP" + cgj + "TO" + cgj + "OPEN"
+
+        status, body = self.send(hashtag=hostile)
+
+        self.assertEqual(200, status)
+        delivered_hashtag = self.fcm_client.attachment_calls[-1][3]
+        self.assertNotIn(" ", delivered_hashtag)
+        self.assertNotIn("·", delivered_hashtag)
 
     def test_an_astral_letter_this_process_barely_knows_about_still_sends(self):
         """G30 was a category-shaped charset rule; this is the OTHER way one diverges. A modern
@@ -2800,9 +2905,15 @@ class BlockedSendCostTest(YoServerTestCase):
     110 ms. The one control whose threat model explicitly names the sender as the adversary
     announced itself to that adversary in the timing, while the body was byte-identical.
 
-    Asserted as "the blocked path consults the delivery-cost estimator" rather than by measuring
-    wall-clock time, which would be a flaky test on a loaded machine. The estimator's own
-    arithmetic is asserted separately.
+    Padding only the blocked branch to a mean was still two leaks of its own: a delivered send
+    was never padded at all, so a min-of-N classifier still separated a point mass (blocked) from
+    the distribution it was drawn from (delivered) even with matching means; and the mean
+    cold-starts at a laptop number every restart, so blocked was briefly SLOWER than a real
+    delivery until it decayed. The fix gives both branches one shared deadline, so they are
+    asserted as "both branches sleep to the identical instant" via the injected clock and
+    sleeper, rather than by measuring wall-clock time (flaky on a loaded machine) or by asserting
+    only that a sleep function was called (which passes at a zero deadline with both leaks
+    still present).
     """
 
     def _account(self, username):
@@ -2811,21 +2922,48 @@ class BlockedSendCostTest(YoServerTestCase):
         )
         return body["token"]
 
-    def test_a_blocked_send_spends_what_a_delivery_would_have(self):
+    def test_a_blocked_send_and_a_delivered_send_target_the_same_deadline(self):
         alice = self._account("ALICE")
         bob = self._account("BOB")
         self.request("POST", "/v1/register", {"fcm_token": "BOB-PHONE"}, token=bob)
-        self.request("POST", "/v1/block", {"username": "ALICE"}, token=bob)
+        carol = self._account("CAROL")
+        self.request("POST", "/v1/register", {"fcm_token": "CAROL-PHONE"}, token=carol)
+        self.request("POST", "/v1/block", {"username": "ALICE"}, token=carol)
 
-        with mock.patch.object(self.server.delivery_cost, "sleep_to_match") as matched:
-            status, body = self.request(
+        sleeps = []
+        # `started` inside _handle_send is pinned so both requests measure elapsed time from the
+        # identical instant; the estimator's own clock is faked separately so the padding
+        # arithmetic is asserted exactly, with no wall-clock measurement anywhere in this test.
+        self.server.delivery_cost = yo_server.DeliveryCostEstimator(
+            clock=lambda: 1_000.05,
+            sleeper=lambda seconds: sleeps.append(seconds),
+        )
+
+        with mock.patch("yo_server.time.monotonic", return_value=1_000.0):
+            status_delivered, body_delivered = self.request(
                 "POST", "/v1/send", {"recipient": "BOB"}, token=alice
             )
+            status_blocked, body_blocked = self.request(
+                "POST", "/v1/send", {"recipient": "CAROL"}, token=alice
+            )
 
-        self.assertEqual(200, status)
-        self.assertEqual({"delivered": True}, body)
-        matched.assert_called_once()
-        self.assertEqual([], self.fcm_client.calls, "nothing may actually be sent")
+        self.assertEqual(200, status_delivered)
+        self.assertEqual({"delivered": True}, body_delivered)
+        self.assertEqual(200, status_blocked)
+        self.assertEqual({"delivered": True}, body_blocked)
+        self.assertEqual(
+            2, len(sleeps), "both the delivered and the blocked send must pad to the deadline"
+        )
+        self.assertEqual(
+            sleeps[0],
+            sleeps[1],
+            "a delivered and a blocked send must sleep to the exact same absolute instant",
+        )
+        self.assertEqual(
+            [("BOB-PHONE", "ALICE")],
+            self.fcm_client.calls,
+            "nothing may actually be sent to the blocked recipient",
+        )
 
     def test_a_real_delivery_teaches_the_estimator_what_one_costs(self):
         alice = self._account("ALICE")
@@ -2838,14 +2976,112 @@ class BlockedSendCostTest(YoServerTestCase):
         observed.assert_called_once()
         self.assertGreaterEqual(observed.call_args[0][0], 0.0)
 
-    def test_the_estimator_follows_what_it_is_told(self):
-        """Self-calibrating rather than a constant, because the right delay depends on how far
-        the server is from Google - a laptop pays ~117 ms, the production host perhaps 60-75."""
-        estimator = yo_server.DeliveryCostEstimator(initial_seconds=0.0)
-        for _ in range(200):
-            estimator.observe(0.070)
+    def test_the_observed_duration_excludes_the_pad_before_it_can_ratchet(self):
+        """CRITICAL FOOTGUN: if observe() ever saw the padded (post-sleep) duration, the deadline
+        would feed on its own output and ratchet upward without bound - every Yo slower forever.
+        Order must be: measure elapsed, observe(elapsed), sleep to deadline, write the response.
+        Asserted as call ORDER through a fake standing in for the whole estimator, not by
+        inspecting timings."""
+        alice = self._account("ALICE")
+        bob = self._account("BOB")
+        self.request("POST", "/v1/register", {"fcm_token": "BOB-PHONE"}, token=bob)
 
-        self.assertAlmostEqual(0.070, estimator.estimate(), places=3)
+        order = []
+
+        class _OrderRecordingCost:
+            def observe(self, seconds):
+                order.append(("observe", seconds))
+
+            def sleep_until_deadline(self, started):
+                order.append(("sleep", started))
+
+        self.server.delivery_cost = _OrderRecordingCost()
+
+        status, body = self.request("POST", "/v1/send", {"recipient": "BOB"}, token=alice)
+
+        self.assertEqual(200, status)
+        self.assertEqual({"delivered": True}, body)
+        self.assertEqual(2, len(order))
+        self.assertEqual("observe", order[0][0])
+        self.assertEqual("sleep", order[1][0])
+
+    def test_the_estimator_pads_both_paths_to_the_same_deadline(self):
+        """Self-calibrating rather than a constant, because the right delay depends on how far
+        the server is from Google - a laptop pays ~117 ms, the production host perhaps 60-75.
+
+        Constructed with NO argument, exactly as production constructs it - not with
+        initial_seconds=0.0, which steps around the only value production ever uses and would
+        pass even with a zero deadline. RED-FIRST: fails against unmodified source, because
+        DeliveryCostEstimator takes no injectable clock/sleeper and the delivered branch never
+        sleeps at all.
+        """
+        sleeps = []
+        estimator = yo_server.DeliveryCostEstimator(
+            clock=lambda: 42.05,
+            sleeper=lambda seconds: sleeps.append(seconds),
+        )
+        started = 42.0
+
+        # Delivered path: observe the real cost first, then pad to the shared deadline.
+        estimator.observe(0.03)
+        estimator.sleep_until_deadline(started)
+
+        # Blocked path: no observation, same deadline computation, same `started`.
+        estimator.sleep_until_deadline(started)
+
+        self.assertEqual(2, len(sleeps))
+        self.assertEqual(
+            sleeps[0], sleeps[1], "blocked and delivered must target the identical instant"
+        )
+
+    def test_an_empty_window_falls_back_to_the_floor_not_to_zero(self):
+        sleeps = []
+        estimator = yo_server.DeliveryCostEstimator(
+            clock=lambda: 100.0,
+            sleeper=lambda seconds: sleeps.append(seconds),
+        )
+
+        estimator.sleep_until_deadline(started=100.0)
+
+        self.assertEqual(1, len(sleeps))
+        self.assertAlmostEqual(
+            yo_server.DeliveryCostEstimator._INITIAL_SECONDS, sleeps[0], places=9
+        )
+
+    def test_one_enormous_sample_is_capped_by_the_ceiling(self):
+        sleeps = []
+        estimator = yo_server.DeliveryCostEstimator(
+            clock=lambda: 100.0,
+            sleeper=lambda seconds: sleeps.append(seconds),
+        )
+        estimator.observe(45.0)
+
+        estimator.sleep_until_deadline(started=100.0)
+
+        self.assertEqual([yo_server.DeliveryCostEstimator._CEILING_SECONDS], sleeps)
+
+    def test_the_deadline_sits_above_a_high_percentile_and_strictly_above_the_mean(self):
+        """A mean-padded implementation fails this: 90 fast deliveries and 10 slow ones give a
+        mean of 0.075s but a 95th percentile of 0.3s, and the deadline must track the tail, not
+        the average, or the tail below it leaks exactly as before."""
+        sleeps = []
+        estimator = yo_server.DeliveryCostEstimator(
+            clock=lambda: 100.0,
+            sleeper=lambda seconds: sleeps.append(seconds),
+        )
+        durations = [0.05] * 90 + [0.3] * 10
+        for seconds in durations:
+            estimator.observe(seconds)
+        mean = sum(durations) / len(durations)
+
+        estimator.sleep_until_deadline(started=100.0)
+
+        self.assertEqual(1, len(sleeps))
+        pad = sleeps[0]
+        self.assertGreaterEqual(
+            round(pad, 9), 0.3, "the deadline must sit at or above the 95th percentile"
+        )
+        self.assertGreater(pad, mean, "a mean-padded implementation would fail here")
 
 
 class TokenExpiryTest(YoServerTestCase):

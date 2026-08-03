@@ -147,6 +147,97 @@ class HashtagRuleTest {
         assertTrue(survivesUtf8RoundTrip(result))
     }
 
+    /**
+     * RED-FIRST: `\p{L}\p{N}_-` does not cover Unicode categories Mn (non-spacing mark) or Mc
+     * (spacing combining mark), so `DISALLOWED` stripped a vowel sign or virama exactly as
+     * unconditionally as it strips a literal space. Those marks are not decoration - a script
+     * assigns them the meaning that distinguishes one word from another, and they belong to the
+     * consonant in front of them. "नमस्ते" (Devanagari for "namaste") is न+म+स+् (virama, Mn)+
+     * त+े (vowel sign E, Mn); stripping the two Mn marks reduces it to "नमसत", a bare consonant
+     * skeleton that is a different, nonsensical string, not a narrowed version of the same word.
+     */
+    @Test
+    fun `a Devanagari hashtag keeps its vowel signs`() {
+        assertEquals("नमस्ते", HashtagRule.sanitize("नमस्ते"))
+    }
+
+    /**
+     * The shared table: `SendAttachmentTest.test_a_hashtag_and_the_client_agree_on_the_same_survivors`
+     * in the Python suite asserts the identical pairs against the server's own sanitiser, so
+     * client and server cannot silently drift onto two different rules again.
+     */
+    @Test
+    fun `client and server agree on the same survivors`() {
+        val cases = listOf(
+            "नमस्ते" to "नमस्ते",
+            "#नमस्ते" to "नमस्ते", // the client always drops a leading hash, unlike the server
+            "مَرْحَبًا" to "مَرْحَبًا",
+            "नमस्ते दुनिया" to "नमस्तेदुनिया",
+            "world cup" to "worldcup",
+            "world_cup" to "world_cup",
+        )
+        for ((input, expected) in cases) {
+            assertEquals("sanitize($input)", expected, HashtagRule.sanitize(input))
+        }
+    }
+
+    /**
+     * A combining mark has no meaning without the base character it modifies - a lone vowel
+     * sign or accent renders as garbage attached to whatever precedes the hashtag in the
+     * notification body, not as a word of its own. Widening the charset to admit Mn/Mc must not
+     * let a hashtag consisting ENTIRELY of such marks through: `sanitize` already returns null
+     * for an empty result (see `nothing usable yields null rather than an empty tag` above), and
+     * a pure-marks hashtag has to land there too.
+     */
+    @Test
+    fun `a hashtag of only combining marks yields null`() {
+        val pureMarkHashtags = listOf(
+            "́", // COMBINING ACUTE ACCENT alone, category Mn
+            "्", // DEVANAGARI SIGN VIRAMA alone, category Mn
+            "्́", // more than one mark, still no base character
+            "#́", // the leading hash is stripped first, still nothing but a mark left
+        )
+        for (hashtag in pureMarkHashtags) {
+            assertNull("sanitize($hashtag) should have no base character to survive", HashtagRule.sanitize(hashtag))
+        }
+    }
+
+    /**
+     * Widening `DISALLOWED` to admit Mn/Mc must not reopen the forgery the five blank-rendering
+     * codepoints and the base `\p{L}\p{N}_-` rule exist to stop. Unicode's General Category is a
+     * strict partition - a code point is never in two categories at once - so proving the
+     * literal space and the app's own '·' separator are NOT category Mn or Mc is a structural
+     * guarantee, not a sample: nothing `\p{Mn}\p{Mc}` admits can BE either character.
+     */
+    @Test
+    fun `Mn and Mc can never be space or middle dot`() {
+        assertFalse(' '.toString().matches(Regex("[\\p{Mn}\\p{Mc}]")))
+        assertFalse('·'.toString().matches(Regex("[\\p{Mn}\\p{Mc}]")))
+        for (codepoint in "ͺᅟᅠㅤﾠ") {
+            assertFalse(
+                "U+${codepoint.code.toString(16)} must not be Mn/Mc",
+                codepoint.toString().matches(Regex("[\\p{Mn}\\p{Mc}]")),
+            )
+        }
+    }
+
+    /**
+     * A combining mark draws on the character before it rather than occupying a column of its
+     * own, so - unlike the five excluded letters above, which render as blank WIDTH - admitting
+     * one cannot reproduce the visible word-separating gap that made "TAP TO OPEN" legible as
+     * three words. U+034F (COMBINING GRAPHEME JOINER, category Mn) is now admitted rather than
+     * stripped, but it carries no width: the base letters it sits between still read as run
+     * together, not as separate words.
+     */
+    @Test
+    fun `a zero-width mark cannot recreate visible word separation`() {
+        val cgj = "͏"
+        val result = HashtagRule.sanitize("TAP${cgj}TO${cgj}OPEN")!!
+
+        assertFalse(result.contains(' '))
+        assertFalse(result.contains('·'))
+    }
+
     @Test
     fun `the ordinary two-word case travels rather than failing`() {
         assertEquals("worldcup", HashtagRule.sanitize("world cup"))

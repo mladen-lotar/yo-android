@@ -8,12 +8,13 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from traceback import format_exc
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 import yo_auth
@@ -54,6 +55,28 @@ MAX_HASHTAG_BYTES = 140
 # retry re-issued that identical doomed request forever. Reject what cannot diverge; sanitise what
 # can.
 HASHTAG_PATTERN = re.compile(r"[^\w-]|[ͺᅟᅠㅤﾠ]")
+
+# \w does not cover Unicode categories Mn (non-spacing mark) or Mc (spacing combining mark), so
+# HASHTAG_PATTERN alone stripped every combining mark exactly as unconditionally as it strips a
+# literal space. That is not narrowing a hashtag, it is corrupting one: Devanagari and Arabic
+# spell a real word by attaching a vowel sign or virama/harakat to the letter in front of it, and
+# a category-blind strip reduces "नमस्ते" (namaste) to "नमसत", a consonant skeleton that reads as
+# nonsense - see _optional_attachment and test_a_devanagari_hashtag_keeps_its_vowel_signs. A
+# character in HASHTAG_MARK_CATEGORIES is admitted in addition to HASHTAG_PATTERN's [\w-],
+# provided it is not one of the five codepoints above, which is automatic: none of those five is
+# Mn or Mc (they are Lm/Lo), so widening here cannot let any of them back in.
+#
+# This cannot reopen the forgery HASHTAG_PATTERN exists to stop. Unicode's General Category is a
+# strict partition, so a code point that is Mn or Mc can never simultaneously be Zs (a literal
+# space) or the Po that '·' belongs to - see test_mn_and_mc_can_never_be_space_or_middle_dot. A
+# combining mark is also zero-width by definition: it draws on the character before it rather
+# than occupying a column of its own, so unlike the five excluded letters above it cannot
+# reproduce the VISIBLE word-separating width that made "TAP TO OPEN" read as three words in the
+# first place.
+#
+# A mark has no meaning without the base character it modifies, so a hashtag left with nothing
+# but marks after sanitising is treated as an attachment that vanished - see _optional_attachment.
+HASHTAG_MARK_CATEGORIES = ("Mn", "Mc")
 
 # A broadcast client id is delivered to every subscriber as the SENDER, landing in exactly the
 # position a username lands in - the app renders "From <SENDER>" with no charset filter of its
@@ -201,7 +224,8 @@ class RateLimiter:
 
 
 class DeliveryCostEstimator:
-    """A running estimate of what delivering a Yo costs, so refusing to can cost the same.
+    """A shared deadline both a blocked and a delivered send are padded to, so refusing to
+    deliver costs exactly what delivering does.
 
     A block answers `200 {"delivered":true}` and sends nothing, which is deliberate: telling a
     sender they were blocked turns the block into a notification for the person who was blocked.
@@ -210,6 +234,19 @@ class DeliveryCostEstimator:
     blocked p50 0.79 ms, delivered p50 116.69 ms, ranges disjoint by 110 ms. Against production's
     own jitter (yo.the-shop.io /healthz p50 42 ms, IQR 4 ms) a min-of-three classifier separates
     them essentially perfectly, and the sender is allowed 60 sends a minute.
+
+    Padding only the blocked branch to a single scalar mean was still two independent leaks.
+    First, a delivered send was never padded at all, so it landed anywhere in the real FCM
+    round-trip distribution while a blocked send landed almost exactly on the mean of that
+    distribution - a min-of-N classifier still separates a point mass from the distribution it
+    was drawn from, even with identical means, because the variance differs. Second, the estimate
+    cold-starts at a laptop number every restart (see `_INITIAL_SECONDS` below) and decays toward
+    the real production cost only after roughly a dozen deliveries, so a blocked send is briefly
+    slower than a real one in the opposite direction, in memory only, reopened by every deploy.
+    Both are fixed the same way: there is no per-branch pad to get wrong if both branches sleep to
+    one shared deadline. That makes the property structural rather than statistical - both become
+    the same point mass, so there is no distribution left to model - and it subsumes the
+    cold-start problem too, since a wrong deadline is now a latency bug, not a leak.
 
     So the one control whose threat model explicitly names the sender as the adversary announced
     itself to that adversary. This is the same defect the login path had, in the same week -
@@ -222,29 +259,79 @@ class DeliveryCostEstimator:
     the other, and wrong in the direction of leaking again.
     """
 
-    # Weight on each new observation. Low enough that one slow outlier does not move the estimate
-    # much, high enough to follow a real change in where FCM is being reached from.
-    _SMOOTHING = 0.2
+    # How many recent delivery durations the deadline is drawn from. Bounded so a long-dead
+    # deployment's early traffic eventually ages out rather than permanently biasing the window.
+    _WINDOW_SIZE = 128
 
-    def __init__(self, initial_seconds: float = 0.12):
-        self._seconds = initial_seconds
+    # The percentile the deadline sits at, not the mean: the deadline must sit above almost every
+    # real delivery, or the tail below it is exactly the leak this class exists to remove. Not
+    # `max` either - a single outlier would pad every send for the rest of the window.
+    _PAD_PERCENTILE = 0.95
+
+    # Every restart starts with an empty window, and an empty (or otherwise degenerate) window
+    # must not collapse the pad to zero - that would reopen the exact leak this class fixes.
+    # Deliberately still a laptop-shaped number, not a guessed production one: once both branches
+    # share a deadline this constant is a latency knob, not a security boundary, and it errs slow,
+    # which is the safe side. A module constant, not an environment variable, for the same reason.
+    _INITIAL_SECONDS = 0.12
+
+    # However bad a stretch of real FCM latency gets, no Yo should be made to wait longer than
+    # this for the sake of matching it.
+    _CEILING_SECONDS = 1.0
+
+    def __init__(
+        self,
+        initial_seconds: float = _INITIAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self._floor = initial_seconds
+        self._durations: Deque[float] = deque(maxlen=self._WINDOW_SIZE)
         self._lock = threading.Lock()
+        # Injected rather than called directly, so a test can assert on the EFFECT - the
+        # instant both branches sleep to - instead of only that some sleep function was called,
+        # which passes even when the two branches disagree on when to stop.
+        self._clock = clock
+        self._sleeper = sleeper
 
     def observe(self, seconds: float) -> None:
-        with self._lock:
-            self._seconds = (self._seconds * (1 - self._SMOOTHING)) + (
-                seconds * self._SMOOTHING
-            )
+        """Record what a real delivery cost.
 
-    def estimate(self) -> float:
+        Callers must pass the PRE-sleep elapsed time. If a padded (post-sleep) duration were
+        ever observed here, the deadline would feed on its own output and ratchet upward without
+        bound - every Yo slower forever. This method has no way to enforce that on its own; the
+        call site is what must measure elapsed, observe it, and only then sleep.
+        """
         with self._lock:
-            return self._seconds
+            self._durations.append(seconds)
 
-    def sleep_to_match(self, started: float) -> None:
-        """Spend whatever is left of a delivery's typical cost."""
-        remaining = self.estimate() - (time.monotonic() - started)
+    def _deadline_pad(self) -> float:
+        """The seconds to pad to, floored and ceilinged, computed under the lock."""
+        with self._lock:
+            if not self._durations:
+                percentile = 0.0
+            else:
+                ordered = sorted(self._durations)
+                index = min(
+                    len(ordered) - 1,
+                    max(0, math.ceil(self._PAD_PERCENTILE * len(ordered)) - 1),
+                )
+                percentile = ordered[index]
+        return min(max(percentile, self._floor), self._CEILING_SECONDS)
+
+    def sleep_until_deadline(self, started: float) -> None:
+        """Sleep until `started` plus the shared pad, whatever branch is calling.
+
+        Not "sleep to match a delivery" - there is deliberately no per-branch pad any more. Both
+        the blocked branch and the delivered branch call this against the same `started`, and
+        both return at the same absolute instant, which is what makes the two indistinguishable
+        by construction rather than by a mean the FCM round-trip distribution still spreads
+        around.
+        """
+        deadline = started + self._deadline_pad()
+        remaining = deadline - self._clock()
         if remaining > 0:
-            time.sleep(remaining)
+            self._sleeper(remaining)
 
 
 def _configured_apk_path() -> Optional[Path]:
@@ -1171,7 +1258,23 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             # `value` is preserved untouched whenever nothing needed removing, so a hashtag that
             # was already clean carries on unchanged rather than losing its leading hash.
             candidate = value.lstrip("#")
-            sanitized = HASHTAG_PATTERN.sub("", candidate)
+            # Char-by-char rather than a single HASHTAG_PATTERN.sub: a character HASHTAG_PATTERN
+            # would strip is kept anyway when it is a combining mark (see HASHTAG_MARK_CATEGORIES
+            # above), so a vowel sign or virama travels with the letter it belongs to instead of
+            # being torn off it.
+            sanitized = "".join(
+                ch
+                for ch in candidate
+                if not HASHTAG_PATTERN.match(ch)
+                or unicodedata.category(ch) in HASHTAG_MARK_CATEGORIES
+            )
+            if sanitized and all(
+                unicodedata.category(ch) in HASHTAG_MARK_CATEGORIES for ch in sanitized
+            ):
+                # A mark with no base character in front of it modifies nothing - it renders as
+                # garbage attached to whatever precedes the hashtag in the notification body, not
+                # as the sender's word. Treated as vanished, same as the empty-string case below.
+                sanitized = ""
             if not sanitized:
                 # An attachment that sanitises to nothing is an attachment that vanished, and
                 # that has to be reported for the same reason as the docstring above - not
@@ -1229,8 +1332,9 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             # "Indistinguishable" has to include the clock. The body was always identical and the
             # timing never was - two SQLite probes against an HTTPS round trip to Google, which
             # measured 0.79 ms against 116.69 ms with the ranges 110 ms apart. See
-            # DeliveryCostEstimator; this spends what a delivery would have spent.
-            self.server.delivery_cost.sleep_to_match(started)
+            # DeliveryCostEstimator; both branches sleep to the SAME shared deadline now, not a
+            # scalar this one spends toward - a delivered send pads to it too, just below.
+            self.server.delivery_cost.sleep_until_deadline(started)
             self._write_json(HTTPStatus.OK, {"delivered": True})
             return
         try:
@@ -1268,7 +1372,13 @@ class YoRequestHandler(BaseHTTPRequestHandler):
             return
         # What a real delivery cost, which is what a block must be made to cost. Recorded only on
         # this path: the failure paths answer a different status and are not what is being matched.
-        self.server.delivery_cost.observe(time.monotonic() - started)
+        #
+        # Order matters and must not change: measure elapsed, observe() it, THEN sleep to the
+        # deadline. observe() must see the PRE-sleep duration - if it saw the padded total
+        # instead, the deadline would feed on its own output and ratchet upward without bound.
+        elapsed = time.monotonic() - started
+        self.server.delivery_cost.observe(elapsed)
+        self.server.delivery_cost.sleep_until_deadline(started)
         self._write_json(HTTPStatus.OK, {"delivered": delivered})
 
     def _handle_broadcast(

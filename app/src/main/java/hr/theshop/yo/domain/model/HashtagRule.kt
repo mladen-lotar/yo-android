@@ -28,6 +28,28 @@ package hr.theshop.yo.domain.model
  * blanks passes a category-only check exactly as well as the real thing. Dot-rendering letters
  * such as U+1427 (Canadian syllabics) stay allowed: they are real letters in a real script, and
  * it is the missing WHITESPACE that makes a forgery legible, not the dot.
+ *
+ * `\p{L}\p{N}_-` also does not cover Unicode categories Mn (non-spacing mark) or Mc (spacing
+ * combining mark), so a vowel sign or virama used to be stripped exactly as unconditionally as a
+ * literal space. That is not narrowing a hashtag, it is corrupting one: Devanagari and vocalised
+ * Arabic spell a real word by attaching a mark to the letter in front of it, and a category-blind
+ * strip reduced "नमस्ते" (namaste) to "नमसत", a consonant skeleton that reads as nonsense -
+ * see `a Devanagari hashtag keeps its vowel signs`. `\p{Mn}\p{Mc}` is now admitted alongside
+ * `\p{L}\p{N}_-`; none of the five codepoints above is Mn or Mc (they are Lm/Lo), so this cannot
+ * let any of them back in.
+ *
+ * This cannot reopen the forgery those five codepoints exist to stop, either. Unicode's General
+ * Category is a strict partition, so a code point that is Mn or Mc can never simultaneously be
+ * Zs (a literal space) or the Po that '·' belongs to - see
+ * `Mn and Mc can never be space or middle dot`. A combining mark is also zero-width by
+ * definition: it draws on the character before it rather than occupying a column of its own, so
+ * unlike the five excluded letters above it cannot reproduce the VISIBLE word-separating width
+ * that made "TAP TO OPEN" read as three words in the first place - see
+ * `a zero-width mark cannot recreate visible word separation`.
+ *
+ * A mark has no meaning without the base character it modifies, so a hashtag left with nothing
+ * but marks after sanitising is treated the same as one that sanitised to nothing entirely - see
+ * `a hashtag of only combining marks yields null`.
  */
 object HashtagRule {
     /**
@@ -36,7 +58,8 @@ object HashtagRule {
     const val MAX_CHARS = 32
 
     private const val BLANK_RENDERING_CODEPOINTS = "ͺᅟᅠㅤﾠ"
-    private val DISALLOWED = Regex("[^\\p{L}\\p{N}_-]|[$BLANK_RENDERING_CODEPOINTS]")
+    private val DISALLOWED = Regex("[^\\p{L}\\p{N}\\p{Mn}\\p{Mc}_-]|[$BLANK_RENDERING_CODEPOINTS]")
+    private val ONLY_COMBINING_MARKS = Regex("^[\\p{Mn}\\p{Mc}]+$")
 
     /**
      * The hashtag as it may be sent and shown, or null when nothing usable is left.
@@ -50,7 +73,7 @@ object HashtagRule {
             ?.trimStart('#')
             ?.replace(DISALLOWED, "")
             ?.let(::truncateWholeCharacters)
-            ?.takeIf { it.isNotEmpty() }
+            ?.takeIf { it.isNotEmpty() && !ONLY_COMBINING_MARKS.matches(it) }
 
     /**
      * Truncate to [MAX_CHARS] without splitting a character in half.
